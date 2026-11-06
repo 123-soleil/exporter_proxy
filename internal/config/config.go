@@ -24,7 +24,7 @@ import (
 const (
 	DefaultTimeout                     = 10 * time.Second
 	DefaultMaxBodyBytes          int64 = 2 << 20 // 2 MiB, ample for typical exporters (node_exporter: ~0.1-0.5 MiB)
-	DefaultMaxSamples                  = 50000
+	DefaultMaxSamples                  = 24000   // node_exporter: a few thousand samples
 	DefaultMaxConcurrentRequests       = 2
 )
 

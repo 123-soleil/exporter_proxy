@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Design: mandatory validation of every response with the Prometheus text
   parser, bounded by `max_body_bytes` and `timeout`, with parse duration,
   response size and per-reason error metrics.
-- Design: `max_samples` limit per response (default 50000) and
+- Design: `max_samples` limit per response (default 24000) and
   `max_concurrent_requests` limit per listener (default 2, extra requests
   get `503`), with sample count, in-flight and rejection metrics.
 - Design: absolute, clean paths enforced for `file` and `unix_socket`;
@@ -52,8 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duration measured; parse errors never include the offending content.
   Benchmark on synthetic data in `internal/content`.
 - Built-in defaults sized for common exporters, with exceptions set per
-  route or listener: `max_body_bytes` 2 MiB and `max_concurrent_requests` 2,
-  bounding the worst-case parsing memory to about 45 MiB per listener.
+  route or listener: `max_body_bytes` 2 MiB, `max_samples` 24000 and
+  `max_concurrent_requests` 2, bounding the worst-case parsing memory to
+  about 45 MiB per listener.
 - HTTP handler per listener: exact path routing, `GET`/`HEAD` only (`405`
   otherwise, `404` for unknown paths), `max_concurrent_requests` slots with
   immediate `503`, `502` with the failure reason only, failures logged at
