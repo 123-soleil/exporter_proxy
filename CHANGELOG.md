@@ -54,4 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in defaults sized for common exporters, with exceptions set per
   route or listener: `max_body_bytes` 2 MiB and `max_concurrent_requests` 2,
   bounding the worst-case parsing memory to about 45 MiB per listener.
+- HTTP handler per listener: exact path routing, `GET`/`HEAD` only (`405`
+  otherwise, `404` for unknown paths), `max_concurrent_requests` slots with
+  immediate `503`, `502` with the failure reason only, failures logged at
+  `warn`, optional access log, hooks for the proxy metrics.
 - `.gitignore` for Go builds, local configuration and key material.

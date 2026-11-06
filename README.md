@@ -52,6 +52,20 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
   go on different listeners.
 - Request credentials (`Authorization` header) are never forwarded upstream.
 
+### HTTP responses
+
+| Situation | Status | Notes |
+|-----------|--------|-------|
+| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`. `HEAD` returns the headers only. |
+| Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
+| Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
+| `max_concurrent_requests` reached | `503` | Immediate, never queued. |
+| Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
+
+`404` and `405` are answered before taking a concurrency slot: only real
+source reads count against `max_concurrent_requests`. A request whose client
+disconnects before the answer is not counted as a source failure.
+
 ### Route sources
 
 Each route has exactly one source:
