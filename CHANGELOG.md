@@ -29,4 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Design: configuration reload on `SIGHUP` with reload status metrics.
 - Design: exporter-style logs via `promslog` (`logfmt` by default, `json`
   optional, `--log.level`), access log disabled by default (`--log.access`).
+- Command skeleton: `--version` (one line), `--log.level`, `--log.format`,
+  `--config`, UTC log timestamps, reliable exit codes (0, 1, 2).
+- `Makefile` with `help`, `build` (static binary, version injected with
+  `-ldflags -X`), `test`, `lint` and `clean` targets.
 - `.gitignore` for Go builds, local configuration and key material.

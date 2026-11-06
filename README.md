@@ -344,7 +344,30 @@ re-reads them on new connections.
 
 ## Development
 
-Planned `Makefile` targets: `help` (default), `build`, `test`, `lint`, `clean`.
+Requirements: Go 1.26 or later (required by `prometheus/common`), git, make,
+and [golangci-lint](https://golangci-lint.run/) v2 for `make lint`.
+
+| Target       | Description                                                       |
+|--------------|-------------------------------------------------------------------|
+| `make help`  | List targets (default target).                                    |
+| `make build` | Build a static binary (`CGO_ENABLED=0`, `-trimpath`) into `bin/exporter_proxy`. |
+| `make test`  | Run the unit tests.                                               |
+| `make lint`  | Check `gofmt`, run `go vet` and `golangci-lint run`.              |
+| `make clean` | Remove `bin/exporter_proxy` and coverage files (other files in `bin/`, such as tools, are kept). |
+
+`make lint` uses `bin/golangci-lint` when that file exists, otherwise
+`golangci-lint` from `PATH`; `make lint GOLANGCI_LINT=/path/to/golangci-lint`
+forces another one.
+
+`make build` injects version information with `-ldflags -X` into
+`prometheus/common/version`: `VERSION` (default `git describe --tags --dirty
+--always`), `REVISION`, `BRANCH` and `BUILD_DATE` (date of the last commit, in
+UTC, so rebuilding a commit gives the same values). Each can be overridden,
+e.g. `make build VERSION=1.0.0`.
+
+Tests must not be run from a `noexec` mount: `go test` executes the test
+binaries it builds in `$TMPDIR`. On a server where `/tmp` is `noexec`, point
+`GOTMPDIR` to an executable directory.
 
 ## License
 
