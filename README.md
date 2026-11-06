@@ -537,15 +537,38 @@ answer `502`.
 
 ### Configuration reload (`SIGHUP`)
 
-On `SIGHUP` (`systemctl reload exporter_proxy`), the configuration is read
-and validated again:
+On `SIGHUP` (`systemctl reload exporter_proxy`), the configuration file is
+read, validated, its web configuration files are validated and every new
+address is bound **before** anything changes. A reload is all or nothing:
 
-- if it is invalid, the error is logged, the running configuration is kept
-  and `exporter_proxy_config_last_reload_successful` is set to `0`;
-- if it is valid, routes and limits are swapped atomically; listeners that
-  were added are started, listeners that were removed or whose address or web
-  configuration file changed are stopped gracefully (in-flight requests are
-  completed) and restarted; `exporter_proxy_config_hash` is updated.
+- if any step fails (invalid configuration, invalid web configuration, port
+  in use, new `systemd:` socket), the error is logged, the running
+  configuration is kept unchanged and
+  `exporter_proxy_config_last_reload_successful` is set to `0`;
+- otherwise the new configuration is applied, `exporter_proxy_config_hash`
+  and the reload metrics are updated and the log line
+  `msg="configuration reloaded" ... changed=true|false` tells whether the
+  file content changed.
+
+How each listener is applied (listeners are matched by `name`, addresses by
+the `listen` value as written):
+
+| Change | Effect |
+|--------|--------|
+| Same `name`, `listen` and `web_config_file` | Routes and limits are swapped atomically; the socket and open connections are kept. |
+| Same `listen`, other `web_config_file`, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully. |
+| New `listen` address | Bound at reload. |
+| New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
+| Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. |
+
+During a reload, requests already running on the previous handler still
+count against its `max_concurrent_requests`, while new requests use the new
+one: for a few seconds, a listener may serve up to twice its limit. Metric
+series of removed listeners and routes are deleted.
+
+Since the address is compared as written, changing `":9100"` into
+`"0.0.0.0:9100"` is seen as a new address and fails with "address already in
+use": restart the service for such a change.
 
 Web configuration files themselves do not need a reload, exporter-toolkit
 re-reads them while running:

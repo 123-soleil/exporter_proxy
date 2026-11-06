@@ -49,6 +49,10 @@ type Metrics struct {
 	configHash          prometheus.Gauge
 	reloadSuccessful    prometheus.Gauge
 	reloadSuccessTstamp prometheus.Gauge
+
+	// routes holds the listener and route paths of the loaded
+	// configuration, to delete the series of removed ones on reload.
+	routes map[string]map[string]bool
 }
 
 // New creates the metrics, registered in a dedicated registry together with
@@ -122,11 +126,33 @@ func New() *Metrics {
 	return m
 }
 
-// ConfigLoaded records a successful configuration load.
+// ConfigLoaded records a successful configuration load (startup or reload).
+// Series of listeners and routes that are no longer configured are deleted.
+// Not safe for concurrent calls: loads are serialized by the caller.
 func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 	m.configHash.Set(float64(cfg.Hash))
 	m.reloadSuccessful.Set(1)
 	m.reloadSuccessTstamp.Set(float64(at.Unix()))
+
+	next := make(map[string]map[string]bool, len(cfg.Listeners))
+	for _, l := range cfg.Listeners {
+		next[l.Name] = make(map[string]bool, len(l.Routes))
+		for _, r := range l.Routes {
+			next[l.Name][r.Path] = true
+		}
+	}
+	for listener, routes := range m.routes {
+		if _, ok := next[listener]; !ok {
+			m.deleteSeries(prometheus.Labels{"listener": listener})
+			continue
+		}
+		for route := range routes {
+			if !next[listener][route] {
+				m.deleteSeries(prometheus.Labels{"listener": listener, "route": route})
+			}
+		}
+	}
+	m.routes = next
 
 	// Initialize the series of every configured listener and route, so that
 	// rates and alerts work from the first scrape.
@@ -138,6 +164,21 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 				m.sourceErrors.WithLabelValues(l.Name, r.Path, string(reason))
 			}
 		}
+	}
+}
+
+// deleteSeries deletes the series matching labels in every vector that has
+// all these labels.
+func (m *Metrics) deleteSeries(labels prometheus.Labels) {
+	routeVecs := []interface {
+		DeletePartialMatch(prometheus.Labels) int
+	}{m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples, m.sourceErrors, m.fileModified}
+	for _, v := range routeVecs {
+		v.DeletePartialMatch(labels)
+	}
+	if _, ok := labels["route"]; !ok {
+		m.inFlight.DeletePartialMatch(labels)
+		m.rejected.DeletePartialMatch(labels)
 	}
 }
 

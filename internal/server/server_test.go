@@ -475,3 +475,267 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Errorf("metrics with credentials: code %d body %q", code, body)
 	}
 }
+
+// writeWeb writes a web configuration file with the given content.
+func writeWeb(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func route(path, upstreamURL string) config.Route {
+	return config.Route{Path: path, Upstream: upstreamURL + "/metrics", Limits: limits()}
+}
+
+// freeAddr returns a loopback address with a port that was free a moment
+// ago. Reload compares listen values as written, so tests use real ports
+// rather than ":0" (which validation rejects anyway).
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln := tcpListener(t)
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func withAddr(t *testing.T, l config.Listener) config.Listener {
+	t.Helper()
+	l.Listen = freeAddr(t)
+	return l
+}
+
+func TestReloadSwapsRoutesKeepingTheSocket(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+
+	l.Listen = addr // same address: the socket must be kept
+	l.Routes = []config.Route{route("/new", up.URL)}
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if got := s.Addr("node").String(); got != addr {
+		t.Errorf("address changed: %s -> %s", addr, got)
+	}
+	if code, _ := get(t, "http://"+addr+"/new", "", ""); code != http.StatusOK {
+		t.Errorf("new route: code %d, want 200", code)
+	}
+	if code, _ := get(t, "http://"+addr+"/metrics", "", ""); code != http.StatusNotFound {
+		t.Errorf("removed route: code %d, want 404", code)
+	}
+}
+
+func TestReloadNewWebConfigOnSameAddress(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+	auth := filepath.Join(dir, "auth.yml")
+	basicAuthWebConfig(t, auth, "prometheus", "s3cret-test")
+
+	l := withAddr(t, listenerConfig("node", plain, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+	url := "http://" + addr + "/metrics"
+	if code, _ := get(t, url, "", ""); code != http.StatusOK {
+		t.Fatalf("before reload: code %d", code)
+	}
+
+	l.Listen = addr
+	l.WebConfigFile = auth
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	// The old server stops gracefully; new connections reach the new one.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		code, _ := get(t, url, "", "")
+		if code == http.StatusUnauthorized {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("still served without authentication after reload (code %d)", code)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if code, _ := get(t, url, "prometheus", "s3cret-test"); code != http.StatusOK {
+		t.Errorf("with credentials after reload: code %d, want 200", code)
+	}
+}
+
+func TestReloadAddsAndRemovesListeners(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+
+	old := withAddr(t, listenerConfig("old", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{old}}, io.Discard)
+	oldAddr := s.Addr("old").String()
+
+	added := withAddr(t, listenerConfig("added", web, up.URL))
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{added}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if s.Addr("old") != nil {
+		t.Error("removed listener still known")
+	}
+	newAddr := s.Addr("added")
+	if newAddr == nil {
+		t.Fatal("added listener not started")
+	}
+	if code, _ := get(t, "http://"+newAddr.String()+"/metrics", "", ""); code != http.StatusOK {
+		t.Errorf("added listener: code %d, want 200", code)
+	}
+
+	// The removed listener's port is eventually closed.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", oldAddr, 200*time.Millisecond)
+		if err != nil {
+			break
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("removed listener still accepts connections")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestReloadRenamedListenerKeepsThePort(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("before", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("before").String()
+
+	l.Name = "after"
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v (the address must be reused, not bound again)", err)
+	}
+	if got := s.Addr("after"); got == nil || got.String() != addr {
+		t.Fatalf("renamed listener address = %v, want %s", got, addr)
+	}
+	if code, _ := get(t, "http://"+addr+"/metrics", "", ""); code != http.StatusOK {
+		t.Errorf("after rename: code %d, want 200", code)
+	}
+}
+
+func TestReloadFailureLeavesRunningConfiguration(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	busy := tcpListener(t)
+	defer func() { _ = busy.Close() }()
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+	l.Listen = addr
+
+	tests := []struct {
+		name    string
+		cfg     func() *config.Config
+		wantErr string
+	}{
+		{
+			name: "port in use",
+			cfg: func() *config.Config {
+				other := withAddr(t, listenerConfig("other", web, up.URL))
+				other.Listen = busy.Addr().String()
+				changed := l
+				changed.Routes = []config.Route{route("/changed", up.URL)}
+				return &config.Config{Listeners: []config.Listener{changed, other}}
+			},
+			wantErr: `listener "other"`,
+		},
+		{
+			name: "invalid web configuration",
+			cfg: func() *config.Config {
+				bad := l
+				bad.WebConfigFile = writeWeb(t, dir, "bad.yml", "nope: 1\n")
+				return &config.Config{Listeners: []config.Listener{bad}}
+			},
+			wantErr: "invalid web configuration",
+		},
+		{
+			name: "new systemd socket",
+			cfg: func() *config.Config {
+				sd := withAddr(t, listenerConfig("sd", web, up.URL))
+				sd.Listen = "systemd:sd"
+				return &config.Config{Listeners: []config.Listener{l, sd}}
+			},
+			wantErr: "only taken at startup",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := s.Reload(tt.cfg())
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Reload error = %v, want %q", err, tt.wantErr)
+			}
+			// Untouched: same address, same routes.
+			if got := s.Addr("node").String(); got != addr {
+				t.Errorf("address changed to %s", got)
+			}
+			if code, _ := get(t, "http://"+addr+"/metrics", "", ""); code != http.StatusOK {
+				t.Errorf("original route: code %d, want 200", code)
+			}
+			if code, _ := get(t, "http://"+addr+"/changed", "", ""); code != http.StatusNotFound {
+				t.Errorf("route from the failed reload is served (code %d)", code)
+			}
+		})
+	}
+}
+
+func TestReloadLetsInFlightRequestsFinish(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer slow.Close()
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+
+	s := startServer(t, &config.Config{Listeners: []config.Listener{withAddr(t, listenerConfig("slow", web, slow.URL))}}, io.Discard)
+	url := "http://" + s.Addr("slow").String() + "/metrics"
+
+	type result struct {
+		code int
+		body string
+	}
+	resc := make(chan result, 1)
+	go func() {
+		code, body := get(t, url, "", "")
+		resc <- result{code, body}
+	}()
+	<-started
+
+	// Remove the listener while its request is running.
+	var gotAuth atomic.Value
+	other := listenerConfig("other", web, upstream(t, &gotAuth).URL)
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{other}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	close(release)
+
+	if r := <-resc; r.code != http.StatusOK || r.body != metrics {
+		t.Errorf("in-flight request during reload: code=%d body=%q, want 200", r.code, r.body)
+	}
+}

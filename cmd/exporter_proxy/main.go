@@ -105,6 +105,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	logger.Info("configuration loaded", "path", opts.configPath,
 		"listeners", len(cfg.Listeners), "routes", routes, "hash", cfg.HashString())
 
+	// SIGHUP (systemctl reload) reloads the configuration. Registered
+	// before serving, so that an early SIGHUP does not kill the process.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	m := metrics.New()
 	m.ConfigLoaded(cfg, time.Now())
 
@@ -120,12 +126,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	code := exitOK
-	select {
-	case <-ctx.Done():
-		logger.Info("shutting down", "timeout", shutdownTimeout)
-	case err := <-srv.Err():
-		logger.Error("listener failed, shutting down", "err", err)
-		code = exitError
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("shutting down", "timeout", shutdownTimeout)
+			break loop
+		case err := <-srv.Err():
+			logger.Error("listener failed, shutting down", "err", err)
+			code = exitError
+			break loop
+		case <-hup:
+			if next := reload(opts.configPath, cfg.Hash, srv, m, logger); next != nil {
+				cfg = next
+			}
+		}
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -136,6 +151,26 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	logger.Info("stopped")
 	return code
+}
+
+// reload loads the configuration again and applies it, returning the new
+// configuration. On any error it returns nil: the running configuration is
+// kept and the reload metric is set to 0.
+func reload(path string, runningHash uint64, srv *server.Server, m *metrics.Metrics, logger *slog.Logger) *config.Config {
+	logger.Info("reloading configuration", "path", path)
+	cfg, err := config.Load(path)
+	if err == nil {
+		err = srv.Reload(cfg)
+	}
+	if err != nil {
+		m.ConfigLoadFailed()
+		logger.Error("configuration reload failed, keeping the running configuration", "path", path, "err", err)
+		return nil
+	}
+	m.ConfigLoaded(cfg, time.Now())
+	logger.Info("configuration reloaded", "path", path, "hash", cfg.HashString(),
+		"changed", cfg.Hash != runningHash, "listeners", len(cfg.Listeners))
+	return cfg
 }
 
 // runCheck implements --check: it reports every problem, one log line each,

@@ -77,4 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiry warning, non-empty client CA), metrics files (present, regular,
   readable, fresh) and Unix sockets (present, writable), reporting every
   finding on its own line; exit code 0 or 1.
+- Configuration reload on `SIGHUP`, all or nothing: unchanged listeners keep
+  their socket and connections, a listener on the same address with a new
+  web configuration or name gets a duplicate of the socket (the port is
+  never closed), removed listeners stop gracefully; metrics of removed routes
+  are deleted; `config_last_reload_successful` set to 0 on failure.
 - `.gitignore` for Go builds, local configuration and key material.

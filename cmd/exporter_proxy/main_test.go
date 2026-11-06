@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -391,4 +393,107 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func TestRunReloadsOnSIGHUP(t *testing.T) {
+	port, metricsPort := freePort(t), freePort(t)
+	cfgPath := servingConfig(t, port, metricsPort)
+	original := readFile(t, cfgPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &lockedBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, []string{"--config=" + cfgPath}, io.Discard, logs) }()
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitCode(t, base+"/metrics", http.StatusOK)
+
+	// 1. Valid change: the route moves to /renamed.
+	writeConfig(t, cfgPath, strings.Replace(original, "- path: /metrics", "- path: /renamed", 1))
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waitCode(t, base+"/renamed", http.StatusOK)
+	waitCode(t, base+"/metrics", http.StatusNotFound)
+	if !strings.Contains(logs.String(), "changed=true") {
+		t.Errorf("reload not logged as a change:\n%s", logs.String())
+	}
+
+	// 2. Invalid change: kept running with the previous configuration.
+	writeConfig(t, cfgPath, "listeners: [\n")
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "configuration reload failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("failed reload not logged:\n%s", logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitCode(t, base+"/renamed", http.StatusOK)
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if !strings.Contains(string(body), "exporter_proxy_config_last_reload_successful 0") {
+		t.Error("config_last_reload_successful not 0 after a failed reload")
+	}
+
+	cancel()
+	if code := <-done; code != exitOK {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+}
+
+// waitCode polls url until it answers with code.
+func waitCode(t *testing.T, url string, code int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get(url)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == code {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not answer %d in time (last err %v)", url, code, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// writeConfig replaces a configuration file atomically.
+func writeConfig(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for concurrent use.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

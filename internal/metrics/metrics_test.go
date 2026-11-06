@@ -151,3 +151,47 @@ func TestMetricNamesLint(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigReloadDeletesRemovedSeries(t *testing.T) {
+	m := New()
+	m.ConfigLoaded(&config.Config{Listeners: []config.Listener{
+		{Name: "gone", Routes: []config.Route{{Path: "/metrics"}}},
+		{Name: "kept", Routes: []config.Route{{Path: "/a"}, {Path: "/b"}}},
+	}}, time.Now())
+	for _, l := range []struct{ listener, route string }{{"gone", "/metrics"}, {"kept", "/a"}, {"kept", "/b"}} {
+		m.RequestServed(l.listener, l.route, 200, time.Millisecond)
+		m.FileModified(l.listener, l.route, time.Now())
+	}
+	m.RequestServed("kept", "", 404, time.Millisecond)
+
+	// Reload: listener "gone" and route "/b" are removed.
+	m.ConfigLoaded(&config.Config{Listeners: []config.Listener{
+		{Name: "kept", Routes: []config.Route{{Path: "/a"}}},
+	}}, time.Now())
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if !strings.HasPrefix(f.GetName(), "exporter_proxy_") {
+			continue
+		}
+		for _, metric := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range metric.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["listener"] == "gone" || labels["route"] == "/b" {
+				t.Errorf("%s still has series %v after reload", f.GetName(), labels)
+			}
+		}
+	}
+	// Kept series survive, including unmatched requests of a kept listener.
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("kept", "/a", "200")); got != 1 {
+		t.Errorf("kept series reset: %v", got)
+	}
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("kept", "", "404")); got != 1 {
+		t.Errorf("unmatched series of a kept listener reset: %v", got)
+	}
+}
