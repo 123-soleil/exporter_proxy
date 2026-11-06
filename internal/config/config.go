@@ -23,9 +23,9 @@ import (
 // listener/route sets a value. Keep README.md in sync.
 const (
 	DefaultTimeout                     = 10 * time.Second
-	DefaultMaxBodyBytes          int64 = 10 << 20 // 10 MiB
+	DefaultMaxBodyBytes          int64 = 4 << 20 // 4 MiB, about max_samples (50000) worth of text
 	DefaultMaxSamples                  = 50000
-	DefaultMaxConcurrentRequests       = 10
+	DefaultMaxConcurrentRequests       = 4
 )
 
 // Config is the resolved configuration: every default has been applied.

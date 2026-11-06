@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parser, bounded by `max_body_bytes` and `timeout`, with parse duration,
   response size and per-reason error metrics.
 - Design: `max_samples` limit per response (default 50000) and
-  `max_concurrent_requests` limit per listener (default 10, extra requests
+  `max_concurrent_requests` limit per listener (default 4, extra requests
   get `503`), with sample count, in-flight and rejection metrics.
 - Design: absolute, clean paths enforced for `file` and `unix_socket`;
   mandatory `max_age` for file routes with `stale` rejection and a file
@@ -51,4 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names), `max_samples` limit counted like Prometheus' `sample_limit`, parse
   duration measured; parse errors never include the offending content.
   Benchmark on synthetic data in `internal/content`.
+- Built-in defaults sized from the benchmark: `max_body_bytes` 4 MiB (about
+  `max_samples` worth of text) and `max_concurrent_requests` 4, bounding the
+  worst-case parsing memory to about 180 MiB per listener.
 - `.gitignore` for Go builds, local configuration and key material.
