@@ -42,4 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required `web_config_file`, `metrics` section and `max_age` on file routes,
   strictly positive limits.
 - Configuration hash (first 48 bits of SHA-256), logged at startup.
+- Metric sources: HTTP over TCP, HTTP over a Unix socket and static files,
+  bounded by `timeout` and `max_body_bytes` (decompressed size), with typed
+  failure reasons (`unavailable`, `timeout`, `too_large`, `stale`); no proxy
+  from the environment, no redirects, no client header forwarded, FIFOs and
+  non-regular files rejected without blocking.
 - `.gitignore` for Go builds, local configuration and key material.

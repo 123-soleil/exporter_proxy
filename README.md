@@ -72,8 +72,18 @@ Each route has exactly one source:
   (`reason="stale"`), so a writer that stopped running cannot go unnoticed
   behind old values. Choose it as a few times the writer's period (for
   example `max_age: 15m` for a file written every 5 minutes).
-- Upstream requests are sent with `Accept: text/plain; version=0.0.4`, no
-  client header is forwarded, and redirects are not followed.
+- Upstream requests are sent with `Accept: text/plain;version=0.0.4` and a
+  `User-Agent: exporter_proxy/<version>`; no client header is forwarded
+  (`Authorization` in particular), redirects are not followed and any status
+  other than `200` is a failure.
+- The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
+  always go straight to the configured upstream or socket.
+- gzip-compressed responses are accepted; `max_body_bytes` applies to the
+  decompressed size, so a small compressed body cannot expand without bound.
+- Files are opened without blocking and checked on the open descriptor: a
+  path pointing to a FIFO, a directory or a device fails immediately, and the
+  file cannot be swapped between the checks and the read. Local reads cannot
+  be interrupted, so for files `timeout` is checked once the read is done.
 - Whatever the source, the content is validated before being served (see
   below). Any failure returns `502 Bad Gateway`, is logged and counted, so
   Prometheus marks the target down instead of scraping partial or unexpected
