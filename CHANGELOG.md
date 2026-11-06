@@ -33,4 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config`, UTC log timestamps, reliable exit codes (0, 1, 2).
 - `Makefile` with `help`, `build` (static binary, version injected with
   `-ldflags -X`), `test`, `lint` and `clean` targets.
+- Strict configuration loading: unknown keys, empty files and multiple YAML
+  documents are errors; limits resolve from route or listener, then the
+  `defaults` section, then built-in defaults (documented in the README).
 - `.gitignore` for Go builds, local configuration and key material.

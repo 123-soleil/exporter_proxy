@@ -106,7 +106,7 @@ page) from being exposed through the proxy.
 - Validation guarantees the format, not the harmlessness of the content:
   label values are still free text chosen by the source.
 - Each listener serves at most `max_concurrent_requests` requests at the same
-  time (default 10). Extra requests are answered immediately with
+  time (default 10, set in `defaults` or per listener). Extra requests are answered immediately with
   `503 Service Unavailable` instead of queuing.
 - Memory use is therefore bounded by roughly `max_body_bytes` × the sum of
   `max_concurrent_requests` over all listeners. Parsing is linear in the
@@ -177,7 +177,7 @@ never client addresses or user names, to keep cardinality low.
 
 ## Configuration
 
-Main file (default `/etc/exporter_proxy/config.yml`, draft format):
+Main file (default `/etc/exporter_proxy/config.yml`, option `--config`):
 
 ```yaml
 # Endpoint exposing exporter_proxy's own metrics.
@@ -185,17 +185,19 @@ metrics:
   listen: "127.0.0.1:9999"
   web_config_file: /etc/exporter_proxy/web-metrics.yml
 
-# Defaults applied to every route, each one can be overridden per route.
+# Optional. Replaces the built-in defaults for every route (and every listener
+# for max_concurrent_requests); each value can still be overridden below.
 defaults:
-  timeout: 10s              # maximum time to read a source
-  max_body_bytes: 10485760  # 10 MiB, larger responses are rejected
-  max_samples: 50000        # responses with more samples are rejected
+  timeout: 10s                  # maximum time to read a source
+  max_body_bytes: 10485760      # 10 MiB, larger responses are rejected
+  max_samples: 50000            # responses with more samples are rejected
+  max_concurrent_requests: 10   # per listener, extra requests get 503
 
 listeners:
   - name: node                 # used as metric label, must be unique
     listen: ":9100"
     web_config_file: /etc/exporter_proxy/web-mtls.yml
-    max_concurrent_requests: 10   # extra requests get 503 (default 10)
+    max_concurrent_requests: 20   # per-listener override
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics
@@ -218,6 +220,43 @@ listeners:
         file: /var/lib/batch/metrics.prom
         max_age: 15m                     # required for file routes
 ```
+
+### Parsing rules
+
+- The file is decoded strictly: an unknown or misspelled key, at any level,
+  is an error (exit code `1` at startup), never silently ignored.
+- The file must contain exactly one YAML document; an empty file is an error.
+- Durations use Go syntax with a unit (`500ms`, `10s`, `15m`, `1h`); a bare
+  number such as `10` is rejected.
+- Sizes are plain integers in bytes.
+
+### Default values
+
+Each limit is resolved in this order, the first one set wins:
+
+1. the value on the route (`timeout`, `max_body_bytes`, `max_samples`) or on
+   the listener (`max_concurrent_requests`);
+2. the value in the `defaults` section;
+3. the built-in default below.
+
+| Key                       | Level            | Built-in default | Notes |
+|---------------------------|------------------|------------------|-------|
+| `timeout`                 | defaults, route  | `10s`            | Maximum time to fetch and read a source. |
+| `max_body_bytes`          | defaults, route  | `10485760` (10 MiB) | Larger responses are rejected (`too_large`). |
+| `max_samples`             | defaults, route  | `50000`          | Responses with more samples are rejected (`too_many_samples`). |
+| `max_concurrent_requests` | defaults, listener | `10`           | Extra requests get `503`. |
+| `max_age`                 | route (`file`)   | none, required   | Older files are rejected (`stale`). |
+
+Other built-in defaults:
+
+| Setting           | Default                           |
+|-------------------|-----------------------------------|
+| `--config`        | `/etc/exporter_proxy/config.yml`  |
+| `--log.level`     | `info`                            |
+| `--log.format`    | `logfmt`                          |
+| `--log.access`    | off                               |
+
+### Web configuration examples
 
 Example mTLS web configuration (`web-mtls.yml`):
 

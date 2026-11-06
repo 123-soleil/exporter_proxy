@@ -10,6 +10,7 @@ import (
 )
 
 func TestRunExitCodes(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.yml")
 	tests := []struct {
 		name       string
 		args       []string
@@ -57,6 +58,18 @@ func TestRunExitCodes(t *testing.T) {
 			args:       []string{"--config=" + validConfig(t)},
 			wantCode:   exitError,
 			wantStderr: "proxy not implemented yet",
+		},
+		{
+			name:       "missing config file",
+			args:       []string{"--config=" + missing},
+			wantCode:   exitError,
+			wantStderr: "cannot load configuration",
+		},
+		{
+			name:       "unknown config key",
+			args:       []string{"--config=" + writeFile(t, "listners: []\n")},
+			wantCode:   exitError,
+			wantStderr: "field listners not found",
 		},
 	}
 

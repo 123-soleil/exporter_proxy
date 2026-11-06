@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
 )
@@ -72,7 +73,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	logger := promslog.New(opts.logConfig)
 
 	logger.Info("starting "+appName, version.Slog()...)
-	logger.Info("loading configuration", "path", opts.configPath)
+	cfg, err := config.Load(opts.configPath)
+	if err != nil {
+		logger.Error("cannot load configuration", "path", opts.configPath, "err", err)
+		return exitError
+	}
+	routes := 0
+	for _, l := range cfg.Listeners {
+		routes += len(l.Routes)
+	}
+	logger.Info("configuration loaded", "path", opts.configPath,
+		"listeners", len(cfg.Listeners), "routes", routes)
 
 	// The proxy itself is not implemented yet: fail loudly rather than
 	// pretending to run.
