@@ -115,7 +115,7 @@ page) from being exposed through the proxy.
   a misconfigured source pointing to sensitive data must not leak it into
   the logs.
 - A response larger than `max_body_bytes` is rejected without being fully
-  read (default 4 MiB). A source that does not answer within `timeout` is
+  read (default 2 MiB). A source that does not answer within `timeout` is
   rejected (default 10 s). A response containing more than `max_samples`
   samples is rejected (default 50000; every line with a value counts, so each
   histogram bucket is one sample, like Prometheus' `sample_limit`). These three
@@ -125,14 +125,15 @@ page) from being exposed through the proxy.
 - Validation guarantees the format, not the harmlessness of the content:
   label values are still free text chosen by the source.
 - Each listener serves at most `max_concurrent_requests` requests at the same
-  time (default 4, set in `defaults` or per listener). Extra requests are answered immediately with
+  time (default 2, set in `defaults` or per listener). Extra requests are answered immediately with
   `503 Service Unavailable` instead of queuing.
 - Parsing is linear in the response size, but the parser allocates about
   **10 times the body size** while it runs. Peak memory is therefore bounded
   by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
-  all listeners: with the defaults (4 MiB, 4 requests) and one listener,
-  about 180 MiB in the worst case. Lower `max_body_bytes` to what the
-  exporters really produce (see `exporter_proxy_response_size_bytes`), and
+  all listeners: with the defaults (2 MiB, 2 requests) and one listener,
+  about 45 MiB in the worst case. The defaults fit common exporters; raise
+  `max_body_bytes` (and `max_concurrent_requests`) only on the routes or
+  listeners that need it (see `exporter_proxy_response_size_bytes`), and
   size `MemoryMax=` in the systemd unit accordingly.
 - Parse cost is exposed as `exporter_proxy_parse_duration_seconds`.
   Reference measurements on synthetic node_exporter-like data (single
@@ -220,9 +221,9 @@ metrics:
 # for max_concurrent_requests); each value can still be overridden below.
 defaults:
   timeout: 10s                  # maximum time to read a source
-  max_body_bytes: 4194304       # 4 MiB, larger responses are rejected
+  max_body_bytes: 2097152       # 2 MiB, larger responses are rejected
   max_samples: 50000            # responses with more samples are rejected
-  max_concurrent_requests: 4    # per listener, extra requests get 503
+  max_concurrent_requests: 2    # per listener, extra requests get 503
 
 listeners:
   - name: node                 # used as metric label, must be unique
@@ -299,9 +300,9 @@ Each limit is resolved in this order, the first one set wins:
 | Key                       | Level            | Built-in default | Notes |
 |---------------------------|------------------|------------------|-------|
 | `timeout`                 | defaults, route  | `10s`            | Maximum time to fetch and read a source. |
-| `max_body_bytes`          | defaults, route  | `4194304` (4 MiB)   | Larger responses are rejected (`too_large`). |
+| `max_body_bytes`          | defaults, route  | `2097152` (2 MiB)   | Larger responses are rejected (`too_large`). |
 | `max_samples`             | defaults, route  | `50000`          | Responses with more samples are rejected (`too_many_samples`). |
-| `max_concurrent_requests` | defaults, listener | `4`            | Extra requests get `503`. |
+| `max_concurrent_requests` | defaults, listener | `2`            | Extra requests get `503`. |
 | `max_age`                 | route (`file`)   | none, required   | Older files are rejected (`stale`). |
 
 Other built-in defaults:
