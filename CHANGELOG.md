@@ -72,4 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source errors by reason, in-flight and rejected requests, file
   modification time, `build_info`, configuration hash and load status, plus
   Go and process metrics; series pre-initialized at 0.
+- `--check`: validates the configuration, the web configuration files
+  (exporter-toolkit validation, certificate validity dates with a 30-day
+  expiry warning, non-empty client CA), metrics files (present, regular,
+  readable, fresh) and Unix sockets (present, writable), reporting every
+  finding on its own line; exit code 0 or 1.
 - `.gitignore` for Go builds, local configuration and key material.

@@ -326,3 +326,69 @@ func TestRunFailsWhenPortIsBusy(t *testing.T) {
 		t.Errorf("stderr = %s, want bind error", &stderr)
 	}
 }
+
+func TestRunCheck(t *testing.T) {
+	// A valid setup passes without binding any port: the busy port is
+	// irrelevant to --check.
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = busy.Close() }()
+	good := servingConfig(t, busy.Addr().(*net.TCPAddr).Port, freePort(t))
+
+	invalid := writeFile(t, `
+metrics:
+  listen: ":9999"
+listeners:
+  - name: a
+    listen: ":9100"
+    routes:
+      - path: metrics
+        file: relative.prom
+`)
+	missingFile := strings.Replace(readFile(t, good), "m.prom", "absent.prom", 1)
+
+	tests := []struct {
+		name       string
+		config     string
+		wantCode   int
+		wantStderr []string
+	}{
+		{"valid setup", good, exitOK, []string{"check passed", "hash="}},
+		{"invalid configuration", invalid, exitError, []string{
+			`problem="metrics: web_config_file is required"`,
+			`problem="listener \"a\": web_config_file is required"`,
+			"path must start with '/'",
+			"check failed",
+		}},
+		{"missing metrics file", writeFile(t, missingFile), exitError, []string{"absent.prom", "no such file", "problems=1"}},
+		{"missing config file", filepath.Join(t.TempDir(), "nope.yml"), exitError, []string{"cannot load configuration"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(context.Background(), []string{"--check", "--config=" + tt.config}, &stdout, &stderr)
+			if code != tt.wantCode {
+				t.Errorf("exit code = %d, want %d\n%s", code, tt.wantCode, &stderr)
+			}
+			for _, w := range tt.wantStderr {
+				if !strings.Contains(stderr.String(), w) {
+					t.Errorf("stderr lacks %q:\n%s", w, &stderr)
+				}
+			}
+			if strings.Contains(stderr.String(), "Listening on") {
+				t.Error("--check started a listener")
+			}
+		})
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}

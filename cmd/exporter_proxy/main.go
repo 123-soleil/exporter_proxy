@@ -8,11 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/123-soleil/exporter_proxy/internal/check"
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/metrics"
 	"github.com/123-soleil/exporter_proxy/internal/server"
@@ -41,6 +43,7 @@ const (
 type options struct {
 	configPath  string
 	showVersion bool
+	check       bool
 	accessLog   bool
 	logConfig   *promslog.Config
 }
@@ -86,6 +89,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	logger := promslog.New(opts.logConfig)
 
 	logger.Info("starting "+appName, version.Slog()...)
+	if opts.check {
+		return runCheck(opts.configPath, logger)
+	}
+
 	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		logger.Error("cannot load configuration", "path", opts.configPath, "err", err)
@@ -131,6 +138,42 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
+// runCheck implements --check: it reports every problem, one log line each,
+// and returns exitOK only if there is none. Warnings do not fail the check.
+func runCheck(path string, logger *slog.Logger) int {
+	cfg, err := config.Load(path)
+	if err != nil {
+		var verr *config.ValidationError
+		if errors.As(err, &verr) {
+			for _, p := range verr.Problems {
+				logger.Error("check: configuration problem", "path", path, "problem", p)
+			}
+			logger.Error("check failed", "path", path, "problems", len(verr.Problems))
+		} else {
+			logger.Error("check failed: cannot load configuration", "path", path, "err", err)
+		}
+		return exitError
+	}
+
+	problems, warnings := 0, 0
+	for _, f := range check.Run(cfg, time.Now()) {
+		switch f.Severity {
+		case check.Problem:
+			problems++
+			logger.Error("check: problem", "where", f.Where, "problem", f.Message)
+		default:
+			warnings++
+			logger.Warn("check: warning", "where", f.Where, "warning", f.Message)
+		}
+	}
+	if problems > 0 {
+		logger.Error("check failed", "path", path, "problems", problems, "warnings", warnings)
+		return exitError
+	}
+	logger.Info("check passed", "path", path, "hash", cfg.HashString(), "warnings", warnings)
+	return exitOK
+}
+
 // parseFlags parses the command line. Flag names follow the conventions of
 // Prometheus exporters (--log.level, --log.format).
 func parseFlags(args []string, stderr io.Writer) (*options, error) {
@@ -146,6 +189,7 @@ func parseFlags(args []string, stderr io.Writer) (*options, error) {
 	fs.SetOutput(stderr)
 	fs.StringVar(&opts.configPath, "config", defaultConfigPath, "path to the configuration file")
 	fs.BoolVar(&opts.showVersion, "version", false, "print version information and exit")
+	fs.BoolVar(&opts.check, "check", false, "check the configuration and the files it references, then exit")
 	fs.BoolVar(&opts.accessLog, "log.access", false, "log one line per served request")
 	fs.Var(opts.logConfig.Level, "log.level", "minimum log level: debug, info, warn, error")
 	fs.Var(opts.logConfig.Format, "log.format", "log format: logfmt, json")

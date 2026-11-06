@@ -443,7 +443,7 @@ exporter_proxy --version
 | Flag        | Description                                                        |
 |-------------|--------------------------------------------------------------------|
 | `--config`  | Path to the configuration file (default `/etc/exporter_proxy/config.yml`). |
-| `--check`   | *Not implemented yet.* Check the whole setup without starting anything, then exit (see below). |
+| `--check`   | Check the whole setup without starting anything, then exit `0` (no problem) or `1` (see below). |
 | `--log.level` | Minimum log level: `debug`, `info`, `warn`, `error` (default `info`). |
 | `--log.format` | Log format: `logfmt` or `json` (default `logfmt`).              |
 | `--log.access` | Log one line per served request (default off).                  |
@@ -495,18 +495,32 @@ for log pipelines that prefer JSON.
 
 ### Checking a setup (`--check`)
 
-`--check` goes further than validating the configuration syntax. It reports
-every problem found (one log line each, not only the first one) and
-exits with `0` if everything is correct, `1` otherwise:
+`--check` goes further than validating the configuration syntax. It starts
+nothing and binds no port. It reports every finding (one log line each, not
+only the first one) and exits with `0` if there is no problem, `1`
+otherwise; warnings do not fail the check:
 
-- the main configuration is parsed and validated (same rules as at startup);
-- each web configuration file exists, is readable and valid, and the
-  certificate, key and client CA files it references are readable and can be
-  loaded;
+- the main configuration is parsed and validated (same rules as at startup,
+  each validation problem on its own line);
+- each web configuration file (listeners and `metrics`, checked once when
+  shared) is valid for exporter-toolkit: strict YAML, valid bcrypt hashes,
+  certificate and key readable and matching, client CA readable;
+- the certificates are within their validity dates: an expired or
+  not-yet-valid certificate is a problem, one expiring within 30 days is a
+  warning; the client CA file must contain at least one certificate;
+- basic authentication without TLS is a warning;
 - each `file` route: the file exists, is a regular file, is readable and is
   not older than `max_age`;
-- each `unix_socket` route: the path exists, is a socket and is writable
-  (required by `connect()`).
+- each `unix_socket` route: the path exists, is a socket and is writable by
+  the current user (required by `connect()`).
+
+Example output:
+
+```
+level=ERROR msg="check: problem" where="listener \"files\" route \"/batch/metrics\"" problem="file: open /var/lib/batch/metrics.prom: no such file or directory"
+level=WARN msg="check: warning" where="listener \"node\" web_config_file /etc/exporter_proxy/web-mtls.yml" warning="cert_file /etc/exporter_proxy/tls/node.crt: certificate \"CN=node\" expires on 2026-11-30T00:00:00Z"
+level=ERROR msg="check failed" path=/etc/exporter_proxy/config.yml problems=1 warnings=1
+```
 
 Permissions depend on the user running the check: run it as the service user
 to get a meaningful result:

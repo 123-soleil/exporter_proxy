@@ -296,36 +296,6 @@ func TestShutdownWaitsForInFlightRequests(t *testing.T) {
 	}
 }
 
-func TestBasicAuthWithoutTLS(t *testing.T) {
-	tests := []struct {
-		name string
-		yaml string
-		want bool
-	}{
-		{"empty", "{}\n", false},
-		{"users without TLS", "basic_auth_users:\n  u: hash\n", true},
-		{"users with TLS files", "tls_server_config:\n  cert_file: /c\n  key_file: /k\nbasic_auth_users:\n  u: hash\n", false},
-		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: hash\n", false},
-		{"TLS without users", "tls_server_config:\n  cert_file: /c\n  key_file: /k\n", false},
-		{"mTLS only", "tls_server_config:\n  client_ca_file: /ca\n  client_auth_type: RequireAndVerifyClientCert\n", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := filepath.Join(t.TempDir(), "web.yml")
-			if err := os.WriteFile(p, []byte(tt.yaml), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			got, err := basicAuthWithoutTLS(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tt.want {
-				t.Errorf("basicAuthWithoutTLS = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestStartWarnsOnClearTextBasicAuth(t *testing.T) {
 	webConfig := filepath.Join(t.TempDir(), "web.yml")
 	basicAuthWebConfig(t, webConfig, "prometheus", "s3cret-test")
