@@ -24,4 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Design: `--version` flag and `exporter_proxy_build_info` metric.
 - Design: `exporter_proxy_config_hash` metric (SHA-256 of the loaded
   configuration file, first 48 bits).
+- Design: `--check` flag validating the configuration and the files it
+  references (web configurations, TLS material, metric files, sockets).
+- Design: configuration reload on `SIGHUP` with reload status metrics.
 - `.gitignore` for Go builds, local configuration and key material.

@@ -58,7 +58,7 @@ Each route has exactly one source:
 | Source         | Route keys                     | Behavior                                                                 |
 |----------------|--------------------------------|--------------------------------------------------------------------------|
 | HTTP over TCP  | `upstream`                     | Fetches the URL (`http://` only).                                        |
-| HTTP over UDS  | `upstream` + `unix_socket`     | Connects to the socket instead of the URL host; the URL path and query are sent as is (the host part is ignored, like `curl --unix-socket`). |
+| HTTP over UDS (HTTP only, no raw stream) | `upstream` + `unix_socket` | Connects to the socket instead of the URL host; the URL path and query are sent as is (the host part is ignored, like `curl --unix-socket`). |
 | Static file    | `file`                         | Reads the file on every request.                                         |
 
 - `unix_socket` is only valid together with `upstream`; `file` excludes both.
@@ -162,6 +162,10 @@ textfile collector. Planned metrics (names may change):
   change, comments included, changes the hash. Web configuration files are
   not included: exporter-toolkit re-reads them on new connections, so they
   are not part of the loaded state.
+- `exporter_proxy_config_last_reload_successful` (gauge, 0 or 1): whether
+  the last configuration load (startup or `SIGHUP`) succeeded.
+- `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
+  of the last successful configuration load.
 - `exporter_proxy_requests_in_flight{listener}` (gauge): requests being
   served.
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
@@ -260,7 +264,51 @@ exporter_proxy --version
 | Flag        | Description                                                        |
 |-------------|--------------------------------------------------------------------|
 | `--config`  | Path to the configuration file (default `/etc/exporter_proxy/config.yml`). |
+| `--check`   | Check the whole setup without starting anything, then exit (see below). |
 | `--version` | Print version, revision and Go version on one line, then exit 0.   |
+
+### Checking a setup (`--check`)
+
+`--check` goes further than validating the configuration syntax. It reports
+every problem found (one JSON log line each, not only the first one) and
+exits with `0` if everything is correct, `1` otherwise:
+
+- the main configuration is parsed and validated (same rules as at startup);
+- each web configuration file exists, is readable and valid, and the
+  certificate, key and client CA files it references are readable and can be
+  loaded;
+- each `file` route: the file exists, is a regular file, is readable and is
+  not older than `max_age`;
+- each `unix_socket` route: the path exists, is a socket and is writable
+  (required by `connect()`).
+
+Permissions depend on the user running the check: run it as the service user
+to get a meaningful result:
+
+```sh
+sudo -u exporter_proxy exporter_proxy --check --config /etc/exporter_proxy/config.yml
+```
+
+`--check` does not contact HTTP upstreams over TCP. It is not used as
+`ExecStartPre=` in the systemd unit, because a source that is temporarily
+missing (exporter not started yet, file not written yet) must not prevent
+the proxy from starting: at runtime such a source only makes its own route
+answer `502`.
+
+### Configuration reload (`SIGHUP`)
+
+On `SIGHUP` (`systemctl reload exporter_proxy`), the configuration is read
+and validated again:
+
+- if it is invalid, the error is logged, the running configuration is kept
+  and `exporter_proxy_config_last_reload_successful` is set to `0`;
+- if it is valid, routes and limits are swapped atomically; listeners that
+  were added are started, listeners that were removed or whose address or web
+  configuration file changed are stopped gracefully (in-flight requests are
+  completed) and restarted; `exporter_proxy_config_hash` is updated.
+
+Web configuration files themselves do not need a reload: exporter-toolkit
+re-reads them on new connections.
 
 The version is injected at build time (`-ldflags -X`) from the git tag; a
 build outside a tag reports the output of `git describe --tags --dirty`.
