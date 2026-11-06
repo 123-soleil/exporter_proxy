@@ -15,7 +15,9 @@ Group=exporter_proxy
 EnvironmentFile=-/etc/default/exporter_proxy
 ExecStart=/usr/sbin/exporter_proxy --config /etc/exporter_proxy/config.yml $ARGS
 # Configuration reload: all or nothing, keeps the running configuration on
-# error (see exporter_proxy_config_last_reload_successful).
+# error (see exporter_proxy_config_last_reload_successful). /bin/kill comes
+# from the procps package (installed by default on Debian; minimal container
+# images may lack it).
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s

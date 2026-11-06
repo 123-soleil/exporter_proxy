@@ -476,6 +476,12 @@ Until the first stable release, `exporter_proxy` is built from source and
 installed by hand. The files of `deploy/` are the ones a package will
 install.
 
+### Requirements
+
+- Debian 12 or later (systemd 252 or later).
+- `procps`, which provides `/bin/kill` for `systemctl reload` (installed by
+  default on Debian, missing from minimal container images).
+
 ### Build
 
 ```sh
@@ -538,6 +544,14 @@ kernel protections, `ProtectProc=invisible` and `ProcSubset=pid`,
 `MemoryDenyWriteExecute=yes`, address families limited to `AF_UNIX`,
 `AF_INET` and `AF_INET6`, system calls limited to `@system-service` without
 `@privileged`. All directives exist in systemd 252 (Debian 12).
+
+The unit was tested as installed by the commands above on Debian 12
+(systemd 252, in a container with systemd as PID 1): `--check` as the service
+user, start, scrapes through an mTLS listener (TCP exporter) and a basic
+authentication listener (exporter on a Unix socket under `/run`, metrics file
+under `/var/lib`), refused TLS handshake and wrong password counted,
+`systemctl reload` (valid then invalid configuration, same PID) and
+`systemctl stop` (clean exit). No system call was denied by the filter.
 
 `systemd-analyze security` rates it **1.4 (OK)**. The remaining items are
 needed by the service or depend on the site:

@@ -98,4 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listener, answered `429`); verified credentials are cached as a SHA-256
   and never limited. The web configuration `rate_limit` is supported.
 - Documentation: mTLS preferred over basic authentication.
+- Documentation: `procps` requirement for `systemctl reload`; the unit was
+  tested on Debian 12 (systemd 252) as installed by the README.
 - `.gitignore` for Go builds, local configuration and key material.
