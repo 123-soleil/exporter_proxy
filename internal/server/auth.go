@@ -3,12 +3,13 @@ package server
 import (
 	"crypto/sha256"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
+	config_util "github.com/prometheus/common/config"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/time/rate"
 
@@ -31,9 +32,14 @@ const (
 
 	// verifyRate and verifyBurst bound uncached bcrypt verifications per
 	// listener, all clients together: the last guard against an attack
-	// from many addresses.
-	verifyRate  = 10 // per second
-	verifyBurst = 20
+	// from many addresses. About what one CPU verifies at cost 12.
+	verifyRate  = 5 // per second
+	verifyBurst = 10
+
+	// maxPendingVerifications bounds the verifications running or waiting
+	// for verifyMu: beyond it, requests get 429 instead of queuing, so a
+	// queue never builds up when hashes cost more than the rate allows.
+	maxPendingVerifications = 4
 
 	// maxTrackedClients bounds the per-address limiters kept in memory.
 	maxTrackedClients = 4096
@@ -46,10 +52,47 @@ const (
 	maxLoggedUserLen = 64
 )
 
-// fakeHash is compared against when the user does not exist, so that
-// unknown and known users take the same time (no user enumeration). Same
-// value as exporter-toolkit: bcrypt hash of "fakepassword".
+// StatusWebConfigUnreadable answers every request of a listener whose web
+// configuration file cannot be read or parsed (unassigned 5xx code, so that
+// it is told apart from upstream and proxy errors), with
+// WebConfigUnreadableMessage as body.
+const (
+	StatusWebConfigUnreadable  = 518
+	WebConfigUnreadableMessage = "web configuration unreadable"
+)
+
+// fakeHash is compared against when the user does not exist and no
+// configured hash gives a cost: bcrypt hash of "fakepassword" at cost 10,
+// same value as exporter-toolkit.
 const fakeHash = "$2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi"
+
+// fakeHashes caches, by bcrypt cost, the hash compared against when the
+// user does not exist.
+var fakeHashes sync.Map // int -> []byte
+
+// fakeHashFor returns a hash with the highest cost of the configured
+// hashes, so that an unknown user takes as long as a known one with a wrong
+// password (no user enumeration by timing). It is generated once per cost.
+func fakeHashFor(users map[string]config_util.Secret) []byte {
+	cost := 0
+	for _, h := range users {
+		if c, err := bcrypt.Cost([]byte(h)); err == nil && c > cost {
+			cost = c
+		}
+	}
+	if cost == 0 {
+		return []byte(fakeHash)
+	}
+	if v, ok := fakeHashes.Load(cost); ok {
+		return v.([]byte)
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte("fakepassword"), cost)
+	if err != nil {
+		return []byte(fakeHash)
+	}
+	v, _ := fakeHashes.LoadOrStore(cost, h)
+	return v.([]byte)
+}
 
 // authHandler applies the web configuration of a listener to each request,
 // like exporter-toolkit does, and reports every refusal:
@@ -73,8 +116,11 @@ type authHandler struct {
 	// verifications, per client address and per listener.
 	clientLimiters *clientLimiters
 	verifyLimiter  *rate.Limiter
-	// verifyMu runs one bcrypt verification at a time, like exporter-toolkit.
+	// verifyMu runs one bcrypt verification at a time, like
+	// exporter-toolkit; pending holds a slot per verification running or
+	// waiting for it.
 	verifyMu  sync.Mutex
+	pending   chan struct{}
 	successes *successCache
 }
 
@@ -88,6 +134,7 @@ func newAuthHandler(listener, webConfig string, rl webRateLimit, next http.Handl
 		clientLimiters: newClientLimiters(clientVerifyRate, clientVerifyBurst, maxTrackedClients),
 		verifyLimiter:  rate.NewLimiter(verifyRate, verifyBurst),
 		successes:      newSuccessCache(successCacheSize),
+		pending:        make(chan struct{}, maxPendingVerifications),
 	}
 	if rl.interval > 0 {
 		h.limiter = rate.NewLimiter(rate.Every(rl.interval), rl.burst)
@@ -109,9 +156,11 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c, err := webconfig.Load(h.webConfig)
+	h.rec.WebConfigRead(h.listener, err == nil)
 	if err != nil {
-		h.logger.Error("cannot load web configuration", "web_config_file", h.webConfig, "err", errfmt.OneLine(err))
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		h.logger.Error("cannot load web configuration", "web_config_file", h.webConfig,
+			"code", StatusWebConfigUnreadable, "err", errfmt.OneLine(err))
+		http.Error(w, WebConfigUnreadableMessage, StatusWebConfigUnreadable)
 		return
 	}
 
@@ -130,9 +179,6 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, known := c.Users[user]
-	if !known {
-		hash = fakeHash
-	}
 
 	// The key covers the stored hash: a password change in the web
 	// configuration invalidates the cached success. The password itself is
@@ -143,13 +189,33 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.clientLimiters.allow(clientIP(r)) || !h.verifyLimiter.Allow() {
+	if key := clientKey(r); key != "" && !h.clientLimiters.allow(key) || !h.verifyLimiter.Allow() {
+		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
+		return
+	}
+	select {
+	case h.pending <- struct{}{}:
+	default:
 		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
 		return
 	}
 	h.verifyMu.Lock()
-	err = bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass))
+	if r.Context().Err() != nil {
+		// The client left while waiting: skip the verification, but still
+		// answer (a half-closed client may read) and count the refusal,
+		// never an empty 200.
+		h.verifyMu.Unlock()
+		<-h.pending
+		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
+		return
+	}
+	compared := []byte(hash)
+	if !known {
+		compared = fakeHashFor(c.Users)
+	}
+	err = bcrypt.CompareHashAndPassword(compared, []byte(pass))
 	h.verifyMu.Unlock()
+	<-h.pending
 
 	if !known || err != nil {
 		h.refuse(w, r, proxy.AuthInvalidCredentials, user, http.StatusUnauthorized)
@@ -212,13 +278,25 @@ func (c *successCache) add(k [sha256.Size]byte) {
 	c.keys[k] = struct{}{}
 }
 
-// clientIP returns the IP address of the client, without the port.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+// clientKey identifies the client for rate limiting: its IPv4 address, or
+// the /64 network of its IPv6 address, since a single host usually owns a
+// whole /64. It is empty when the client has no IP address (listener on a
+// Unix socket passed by systemd): only the per-listener limit applies then,
+// instead of one bucket shared by all clients.
+func clientKey(r *http.Request) string {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return ""
 	}
-	return host
+	addr := ap.Addr().Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	p, err := addr.WithZone("").Prefix(64)
+	if err != nil {
+		return addr.String()
+	}
+	return p.String()
 }
 
 // clientLimiters holds one rate limiter per client address.

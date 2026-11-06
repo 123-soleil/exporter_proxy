@@ -120,19 +120,25 @@ func newSwapHandler(sp spec) *swapHandler {
 	return sh
 }
 
-// store installs the handler of sp and returns the previous one, nil the
+// store installs the handler of sp and returns the previous state, nil the
 // first time.
-func (sh *swapHandler) store(sp spec) http.Handler {
-	old := sh.cur.Swap(&handlerState{h: sp.handler, writeTimeout: sp.writeTimeout})
-	if old == nil {
-		return nil
-	}
-	return old.h
+func (sh *swapHandler) store(sp spec) *handlerState {
+	return sh.cur.Swap(&handlerState{h: sp.handler, writeTimeout: sp.writeTimeout})
 }
 
-// closeIdle closes the idle upstream connections of a handler that no
-// longer receives requests, instead of leaving them open until their idle
-// timeout. Connections still in use are closed when they become idle.
+// retire closes the idle upstream connections of a handler replaced by a
+// reload: now, then once its last requests are over (bounded by its write
+// timeout), since connections in use go back to its pool when they end.
+func retire(old *handlerState) {
+	if old == nil {
+		return
+	}
+	closeIdle(old.h)
+	time.AfterFunc(old.writeTimeout, func() { closeIdle(old.h) })
+}
+
+// closeIdle closes the upstream connections of h that are idle now, instead
+// of leaving them open until their idle timeout.
 func closeIdle(h http.Handler) {
 	if c, ok := h.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
@@ -277,7 +283,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 	// Commit: nothing below can fail.
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
-		closeIdle(sw.l.handler.store(sw.sp))
+		retire(sw.l.handler.store(sw.sp))
 	}
 	next := make(map[string]*listener, len(specs))
 	for name := range kept {
@@ -395,16 +401,18 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	tlsCfg.NextProtos = nextProtos
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
-	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
+	name, webConfig, logger, rec := sp.name, sp.webConfig, s.logger.With("listener", sp.name), s.recorder()
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		c, err := webconfig.Load(webConfig)
 		if err == nil {
 			var cfg *tls.Config
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
+				rec.WebConfigRead(name, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
+		rec.WebConfigRead(name, false)
 		logger.Error("cannot load TLS settings for a new connection", "web_config_file", webConfig, "err", errfmt.OneLine(err))
 		return nil, err
 	}

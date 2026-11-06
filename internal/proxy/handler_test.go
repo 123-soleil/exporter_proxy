@@ -99,6 +99,8 @@ func (r *recorder) ContentParsed(_, _ string, samples int, _ time.Duration) {
 
 func (r *recorder) AuthFailed(string, AuthReason) {}
 
+func (r *recorder) WebConfigRead(string, bool) {}
+
 func (r *recorder) SourceFailed(_, _ string, reason source.Reason) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -371,8 +373,12 @@ func TestHandlerClientCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil).WithContext(ctx))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil).WithContext(ctx))
 
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("code on the wire = %d, want 502 (never an empty 200)", w.Code)
+	}
 	if len(rec.failed) != 0 {
 		t.Errorf("client cancellation counted as source failure: %v", rec.failed)
 	}
@@ -540,5 +546,25 @@ func TestHandlerAnswersBeforeScraperTimeout(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "scrape_budget_ms=1000") {
 		t.Errorf("budget not logged: %s", logs.String())
+	}
+}
+
+// closingSource counts CloseIdleConnections calls.
+type closingSource struct {
+	fakeSource
+	closed int
+}
+
+func (c *closingSource) CloseIdleConnections() { c.closed++ }
+
+func TestHandlerCloseIdleConnections(t *testing.T) {
+	src := &closingSource{}
+	h := newHandler("node", []route{
+		{path: "/a", src: src, maxSamples: 10},
+		{path: "/b", src: fakeSource{}, maxSamples: 10}, // without the method
+	}, 1, Options{})
+	h.CloseIdleConnections()
+	if src.closed != 1 {
+		t.Errorf("CloseIdleConnections called %d times, want 1", src.closed)
 	}
 }

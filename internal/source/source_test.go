@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -395,5 +396,25 @@ func TestReasonOf(t *testing.T) {
 				t.Errorf("ReasonOf = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHTTPSourceCloseIdleConnections(t *testing.T) {
+	src, err := New(config.Route{Upstream: "http://127.0.0.1:1/metrics", Limits: config.Limits{Timeout: time.Second, MaxBodyBytes: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := src.(interface{ CloseIdleConnections() })
+	if !ok {
+		t.Fatal("HTTP source does not implement CloseIdleConnections")
+	}
+	c.CloseIdleConnections()
+}
+
+// A limit at the int64 maximum must not overflow into "read nothing".
+func TestReadLimitedHugeLimit(t *testing.T) {
+	body, err := readLimited(strings.NewReader("up 1\n"), math.MaxInt64)
+	if err != nil || string(body) != "up 1\n" {
+		t.Errorf("readLimited = %q, %v; want the whole body", body, err)
 	}
 }

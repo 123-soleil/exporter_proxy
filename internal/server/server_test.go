@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -831,5 +832,39 @@ func TestReloadAppliesRateLimitChange(t *testing.T) {
 			t.Fatal("rate_limit not applied after reload")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// An unreadable web configuration refuses new TLS connections and is
+// reported as a failed read.
+func TestTLSWebConfigUnreadableIsRecorded(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	web := writeWeb(t, dir, "web.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+
+	rec := &authRecorder{}
+	s, err := Start(&config.Config{Listeners: []config.Listener{listenerConfig("node", web, up.URL)}},
+		Options{Logger: slog.New(slog.DiscardHandler), Recorder: rec})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	writeWeb(t, dir, "web.yml", "not: [valid\n")
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test certificate
+	}}
+	if resp, err := client.Get("https://" + s.Addr("node").String() + "/metrics"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("TLS connection accepted with an unreadable web configuration")
+	}
+	if got := rec.reads(); !slices.Equal(got, []bool{false}) {
+		t.Errorf("web configuration reads recorded %v, want [false]", got)
 	}
 }

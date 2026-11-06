@@ -1,17 +1,20 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	config_util "github.com/prometheus/common/config"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
@@ -20,14 +23,27 @@ import (
 // authRecorder captures AuthFailed events.
 type authRecorder struct {
 	proxy.NopRecorder
-	mu      sync.Mutex
-	reasons []proxy.AuthReason
+	mu             sync.Mutex
+	reasons        []proxy.AuthReason
+	webConfigReads []bool
 }
 
 func (r *authRecorder) AuthFailed(_ string, reason proxy.AuthReason) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.reasons = append(r.reasons, reason)
+}
+
+func (r *authRecorder) WebConfigRead(_ string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.webConfigReads = append(r.webConfigReads, ok)
+}
+
+func (r *authRecorder) reads() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.webConfigReads...)
 }
 
 func (r *authRecorder) got() []proxy.AuthReason {
@@ -230,10 +246,20 @@ func TestAuthHandlerWebConfigRateLimit(t *testing.T) {
 }
 
 func TestAuthHandlerBrokenWebConfig(t *testing.T) {
-	h, next, _, logs, path := newTestAuth(t, "{}\n", webRateLimit{})
+	h, next, rec, logs, path := newTestAuth(t, "{}\n", webRateLimit{})
+	if w := do(h, "", ""); w.Code != http.StatusOK {
+		t.Fatalf("valid web config: code %d", w.Code)
+	}
 	mustWriteFile(t, path, "not: [valid\n")
-	if w := do(h, "", ""); w.Code != http.StatusInternalServerError || next.count() != 0 {
-		t.Errorf("broken web config: code %d, next %d, want 500 and 0", w.Code, next.count())
+	w := do(h, "", "")
+	if w.Code != StatusWebConfigUnreadable || next.count() != 1 {
+		t.Errorf("broken web config: code %d, next %d, want 518 and 1", w.Code, next.count())
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != WebConfigUnreadableMessage {
+		t.Errorf("body = %q, want %q", got, WebConfigUnreadableMessage)
+	}
+	if got := rec.reads(); !slices.Equal(got, []bool{true, false}) {
+		t.Errorf("web configuration reads recorded %v, want [true false]", got)
 	}
 	if !strings.Contains(logs.String(), "cannot load web configuration") {
 		t.Errorf("error not logged: %s", logs.String())
@@ -322,5 +348,77 @@ func TestAuthHandlerRateLimitBeforeReadingWebConfig(t *testing.T) {
 	}
 	if w := do(h, "", ""); w.Code != http.StatusTooManyRequests {
 		t.Errorf("rate limited request: code %d, want 429 without reading the file", w.Code)
+	}
+}
+
+// When verifications are already pending, new ones get 429 instead of
+// queuing behind them.
+func TestAuthHandlerPendingVerificationsBounded(t *testing.T) {
+	h, next, _, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{})
+	for range maxPendingVerifications {
+		h.pending <- struct{}{}
+	}
+	if w := do(h, "prometheus", "good-pass"); w.Code != http.StatusTooManyRequests {
+		t.Errorf("with a full queue: code %d, want 429", w.Code)
+	}
+	for range maxPendingVerifications {
+		<-h.pending
+	}
+	if w := do(h, "prometheus", "good-pass"); w.Code != http.StatusOK || next.count() != 1 {
+		t.Errorf("after the queue drained: code %d, next %d, want 200 and 1", w.Code, next.count())
+	}
+}
+
+// Unknown users are compared against a hash of the configured cost.
+func TestFakeHashForUsesConfiguredCost(t *testing.T) {
+	low, _ := bcrypt.GenerateFromPassword([]byte("a"), bcrypt.MinCost)
+	high, _ := bcrypt.GenerateFromPassword([]byte("b"), bcrypt.MinCost+2)
+	got := fakeHashFor(map[string]config_util.Secret{"a": config_util.Secret(low), "b": config_util.Secret(high)})
+	if c, err := bcrypt.Cost(got); err != nil || c != bcrypt.MinCost+2 {
+		t.Errorf("fake hash cost = %d (%v), want %d", c, err, bcrypt.MinCost+2)
+	}
+	if string(fakeHashFor(nil)) != fakeHash {
+		t.Error("without configured hashes, the default fake hash is not used")
+	}
+}
+
+func TestClientKey(t *testing.T) {
+	for remote, want := range map[string]string{
+		"192.0.2.10:40000":             "192.0.2.10",
+		"[::ffff:192.0.2.10]:40000":    "192.0.2.10",
+		"[2001:db8:1:2:3:4:5:6]:40000": "2001:db8:1:2::/64",
+		"[2001:db8:1:2:ffff::1]:40000": "2001:db8:1:2::/64",
+		"[fe80::1%eth0]:40000":         "fe80::/64",
+		"@":                            "", // Unix socket: no per-client limit
+		"":                             "",
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = remote
+		if got := clientKey(r); got != want {
+			t.Errorf("clientKey(%q) = %q, want %q", remote, got, want)
+		}
+	}
+}
+
+// A client that leaves while its verification waits gets a refusal, never
+// an empty 200, and the refusal is counted.
+func TestAuthHandlerClientLeftWhileWaiting(t *testing.T) {
+	h, next, rec, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil).WithContext(ctx)
+	req.RemoteAddr = "192.0.2.10:40000"
+	req.SetBasicAuth("prometheus", "wrong")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests || next.count() != 0 {
+		t.Errorf("code %d, next %d, want 429 and 0", w.Code, next.count())
+	}
+	if got := rec.got(); !slices.Equal(got, []proxy.AuthReason{proxy.AuthRateLimited}) {
+		t.Errorf("recorded %v, want [rate_limited]", got)
+	}
+	if len(h.pending) != 0 {
+		t.Errorf("%d verification slots still taken", len(h.pending))
 	}
 }

@@ -62,13 +62,15 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. |
+| Web configuration file of the listener unreadable or invalid | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
 `404` and `405` are answered before taking a concurrency slot: only real
 source reads count against `max_concurrent_requests`. A request whose client
-disconnects before the answer is not counted as a source failure: nothing is
-sent, and it is recorded with code `499` (nginx convention) in
-`exporter_proxy_requests_total`, so that it does not count as a `5xx`.
+disconnects before the answer is not counted as a source failure: it is
+recorded with code `499` (nginx convention) in
+`exporter_proxy_requests_total`, so that it does not count as a `5xx`, while
+a `502` is still written in case the client is still reading.
 
 ### Route sources
 
@@ -218,24 +220,41 @@ Credentials that already passed a bcrypt check are remembered (as a SHA-256
 of user, stored hash and password: the password itself is not kept in
 memory), so a scraper is checked once and then served without any bcrypt
 cost. Only checks of credentials not yet known to be valid are limited, one
-at a time, by two limits:
+at a time, by three limits:
 
-- **per client IP address: 2 per second, with a burst of 5**, so that a
+- **per client address: 2 per second, with a burst of 5**, so that a
   brute force from one address cannot use up the checks of other clients;
-- **per listener, all addresses together: 10 per second, with a burst of
-  20**, against an attack from many addresses.
+  an IPv4 address counts alone, an IPv6 address with its whole `/64`
+  network (usually one host); clients of a listener on a Unix socket
+  (`systemd:` socket unit with `ListenStream=/path`) have no IP address and
+  only get the per-listener limit;
+- **per listener, all addresses together: 5 per second, with a burst of
+  10**, against an attack from many addresses;
+- **at most 4 checks running or waiting per listener**, so that requests
+  never queue behind slow hashes.
 
-Beyond either limit, the request gets `429` without any bcrypt computation.
+Beyond any of these limits, the request gets `429` without any bcrypt
+computation. A check whose client leaves while waiting is skipped.
 
 As a result, a brute force attack costs at most a few bcrypt checks per
 second and never slows down a scraper whose credentials are already
 verified. A scraper verified for the first time (after a restart or a
-password change) while another address attacks still gets its own checks;
-only an attack from many addresses at once can make it wait for a later
-scrape. Unknown users are checked against a
-fixed hash, so that they take the same time as known ones (no user
-enumeration). Changing a password in the web configuration invalidates the
-remembered credentials of that user.
+password change) while one address attacks still gets its own checks; an
+attack from several addresses at once can use up the per-listener budget,
+and such a scraper then gets `429` until the attack stops.
+
+These rates assume a check of about 200-250 ms (cost 12 on a current
+CPU). With a higher cost, or a slow machine (0.5 s or more per check), a
+single address at 2 checks per second keeps the verifications busy all the
+time, and a scraper verified for the first time mostly gets `429` during
+the attack: keep cost 12, and prefer mTLS, whose refusals cost no bcrypt
+check.
+
+Unknown users are checked against a hash with the highest cost of the
+configured hashes, so that they take the same time as known ones (no user
+enumeration by timing, as long as all hashes have the same cost). Changing
+a password in the web configuration invalidates the remembered credentials
+of that user.
 
 The `rate_limit` section of the web configuration (exporter-toolkit format,
 `interval` and `burst`) is also supported: it limits **all** requests of the
@@ -258,7 +277,10 @@ Besides the standard `go_*`, `process_*` and
 
 - `exporter_proxy_requests_total{listener,route,code}`: requests served;
   `route` is empty for paths that match no route (`404`); `code="499"` for
-  clients that disconnected before the answer.
+  clients that disconnected before the answer. Requests refused before
+  routing (`401` and `429`, counted in `exporter_proxy_auth_failures_total`,
+  and `518`, shown by `exporter_proxy_web_config_read_error`) are not
+  included.
 - `exporter_proxy_request_duration_seconds{listener,route}` (histogram): total
   time to serve a request (fetch + parse), for matched routes only.
 - `exporter_proxy_parse_duration_seconds{listener,route}` (histogram): time
@@ -296,6 +318,11 @@ Besides the standard `go_*`, `process_*` and
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
+- `exporter_proxy_web_config_read_error{listener}` (gauge, 0 or 1): 1 while
+  the last read of the listener's web configuration file failed (requests
+  answered `518`, new TLS connections refused), 0 once it is read again
+  successfully. Updated on every request and every new TLS connection;
+  `listener="metrics"` for the metrics endpoint.
 
 Labels only take values from the configuration (listener names and route
 paths), from a fixed set (`reason`) or from HTTP status codes, never client
@@ -313,6 +340,8 @@ increase(exporter_proxy_source_errors_total[15m]) > 0
 time() - exporter_proxy_file_modified_timestamp_seconds > 3600
 # Someone is trying credentials or certificates.
 increase(exporter_proxy_auth_failures_total{reason=~"invalid_credentials|rate_limited"}[15m]) > 10
+# A web configuration file cannot be read: the listener answers 518.
+exporter_proxy_web_config_read_error == 1
 # Scrapes are refused: raise max_concurrent_requests or reduce scrapers.
 increase(exporter_proxy_requests_rejected_total[15m]) > 0
 # Configuration differs between servers that should be identical.
@@ -412,7 +441,7 @@ Each limit is resolved in this order, the first one set wins:
 | Key                       | Level            | Built-in default | Notes |
 |---------------------------|------------------|------------------|-------|
 | `timeout`                 | defaults, route  | `10s`            | Maximum time to fetch and read a source. |
-| `max_body_bytes`          | defaults, route  | `2097152` (2 MiB)   | Larger responses are rejected (`too_large`). |
+| `max_body_bytes`          | defaults, route  | `2097152` (2 MiB)   | Larger responses are rejected (`too_large`). At most `1073741824` (1 GiB). |
 | `max_samples`             | defaults, route  | `24000`          | Responses with more samples are rejected (`too_many_samples`). |
 | `max_concurrent_requests` | defaults, listener | `2`            | Extra requests get `503`. |
 | `max_age`                 | route (`file`)   | none, required   | Older files are rejected (`stale`). |
@@ -733,6 +762,8 @@ while running, like exporter-toolkit does:
 
 - `basic_auth_users` and `http_server_config.headers` on every request: a
   user added, removed or with a new password takes effect immediately;
+  headers are checked against exporter-toolkit's list (a forbidden header
+  or value makes the file invalid, so requests get `518`), like at startup;
 - TLS settings (certificate, key, client CA) on every new connection, so a
   renewed certificate is picked up without restart.
 

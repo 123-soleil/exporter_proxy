@@ -89,7 +89,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric series; `requests_in_flight` stays exact when a listener is
   removed and added back.
 - Requests whose client disconnected are recorded with code `499` instead
-  of `502`.
+  of `502` (a `502` is still written, never an empty `200`).
+- An unreadable or invalid web configuration file answers `518` with the
+  body `web configuration unreadable` (was a bare `500`), and sets the new
+  gauge `exporter_proxy_web_config_read_error{listener}` to 1 until the file
+  is read successfully again; TLS connections refused for the same reason
+  set it too.
+- Headers of a web configuration file changed while running are checked
+  against exporter-toolkit's allowed list, like at startup (a forbidden
+  header was sent on every response); such a file answers `518`.
+- A client that leaves while its password check waits gets `429` and is
+  counted, never an empty `200`.
+- Clients of a listener on a Unix socket only get the per-listener password
+  check limit, instead of sharing one per-client bucket.
+- A file read still running during a reload no longer recreates the
+  `file_modified_timestamp_seconds` series of a route that stopped being a
+  file route.
+- `max_body_bytes` is limited to 1 GiB: a value near the int64 maximum
+  overflowed and made every route answer an empty `200`.
+- Unknown users are checked against a hash with the cost of the configured
+  hashes (was always cost 10), so that user names cannot be told apart by
+  timing; per-client limits group IPv6 addresses by `/64`.
+- `file_modified_timestamp_seconds` is deleted when a route stops being a
+  file route.
+- `golang.org/x/net` upgraded to v0.62.0 (GO-2026-6866, GO-2026-6860, not
+  reachable from the code).
 - `--check` stops at the first certificate of `cert_file` even when it
   cannot be parsed, instead of checking the next one as the leaf.
 - Idle upstream connections are closed when a handler is replaced or
@@ -108,8 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tls_handshake`, `missing_credentials`, `invalid_credentials`,
   `rate_limited`).
 - Rate limiting of uncached bcrypt password checks (2/s, burst 5 per
-  client IP address, and 10/s, burst 20 per listener, answered `429`), so
-  that a brute force from one address does not lock out other scrapers;
+  client IP address, 5/s, burst 10 and at most 4 pending per listener,
+  answered `429`), so that a brute force from one address does not lock
+  out other scrapers and no queue builds up;
   verified credentials are cached as a SHA-256 and never limited. The web
   configuration `rate_limit` is supported and applied before the web
   configuration is read.

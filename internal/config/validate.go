@@ -227,8 +227,12 @@ func (v *validator) checkAbsPath(where, key, p string) {
 
 func (v *validator) checkLimits(where string, l fileLimits) {
 	v.checkPositiveDuration(where, "timeout", l.Timeout)
-	if l.MaxBodyBytes != nil && *l.MaxBodyBytes <= 0 {
+	switch {
+	case l.MaxBodyBytes == nil:
+	case *l.MaxBodyBytes <= 0:
 		v.addf(where, "max_body_bytes must be greater than 0")
+	case *l.MaxBodyBytes > MaxMaxBodyBytes:
+		v.addf(where, "max_body_bytes must be at most %d (1 GiB)", MaxMaxBodyBytes)
 	}
 	v.checkPositiveInt(where, "max_samples", l.MaxSamples)
 }

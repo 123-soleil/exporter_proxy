@@ -40,6 +40,10 @@ type Recorder interface {
 	// AuthFailed is called for every request or connection refused before
 	// routing (TLS handshake, basic authentication, rate limiting).
 	AuthFailed(listener string, reason AuthReason)
+	// WebConfigRead is called after each read of the web configuration
+	// file of a listener (on every request and every new TLS connection),
+	// with whether it could be read and applied.
+	WebConfigRead(listener string, ok bool)
 }
 
 // AuthReason classifies a refused authentication. Values are metric label
@@ -189,10 +193,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	body, err := h.fetch(ctx, rt)
 	if err != nil {
 		if req.Context().Err() != nil {
-			// The client went away: not a source failure, nobody to answer.
-			// Recorded as 499, nothing is written.
+			// The client went away: not a source failure. Recorded as 499,
+			// but a 502 is still written: a client that only half-closed
+			// its connection may still read, and must not get an empty 200.
 			h.logger.Debug("client canceled the request", "route", rt.path, "err", err)
 			rw.code = statusClientClosedRequest
+			rw.ResponseWriter.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		reason := source.ReasonOf(err)
@@ -316,3 +322,4 @@ func (NopRecorder) FileModified(string, string, time.Time)           {}
 func (NopRecorder) ContentParsed(string, string, int, time.Duration) {}
 func (NopRecorder) AuthFailed(string, AuthReason)                    {}
 func (NopRecorder) SourceFailed(string, string, source.Reason)       {}
+func (NopRecorder) WebConfigRead(string, bool)                       {}

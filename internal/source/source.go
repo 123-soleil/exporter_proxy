@@ -95,7 +95,11 @@ func New(r config.Route) (Source, error) {
 // readLimited reads at most limit bytes from r and fails with
 // ReasonTooLarge if there is more, without reading the rest.
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	probe := limit + 1 // one more byte tells that there is more
+	if probe < limit {
+		probe = limit // overflow: cannot be exceeded anyway
+	}
+	body, err := io.ReadAll(io.LimitReader(r, probe))
 	if err != nil {
 		return nil, err
 	}
