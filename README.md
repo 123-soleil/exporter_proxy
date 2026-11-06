@@ -606,6 +606,17 @@ forces another one.
 UTC, so rebuilding a commit gives the same values). Each can be overridden,
 e.g. `make build VERSION=1.0.0`.
 
+`make test` includes end-to-end tests (`cmd/exporter_proxy/e2e_test.go`)
+that run the whole program with a certificate authority, server and client
+certificates generated at test time. They check that the mTLS listener
+accepts a valid client certificate and refuses a missing one, one from
+another CA, an expired one, one without client usage and TLS 1.1; that
+basic authentication over TLS works and that neither credentials nor other
+client headers nor the client query string reach the upstream exporter; that
+plain HTTP on a TLS port is refused; that the metrics endpoint enforces its
+own web configuration; and that a renewed server certificate is used for new
+connections without restart.
+
 Tests must not be run from a `noexec` mount: `go test` executes the test
 binaries it builds in `$TMPDIR`. On a server where `/tmp` is `noexec`, point
 `GOTMPDIR` to an executable directory.

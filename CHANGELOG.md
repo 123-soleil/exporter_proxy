@@ -82,4 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   web configuration or name gets a duplicate of the socket (the port is
   never closed), removed listeners stop gracefully; metrics of removed routes
   are deleted; `config_last_reload_successful` set to 0 on failure.
+- End-to-end tests with a test PKI: mTLS (valid, missing, foreign CA,
+  expired, wrong usage, TLS 1.1), basic auth over TLS, nothing from the
+  client forwarded upstream, plain HTTP on a TLS port, metrics endpoint
+  protection, server certificate rotation without restart.
 - `.gitignore` for Go builds, local configuration and key material.
