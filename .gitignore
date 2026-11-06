@@ -1,0 +1,30 @@
+# Build output
+/bin/
+/dist/
+
+# Go test and coverage artifacts
+*.test
+*.out
+coverage.*
+*.prof
+
+# Local configuration and secrets (only *.exemple files are versioned)
+.env
+.env.*
+/config.yml
+/web-config*.yml
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local Claude Code notes
+CLAUDE.md
