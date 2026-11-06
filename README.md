@@ -423,13 +423,86 @@ them owned by the service user with mode `0600`.
 
 ## Installation
 
-Until the first stable release, `exporter_proxy` is built from source. Build
-and install instructions will be added together with the `Makefile` and the
-systemd deployment files.
+Until the first stable release, `exporter_proxy` is built from source and
+installed by hand. The files of `deploy/` are the ones a package will
+install.
 
-Upstream exporters must be reconfigured to listen on `127.0.0.1` only;
-otherwise their port remains reachable without authentication and the proxy
-can be bypassed.
+### Build
+
+```sh
+make build        # static binary: bin/exporter_proxy
+```
+
+### Files
+
+| Source in `deploy/` | Installed as | Notes |
+|---------------------|--------------|-------|
+| `bin/exporter_proxy` (built) | `/usr/sbin/exporter_proxy` | mode `0755` |
+| `sysusers/exporter_proxy.conf.exemple` | `/usr/lib/sysusers.d/exporter_proxy.conf` | then `systemd-sysusers` creates the `exporter_proxy` user and group |
+| `systemd/exporter_proxy.service.exemple` | `/usr/lib/systemd/system/exporter_proxy.service` | then `systemctl daemon-reload` |
+| `default/exporter_proxy.exemple` | `/etc/default/exporter_proxy` | optional `ARGS` (`--log.format=json`, ...) |
+| `config/config.yml.exemple` | `/etc/exporter_proxy/config.yml` | contains `CHANGE_ME` |
+| `config/web-mtls.yml.exemple`, `config/web-basic.yml.exemple` | `/etc/exporter_proxy/web-*.yml` | contain `CHANGE_ME` |
+
+```sh
+sudo install -m 0755 bin/exporter_proxy /usr/sbin/exporter_proxy
+sudo install -m 0644 deploy/sysusers/exporter_proxy.conf.exemple /usr/lib/sysusers.d/exporter_proxy.conf
+sudo systemd-sysusers
+sudo install -m 0644 deploy/systemd/exporter_proxy.service.exemple /usr/lib/systemd/system/exporter_proxy.service
+sudo install -m 0644 deploy/default/exporter_proxy.exemple /etc/default/exporter_proxy
+sudo install -d -m 0755 /etc/exporter_proxy /etc/exporter_proxy/tls
+sudo install -m 0640 -g exporter_proxy deploy/config/config.yml.exemple /etc/exporter_proxy/config.yml
+sudo install -m 0640 -g exporter_proxy deploy/config/web-mtls.yml.exemple /etc/exporter_proxy/web-mtls.yml
+sudo install -m 0640 -g exporter_proxy deploy/config/web-basic.yml.exemple /etc/exporter_proxy/web-basic.yml
+sudo systemctl daemon-reload
+```
+
+### What the administrator fills in
+
+1. Replace every `CHANGE_ME` in `/etc/exporter_proxy/config.yml`: listen
+   addresses, upstream ports, socket and file paths. Remove the example
+   routes that do not apply.
+2. Put the server certificate, its key and the client CA in
+   `/etc/exporter_proxy/tls/` (owner `root:exporter_proxy`, mode `0640`)
+   and set their paths in the web configuration files.
+3. For basic authentication, set the bcrypt hash of each user
+   (`htpasswd -nBC 12 "" | tr -d ':\n'`).
+4. Reconfigure the upstream exporters to listen on `127.0.0.1` only;
+   otherwise their port remains reachable without authentication and the
+   proxy can be bypassed.
+5. Give the `exporter_proxy` user access to the sources it reads: read
+   permission on metric files, write permission on Unix sockets (usually by
+   adding it to the group owning them).
+6. Check, then start:
+
+```sh
+sudo -u exporter_proxy exporter_proxy --check --config /etc/exporter_proxy/config.yml
+sudo systemctl enable --now exporter_proxy
+```
+
+### systemd hardening
+
+The unit follows a least-privilege profile: dedicated user, no capability
+(`CapabilityBoundingSet=` empty), read-only file system
+(`ProtectSystem=strict`, `ProtectHome=yes`), private `/tmp` and devices,
+kernel protections, `ProtectProc=invisible` and `ProcSubset=pid`,
+`MemoryDenyWriteExecute=yes`, address families limited to `AF_UNIX`,
+`AF_INET` and `AF_INET6`, system calls limited to `@system-service` without
+`@privileged`. All directives exist in systemd 252 (Debian 12).
+
+`systemd-analyze security` rates it **1.4 (OK)**. The remaining items are
+needed by the service or depend on the site:
+
+| Item | Reason |
+|------|--------|
+| `RestrictAddressFamilies` allows `AF_INET`/`AF_INET6`, no `PrivateNetwork=` | The proxy listens and connects to exporters. |
+| `RestrictAddressFamilies` allows `AF_UNIX` | Exporters on Unix sockets. |
+| No `PrivateUsers=` | It would hide supplementary groups, which grant access to sockets and metric files. |
+| No `IPAddressAllow=`/`IPAddressDeny=` | Scraper addresses are site specific; add them in a local drop-in if wanted. |
+| `@resources` system calls allowed | The Go runtime raises `RLIMIT_NOFILE` at startup. |
+
+Connecting to a Unix socket works under `ProtectSystem=strict`: only the
+permission of the socket file matters, not the read-only mount.
 
 ## Usage
 

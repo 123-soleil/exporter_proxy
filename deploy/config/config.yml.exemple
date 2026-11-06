@@ -1,0 +1,72 @@
+# exporter_proxy configuration (/etc/exporter_proxy/config.yml).
+#
+# Unknown keys are errors. Check a change before applying it:
+#   sudo -u exporter_proxy exporter_proxy --check --config /etc/exporter_proxy/config.yml
+# then apply it without restart: systemctl reload exporter_proxy
+#
+# Durations use a unit (500ms, 10s, 15m, 1h); sizes are in bytes.
+# All paths must be absolute.
+
+# Endpoint exposing exporter_proxy's own metrics. Required.
+metrics:
+  # Address to listen on: "host:port", or "systemd:<name>" for a socket
+  # passed by systemd (FileDescriptorName=<name>). Required.
+  listen: "CHANGE_ME:9999"
+  # exporter-toolkit web configuration (TLS, mTLS, basic auth) of this
+  # endpoint. Required.
+  web_config_file: /etc/exporter_proxy/web-mtls.yml
+
+# Optional. Limits applied to every route (and to every listener for
+# max_concurrent_requests); each one can be overridden on a route or
+# listener. The values below are the built-in defaults.
+defaults:
+  # Maximum time to read a source, response body included.
+  timeout: 10s
+  # Larger responses are rejected (reason "too_large"). Default 2 MiB.
+  max_body_bytes: 2097152
+  # Responses with more samples are rejected (reason "too_many_samples").
+  max_samples: 24000
+  # Requests served at the same time per listener; extra requests get 503.
+  max_concurrent_requests: 2
+
+# Listeners: one address, one web configuration, one or more routes each.
+# All routes of a listener share its authentication.
+listeners:
+  # Name used in logs and as the "listener" metric label: letters, digits,
+  # '_', '.', '-'; unique; "metrics" is reserved. Required.
+  - name: node
+    # "host:port" or "systemd:<name>". Required, unique.
+    listen: "CHANGE_ME:9100"
+    # exporter-toolkit web configuration of this listener. Required.
+    web_config_file: /etc/exporter_proxy/web-mtls.yml
+    # Optional, overrides defaults.max_concurrent_requests.
+    # max_concurrent_requests: 2
+    routes:
+      # Exact request path, starting with '/'. Required, unique in the
+      # listener.
+      - path: /metrics
+        # HTTP exporter over TCP: http:// only, no credentials. The
+        # exporter should listen on 127.0.0.1 only, otherwise it can be
+        # reached without going through the proxy.
+        upstream: http://127.0.0.1:CHANGE_ME/metrics
+        # Optional per-route overrides of the defaults section:
+        # timeout: 20s
+        # max_body_bytes: 4194304
+        # max_samples: 50000
+
+  - name: apps
+    listen: "CHANGE_ME:9443"
+    web_config_file: /etc/exporter_proxy/web-basic.yml
+    routes:
+      # HTTP exporter on a Unix socket: the host of "upstream" is ignored,
+      # its path and query are sent as is. The service user needs write
+      # permission on the socket.
+      - path: /app/metrics
+        upstream: http://localhost/metrics
+        unix_socket: /run/CHANGE_ME/metrics.sock
+      # Static file in the Prometheus text format, re-read on every request.
+      # Must be written atomically (temporary file + rename) and end with a
+      # newline. max_age is required: older files are rejected ("stale").
+      - path: /batch/metrics
+        file: /var/lib/CHANGE_ME/metrics.prom
+        max_age: 15m

@@ -1,0 +1,19 @@
+# exporter-toolkit web configuration: TLS with mandatory client certificate
+# (mTLS). Install as /etc/exporter_proxy/web-mtls.yml, owner
+# root:exporter_proxy, mode 0640.
+#
+# Re-read on every new connection: renewed certificates are used without
+# restart. Replace files atomically (temporary file + rename).
+# Reference: https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md
+
+tls_server_config:
+  # Server certificate and key (PEM). The key must be readable by the
+  # exporter_proxy user only.
+  cert_file: /etc/exporter_proxy/tls/CHANGE_ME.crt
+  key_file: /etc/exporter_proxy/tls/CHANGE_ME.key
+  # CA that signed the scrapers' client certificates (VictoriaMetrics).
+  client_ca_file: /etc/exporter_proxy/tls/CHANGE_ME-ca.crt
+  # Require and verify a client certificate: mTLS.
+  client_auth_type: RequireAndVerifyClientCert
+  # Default minimum version is TLS 1.2; uncomment to require TLS 1.3.
+  # min_version: TLS13

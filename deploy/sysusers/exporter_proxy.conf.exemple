@@ -1,0 +1,5 @@
+# System user and group of the exporter_proxy service
+# (/usr/lib/sysusers.d/exporter_proxy.conf, applied with systemd-sysusers).
+# No usable home directory and no login shell.
+#Type Name           ID GECOS                                    Home        Shell
+u     exporter_proxy -  "exporter_proxy, Prometheus exporter proxy" /nonexistent /usr/sbin/nologin

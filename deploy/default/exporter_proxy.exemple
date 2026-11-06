@@ -1,0 +1,9 @@
+# Environment of the exporter_proxy service (/etc/default/exporter_proxy).
+# Read by exporter_proxy.service; apply with: systemctl restart exporter_proxy
+
+# Extra command line options, appended after --config. Available options:
+#   --log.level=debug|info|warn|error   (default info)
+#   --log.format=logfmt|json            (default logfmt)
+#   --log.access                        one log line per request (default off)
+# Example: ARGS="--log.format=json"
+ARGS=""

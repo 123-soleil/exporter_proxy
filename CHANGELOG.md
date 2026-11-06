@@ -86,4 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired, wrong usage, TLS 1.1), basic auth over TLS, nothing from the
   client forwarded upstream, plain HTTP on a TLS port, metrics endpoint
   protection, server certificate rotation without restart.
+- Deployment files: commented configuration and web configuration examples,
+  `/etc/default` file for extra options, sysusers declaration and hardened
+  systemd unit with reload (`systemd-analyze security`: 1.4).
 - `.gitignore` for Go builds, local configuration and key material.

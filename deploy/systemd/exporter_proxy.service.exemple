@@ -1,0 +1,72 @@
+# exporter_proxy service (/usr/lib/systemd/system/exporter_proxy.service).
+# Hardened for the oldest supported Debian (12, systemd 252).
+
+[Unit]
+Description=TLS, mTLS and basic authentication proxy for Prometheus exporters
+Documentation=file:///usr/share/doc/exporter_proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=exporter_proxy
+Group=exporter_proxy
+# Optional ARGS (log format, level, access log).
+EnvironmentFile=-/etc/default/exporter_proxy
+ExecStart=/usr/sbin/exporter_proxy --config /etc/exporter_proxy/config.yml $ARGS
+# Configuration reload: all or nothing, keeps the running configuration on
+# error (see exporter_proxy_config_last_reload_successful).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+# exporter_proxy waits up to 15 s for in-flight requests on SIGTERM.
+TimeoutStopSec=30s
+SyslogIdentifier=exporter_proxy
+
+# /etc/exporter_proxy, created if missing. Owned by root: the files inside
+# are installed root:exporter_proxy, mode 0640.
+ConfigurationDirectory=exporter_proxy
+UMask=0077
+
+# Identity and privileges: no capability at all. Ports below 1024 use
+# systemd socket activation (listen: "systemd:<name>") instead.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# File system: everything read-only. Metric files are read in place;
+# connecting to a Unix socket works on a read-only mount (only the socket
+# file permission matters).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Kernel.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Processes: the service only needs /proc/self (process_* metrics).
+ProtectProc=invisible
+ProcSubset=pid
+
+# Miscellaneous.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# TCP listeners and upstreams, Unix sockets of upstreams.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
