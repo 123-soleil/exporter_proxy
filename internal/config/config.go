@@ -26,6 +26,10 @@ const (
 	DefaultMaxBodyBytes          int64 = 2 << 20 // 2 MiB, ample for typical exporters (node_exporter: ~0.1-0.5 MiB)
 	DefaultMaxSamples                  = 24000   // node_exporter: a few thousand samples
 	DefaultMaxConcurrentRequests       = 2
+
+	// MaxMaxBodyBytes bounds max_body_bytes: the whole body is held in
+	// memory, and larger values would overflow size computations.
+	MaxMaxBodyBytes int64 = 1 << 30 // 1 GiB
 )
 
 // Config is the resolved configuration: every default has been applied.

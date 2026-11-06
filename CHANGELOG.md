@@ -82,6 +82,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   web configuration or name gets a duplicate of the socket (the port is
   never closed), removed listeners stop gracefully; metrics of removed routes
   are deleted; `config_last_reload_successful` set to 0 on failure.
+- Reload restarts a listener on its socket when TLS, HTTP/2 or `rate_limit`
+  change in the same web configuration file, instead of keeping the old
+  settings (TLS enabled in the file was ignored until restart).
+- Requests of removed listeners still draining no longer recreate their
+  metric series; `requests_in_flight` stays exact when a listener is
+  removed and added back.
+- Requests whose client disconnected are recorded with code `499` instead
+  of `502` (a `502` is still written, never an empty `200`).
+- An unreadable or invalid web configuration file answers `518` with the
+  body `web configuration unreadable` (was a bare `500`), and sets the new
+  gauge `exporter_proxy_web_config_read_error{listener}` to 1 until the file
+  is read successfully again; TLS connections refused for the same reason
+  set it too.
+- Headers of a web configuration file changed while running are checked
+  against exporter-toolkit's allowed list, like at startup (a forbidden
+  header was sent on every response); such a file answers `518`.
+- A client that leaves while its password check waits gets `429` and is
+  counted, never an empty `200`.
+- Clients of a listener on a Unix socket only get the per-listener password
+  check limit, instead of sharing one per-client bucket.
+- A file read still running during a reload no longer recreates the
+  `file_modified_timestamp_seconds` series of a route that stopped being a
+  file route.
+- `max_body_bytes` is limited to 1 GiB: a value near the int64 maximum
+  overflowed and made every route answer an empty `200`.
+- Unknown users are checked against a hash with the cost of the configured
+  hashes (was always cost 10), so that user names cannot be told apart by
+  timing; per-client limits group IPv6 addresses by `/64`.
+- `file_modified_timestamp_seconds` is deleted when a route stops being a
+  file route.
+- `golang.org/x/net` upgraded to v0.62.0 (GO-2026-6866, GO-2026-6860, not
+  reachable from the code).
+- `--check` stops at the first certificate of `cert_file` even when it
+  cannot be parsed, instead of checking the next one as the leaf.
+- Idle upstream connections are closed when a handler is replaced or
+  stopped; a second `SIGTERM` or `SIGINT` stops the process without waiting
+  for the graceful shutdown.
 - End-to-end tests with a test PKI: mTLS (valid, missing, foreign CA,
   expired, wrong usage, TLS 1.1), basic auth over TLS, nothing from the
   client forwarded upstream, plain HTTP on a TLS port, metrics endpoint
@@ -94,9 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged and counted in `exporter_proxy_auth_failures_total{reason}`
   (`tls_handshake`, `missing_credentials`, `invalid_credentials`,
   `rate_limited`).
-- Rate limiting of uncached bcrypt password checks (5/s, burst 10 per
-  listener, answered `429`); verified credentials are cached as a SHA-256
-  and never limited. The web configuration `rate_limit` is supported.
+- Rate limiting of uncached bcrypt password checks (2/s, burst 5 per
+  client IP address, 5/s, burst 10 and at most 4 pending per listener,
+  answered `429`), so that a brute force from one address does not lock
+  out other scrapers and no queue builds up;
+  verified credentials are cached as a SHA-256 and never limited. The web
+  configuration `rate_limit` is supported and applied before the web
+  configuration is read.
 - Documentation: mTLS preferred over basic authentication.
 - Documentation: Prometheus and VictoriaMetrics (vmagent) scrape examples for
   mTLS and basic auth listeners, validated with promtool and vmagent.

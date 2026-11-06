@@ -307,6 +307,11 @@ func TestValidateRejects(t *testing.T) {
 			wantErr: "max_body_bytes must be greater than 0",
 		},
 		{
+			name:    "huge max_body_bytes on route",
+			yaml:    withRoutes("      - path: /m\n        upstream: http://h/m\n        max_body_bytes: 9223372036854775807\n"),
+			wantErr: "max_body_bytes must be at most 1073741824 (1 GiB)",
+		},
+		{
 			name:    "zero max_samples on route",
 			yaml:    withRoutes("      - path: /m\n        upstream: http://h/m\n        max_samples: 0\n"),
 			wantErr: "max_samples must be greater than 0",

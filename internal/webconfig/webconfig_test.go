@@ -3,7 +3,10 @@ package webconfig
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/prometheus/exporter-toolkit/web"
 )
 
 func TestRead(t *testing.T) {
@@ -60,5 +63,40 @@ func TestRead(t *testing.T) {
 func TestReadMissing(t *testing.T) {
 	if _, err := Read(filepath.Join(t.TempDir(), "missing.yml")); err == nil {
 		t.Error("Read(missing) succeeded")
+	}
+}
+
+// Headers are checked like exporter-toolkit does, also when the file
+// changes while running.
+func TestLoadRejectsHeadersLikeExporterToolkit(t *testing.T) {
+	dir := t.TempDir()
+	for name, tc := range map[string]struct {
+		content string
+		wantErr string
+	}{
+		"allowed":          {"http_server_config:\n  headers:\n    X-Frame-Options: deny\n    Strict-Transport-Security: max-age=31536000\n", ""},
+		"forbidden header": {"http_server_config:\n  headers:\n    Set-Cookie: a=b\n", `HTTP header "Set-Cookie" can not be configured`},
+		"forbidden value":  {"http_server_config:\n  headers:\n    X-Frame-Options: allow\n", "invalid value for X-Frame-Options"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".yml")
+			if err := os.WriteFile(p, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			toolkitErr := web.Validate(p)
+			if tc.wantErr == "" {
+				if err != nil || toolkitErr != nil {
+					t.Errorf("Load = %v, web.Validate = %v; want both nil", err, toolkitErr)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Load error = %v, want %q", err, tc.wantErr)
+			}
+			if toolkitErr == nil {
+				t.Error("exporter-toolkit accepts what Load rejects")
+			}
+		})
 	}
 }

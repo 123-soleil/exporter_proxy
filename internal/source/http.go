@@ -63,6 +63,9 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 	}, nil
 }
 
+// CloseIdleConnections closes the idle connections to the upstream.
+func (s *httpSource) CloseIdleConnections() { s.client.CloseIdleConnections() }
+
 func (s *httpSource) Fetch(ctx context.Context) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()

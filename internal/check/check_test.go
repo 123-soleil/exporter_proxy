@@ -267,3 +267,25 @@ func TestReportsEveryProblem(t *testing.T) {
 		t.Errorf("got %d findings, want 4 (two web configs, two files):\n%s", got, summary(Run(cfg, now)))
 	}
 }
+
+// For cert_file, only the first certificate (the leaf) is checked, even
+// when it cannot be parsed: the next ones are intermediates.
+func TestCertificatesLeafOnly(t *testing.T) {
+	dir := t.TempDir()
+	expiredCert, _ := writeCert(t, dir, "expired", now.Add(-365*24*time.Hour), now.Add(-time.Hour))
+	expiredPEM, err := os.ReadFile(expiredCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenLeaf := filepath.Join(dir, "broken-leaf.crt")
+	writeFile(t, brokenLeaf, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("garbage")}))+string(expiredPEM))
+
+	c := &checker{now: now}
+	c.certificates("here", "cert_file", brokenLeaf, false)
+	expect(t, c.findings, want{Problem, "certificate 1"})
+
+	// A bundle reports every certificate.
+	c = &checker{now: now}
+	c.certificates("here", "client_ca_file", brokenLeaf, true)
+	expect(t, c.findings, want{Problem, "certificate 1"}, want{Problem, "expired on"})
+}

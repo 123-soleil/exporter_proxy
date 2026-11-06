@@ -63,6 +63,13 @@ func main() {
 	// SIGTERM (systemctl stop) and SIGINT trigger a graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	// Once the first signal is received, restore the default handling: a
+	// second SIGTERM or Ctrl-C stops the process without waiting for the
+	// graceful shutdown.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/exporter-toolkit/web"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/errfmt"
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
 	"github.com/123-soleil/exporter_proxy/internal/webconfig"
 )
@@ -68,11 +69,29 @@ type Server struct {
 }
 
 type listener struct {
-	tls     bool
-	spec    spec
-	ln      net.Listener
-	srv     *http.Server
-	handler *swapHandler
+	settings listenerSettings
+	spec     spec
+	ln       net.Listener
+	srv      *http.Server
+	handler  *swapHandler
+}
+
+// listenerSettings are the parts of a web configuration that apply when a
+// listener starts. A reload restarts a listener whose settings changed,
+// even if its web configuration file path did not.
+type listenerSettings struct {
+	tls       bool
+	http2     bool // only meaningful with TLS
+	rateLimit webRateLimit
+}
+
+func settingsOf(wc *web.Config) listenerSettings {
+	tlsEnabled := wc.TLSConfig.IsEnabled()
+	return listenerSettings{
+		tls:       tlsEnabled,
+		http2:     tlsEnabled && wc.HTTPConfig.HTTP2,
+		rateLimit: webRateLimit{interval: wc.RateLimiterConfig.Interval, burst: wc.RateLimiterConfig.Burst},
+	}
 }
 
 // spec describes one server: a configured listener or the metrics endpoint.
@@ -101,8 +120,29 @@ func newSwapHandler(sp spec) *swapHandler {
 	return sh
 }
 
-func (sh *swapHandler) store(sp spec) {
-	sh.cur.Store(&handlerState{h: sp.handler, writeTimeout: sp.writeTimeout})
+// store installs the handler of sp and returns the previous state, nil the
+// first time.
+func (sh *swapHandler) store(sp spec) *handlerState {
+	return sh.cur.Swap(&handlerState{h: sp.handler, writeTimeout: sp.writeTimeout})
+}
+
+// retire closes the idle upstream connections of a handler replaced by a
+// reload: now, then once its last requests are over (bounded by its write
+// timeout), since connections in use go back to its pool when they end.
+func retire(old *handlerState) {
+	if old == nil {
+		return
+	}
+	closeIdle(old.h)
+	time.AfterFunc(old.writeTimeout, func() { closeIdle(old.h) })
+}
+
+// closeIdle closes the upstream connections of h that are idle now, instead
+// of leaving them open until their idle timeout.
+func closeIdle(h http.Handler) {
+	if c, ok := h.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 func (sh *swapHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -168,11 +208,13 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 // Reload applies a new configuration. Either everything is applied or
 // nothing is: on error the running listeners are left untouched.
 //
-//   - a listener with the same name, address and web configuration keeps
-//     its socket and connections; its routes and limits are swapped;
-//   - a listener whose address is already served (web configuration
-//     changed, listener renamed) gets a duplicate of the socket, so the port
-//     is never closed, and the previous server is stopped gracefully;
+//   - a listener with the same name, address, web configuration file and
+//     start-time settings (TLS, HTTP/2, rate_limit) keeps its socket and
+//     connections; its routes and limits are swapped;
+//   - a listener whose address is already served (web configuration file
+//     or its start-time settings changed, listener renamed) gets a
+//     duplicate of the socket, so the port is never closed, and the
+//     previous server is stopped gracefully;
 //   - a new address is bound; systemd sockets can only be taken at startup;
 //   - a removed listener is stopped gracefully (in-flight requests complete,
 //     up to 15 s).
@@ -200,9 +242,18 @@ func (s *Server) Reload(cfg *config.Config) error {
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
 		if cur != nil && cur.spec.listen == sp.listen && cur.spec.webConfig == sp.webConfig {
-			swaps = append(swaps, swap{cur, sp})
-			kept[sp.name] = true
-			continue
+			wc, err := webconfig.Load(sp.webConfig)
+			if err != nil {
+				closeListeners(started)
+				return fmt.Errorf("listener %q: %w", sp.name, err)
+			}
+			if settingsOf(wc) == cur.settings {
+				swaps = append(swaps, swap{cur, sp})
+				kept[sp.name] = true
+				continue
+			}
+			// TLS, HTTP/2 or rate_limit changed in the same file: restart
+			// the listener on its socket, below.
 		}
 
 		var ln net.Listener
@@ -232,7 +283,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 	// Commit: nothing below can fail.
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
-		sw.l.handler.store(sw.sp)
+		retire(sw.l.handler.store(sw.sp))
 	}
 	next := make(map[string]*listener, len(specs))
 	for name := range kept {
@@ -292,7 +343,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	for _, sp := range specs {
 		if err := web.Validate(sp.webConfig); err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
-				sp.name, sp.webConfig, oneLine(err)))
+				sp.name, sp.webConfig, errfmt.OneLine(err)))
 		}
 	}
 	if len(problems) > 0 {
@@ -316,10 +367,9 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		return nil, fmt.Errorf("listener %q: %w", sp.name, err)
 	}
 
+	settings := settingsOf(wc)
 	sh := newSwapHandler(sp)
-	auth := newAuthHandler(sp.name, sp.webConfig,
-		webRateLimit{interval: wc.RateLimiterConfig.Interval, burst: wc.RateLimiterConfig.Burst},
-		sh, s.logger, s.recorder())
+	auth := newAuthHandler(sp.name, sp.webConfig, settings.rateLimit, sh, s.logger, s.recorder())
 	srv := &http.Server{
 		Handler:           auth,
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -332,8 +382,8 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder()}, "", 0),
 	}
 
-	l := &listener{spec: sp, ln: ln, srv: srv, handler: sh}
-	if !wc.TLSConfig.IsEnabled() {
+	l := &listener{settings: settings, spec: sp, ln: ln, srv: srv, handler: sh}
+	if !settings.tls {
 		return l, nil
 	}
 
@@ -342,7 +392,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		return nil, fmt.Errorf("listener %q: web_config_file %s: %w", sp.name, sp.webConfig, err)
 	}
 	nextProtos := []string{"http/1.1"}
-	if wc.HTTPConfig.HTTP2 {
+	if settings.http2 {
 		nextProtos = []string{"h2", "http/1.1"}
 	} else {
 		// A non-nil empty map disables HTTP/2 in net/http.
@@ -351,21 +401,22 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	tlsCfg.NextProtos = nextProtos
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
-	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
+	name, webConfig, logger, rec := sp.name, sp.webConfig, s.logger.With("listener", sp.name), s.recorder()
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		c, err := webconfig.Load(webConfig)
 		if err == nil {
 			var cfg *tls.Config
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
+				rec.WebConfigRead(name, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
-		logger.Error("cannot load TLS settings for a new connection", "web_config_file", webConfig, "err", oneLine(err))
+		rec.WebConfigRead(name, false)
+		logger.Error("cannot load TLS settings for a new connection", "web_config_file", webConfig, "err", errfmt.OneLine(err))
 		return nil, err
 	}
 	srv.TLSConfig = tlsCfg
-	l.tls = true
 	return l, nil
 }
 
@@ -376,38 +427,44 @@ func (s *Server) recorder() proxy.Recorder {
 	return s.opts.Recorder
 }
 
-// serve serves l in the background.
+// serve serves l in the background. Called with s.mu held or before s is
+// shared: the goroutine only uses values copied here, since a reload may
+// update l.spec meanwhile.
 func (s *Server) serve(l *listener) {
-	s.logger.Info("listening", "listener", l.spec.name, "address", l.ln.Addr().String(), "tls", l.tls)
+	name, tlsEnabled, srv, ln := l.spec.name, l.settings.tls, l.srv, l.ln
+	s.logger.Info("listening", "listener", name, "address", ln.Addr().String(), "tls", tlsEnabled)
 	s.serving.Add(1)
 	go func() {
 		defer s.serving.Done()
 		var err error
-		if l.tls {
-			err = l.srv.ServeTLS(l.ln, "", "")
+		if tlsEnabled {
+			err = srv.ServeTLS(ln, "", "")
 		} else {
-			err = l.srv.Serve(l.ln)
+			err = srv.Serve(ln)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			select {
-			case s.errc <- fmt.Errorf("listener %q: %w", l.spec.name, err):
+			case s.errc <- fmt.Errorf("listener %q: %w", name, err):
 			default: // an error is already pending
 			}
 		}
 	}()
 }
 
-// drain stops l gracefully in the background.
+// drain stops l gracefully in the background, then closes its idle
+// upstream connections. Called with s.mu held.
 func (s *Server) drain(l *listener) {
+	name, srv, handler := l.spec.name, l.srv, l.handler
 	s.draining.Add(1)
 	go func() {
 		defer s.draining.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer cancel()
-		if err := l.srv.Shutdown(ctx); err != nil {
-			_ = l.srv.Close()
-			s.logger.Warn("listener stopped with requests still running", "listener", l.spec.name, "err", err)
+		if err := srv.Shutdown(ctx); err != nil {
+			_ = srv.Close()
+			s.logger.Warn("listener stopped with requests still running", "listener", name, "err", err)
 		}
+		closeIdle(handler.cur.Load().h)
 	}()
 }
 
@@ -446,10 +503,15 @@ func (s *Server) Err() <-chan error { return s.errc }
 // Shutdown stops accepting connections and waits for in-flight requests to
 // complete, until ctx is done; remaining connections are then closed.
 func (s *Server) Shutdown(ctx context.Context) error {
+	type running struct {
+		name    string
+		srv     *http.Server
+		handler *swapHandler
+	}
 	s.mu.Lock()
-	listeners := make([]*listener, 0, len(s.listeners))
+	listeners := make([]running, 0, len(s.listeners))
 	for _, l := range s.listeners {
-		listeners = append(listeners, l)
+		listeners = append(listeners, running{l.spec.name, l.srv, l.handler})
 	}
 	s.mu.Unlock()
 
@@ -463,9 +525,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			if err := l.srv.Shutdown(ctx); err != nil {
 				_ = l.srv.Close()
 				mu.Lock()
-				errs = append(errs, fmt.Sprintf("listener %q: %v", l.spec.name, err))
+				errs = append(errs, fmt.Sprintf("listener %q: %v", l.name, err))
 				mu.Unlock()
 			}
+			closeIdle(l.handler.cur.Load().h)
 		}()
 	}
 	wg.Wait()
@@ -550,9 +613,4 @@ func closeListeners(ls []*listener) {
 	for _, l := range ls {
 		_ = l.ln.Close()
 	}
-}
-
-// oneLine keeps an error on a single log line.
-func oneLine(err error) string {
-	return strings.Join(strings.Fields(err.Error()), " ")
 }

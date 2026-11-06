@@ -22,7 +22,7 @@ func testConfig() *config.Config {
 			Name: "node",
 			Routes: []config.Route{
 				{Path: "/metrics"},
-				{Path: "/batch"},
+				{Path: "/batch", File: "/var/lib/batch.prom"},
 			},
 		}},
 	}
@@ -83,7 +83,7 @@ func TestRecorder(t *testing.T) {
 		{"requests 200", testutil.ToFloat64(m.requests.WithLabelValues("node", "/metrics", "200")), 2},
 		{"requests 502", testutil.ToFloat64(m.requests.WithLabelValues("node", "/metrics", "502")), 1},
 		{"requests 404 unmatched", testutil.ToFloat64(m.requests.WithLabelValues("node", "", "404")), 1},
-		{"in flight", testutil.ToFloat64(m.inFlight.WithLabelValues("node")), 1},
+		{"in flight", float64(m.inFlight.value("node")), 1},
 		{"rejected", testutil.ToFloat64(m.rejected.WithLabelValues("node")), 1},
 		{"file modified", testutil.ToFloat64(m.fileModified.WithLabelValues("node", "/batch")), 1_800_000_000.5},
 		{"timeout errors", testutil.ToFloat64(m.sourceErrors.WithLabelValues("node", "/metrics", "timeout")), 1},
@@ -193,5 +193,89 @@ func TestConfigReloadDeletesRemovedSeries(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.requests.WithLabelValues("kept", "", "404")); got != 1 {
 		t.Errorf("unmatched series of a kept listener reset: %v", got)
+	}
+}
+
+// Requests of a removed listener that are still draining do not bring its
+// series back, and the in-flight count stays right if it is added back.
+func TestRemovedListenerSeriesStayDeleted(t *testing.T) {
+	m := New()
+	node := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/metrics"}}}}}
+	other := &config.Config{Listeners: []config.Listener{{Name: "other", Routes: []config.Route{{Path: "/metrics"}}}}}
+	m.ConfigLoaded(node, time.Now())
+	m.InFlight("node", 1) // a request starts
+
+	m.ConfigLoaded(other, time.Now()) // "node" removed while the request runs
+	m.SourceFailed("node", "/metrics", source.ReasonTimeout)
+	m.RequestServed("node", "/metrics", 502, time.Second)
+	m.AuthFailed("node", "rate_limited")
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		for _, metric := range f.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "listener" && lp.GetValue() == "node" {
+					t.Errorf("%s: series of removed listener recreated", f.GetName())
+				}
+			}
+		}
+	}
+
+	m.ConfigLoaded(node, time.Now()) // added back before the request ends
+	m.InFlight("node", -1)           // the old request ends
+	if got := m.inFlight.value("node"); got != 0 {
+		t.Errorf("in flight = %d after the request ended, want 0", got)
+	}
+	if n := testutil.CollectAndCount(m.inFlight); n != 1 {
+		t.Errorf("requests_in_flight series = %d, want 1", n)
+	}
+}
+
+// A route that stops being a file route loses its modification time series.
+func TestFileModifiedDeletedWhenRouteChangesSource(t *testing.T) {
+	m := New()
+	file := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/m", File: "/var/m.prom"}}}}}
+	upstream := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/m", Upstream: "http://h/m"}}}}}
+	m.ConfigLoaded(file, time.Now())
+	m.FileModified("node", "/m", time.Now())
+	m.RequestServed("node", "/m", 200, time.Millisecond)
+
+	m.ConfigLoaded(upstream, time.Now())
+	if n := testutil.CollectAndCount(m.fileModified); n != 0 {
+		t.Errorf("file_modified_timestamp_seconds series = %d after the route became HTTP, want 0", n)
+	}
+	// A file read still running on the replaced handler ends now.
+	m.FileModified("node", "/m", time.Now())
+	if n := testutil.CollectAndCount(m.fileModified); n != 0 {
+		t.Errorf("late file read recreated the series (%d series)", n)
+	}
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("node", "/m", "200")); got != 1 {
+		t.Errorf("other series of the route reset: %v", got)
+	}
+}
+
+func TestWebConfigReadError(t *testing.T) {
+	m := New()
+	m.ConfigLoaded(testConfig(), time.Now())
+	// One series per listener plus the metrics endpoint, at 0 from the start.
+	if n := testutil.CollectAndCount(m.webConfigError); n != 2 {
+		t.Errorf("web_config_read_error series = %d, want 2", n)
+	}
+
+	m.WebConfigRead("node", false)
+	if got := testutil.ToFloat64(m.webConfigError.WithLabelValues("node")); got != 1 {
+		t.Errorf("after a failed read = %v, want 1", got)
+	}
+	m.WebConfigRead("node", true)
+	if got := testutil.ToFloat64(m.webConfigError.WithLabelValues("node")); got != 0 {
+		t.Errorf("after a successful read = %v, want 0", got)
+	}
+
+	m.WebConfigRead("unknown", false) // not configured: not recorded
+	if n := testutil.CollectAndCount(m.webConfigError); n != 2 {
+		t.Errorf("series for an unconfigured listener created (%d series)", n)
 	}
 }
