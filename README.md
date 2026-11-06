@@ -66,7 +66,9 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 
 `404` and `405` are answered before taking a concurrency slot: only real
 source reads count against `max_concurrent_requests`. A request whose client
-disconnects before the answer is not counted as a source failure.
+disconnects before the answer is not counted as a source failure: nothing is
+sent, and it is recorded with code `499` (nginx convention) in
+`exporter_proxy_requests_total`, so that it does not count as a `5xx`.
 
 ### Route sources
 
@@ -215,22 +217,31 @@ Every refusal is logged and counted in
 Credentials that already passed a bcrypt check are remembered (as a SHA-256
 of user, stored hash and password: the password itself is not kept in
 memory), so a scraper is checked once and then served without any bcrypt
-cost. Only checks of credentials not yet known to be valid are limited,
-per listener: **5 per second, with a burst of 10**, one at a time. Beyond
-that, the request gets `429` without any bcrypt computation.
+cost. Only checks of credentials not yet known to be valid are limited, one
+at a time, by two limits:
+
+- **per client IP address: 2 per second, with a burst of 5**, so that a
+  brute force from one address cannot use up the checks of other clients;
+- **per listener, all addresses together: 10 per second, with a burst of
+  20**, against an attack from many addresses.
+
+Beyond either limit, the request gets `429` without any bcrypt computation.
 
 As a result, a brute force attack costs at most a few bcrypt checks per
 second and never slows down a scraper whose credentials are already
-verified. A scraper verified for the first time during an attack may get a
-`429` and succeed on its next scrape. Unknown users are checked against a
+verified. A scraper verified for the first time (after a restart or a
+password change) while another address attacks still gets its own checks;
+only an attack from many addresses at once can make it wait for a later
+scrape. Unknown users are checked against a
 fixed hash, so that they take the same time as known ones (no user
 enumeration). Changing a password in the web configuration invalidates the
 remembered credentials of that user.
 
 The `rate_limit` section of the web configuration (exporter-toolkit format,
 `interval` and `burst`) is also supported: it limits **all** requests of the
-listener, legitimate ones included, and is read at startup. Prefer the
-built-in limit above unless all requests must be capped.
+listener, legitimate ones included, before the web configuration is even
+read, and applies when the listener starts (see "Configuration reload").
+Prefer the built-in limits above unless all requests must be capped.
 
 ### Proxy metrics
 
@@ -246,7 +257,8 @@ Besides the standard `go_*`, `process_*` and
 `promhttp_metric_handler_errors_total` metrics, it exports:
 
 - `exporter_proxy_requests_total{listener,route,code}`: requests served;
-  `route` is empty for paths that match no route (`404`).
+  `route` is empty for paths that match no route (`404`); `code="499"` for
+  clients that disconnected before the answer.
 - `exporter_proxy_request_duration_seconds{listener,route}` (histogram): total
   time to serve a request (fetch + parse), for matched routes only.
 - `exporter_proxy_parse_duration_seconds{listener,route}` (histogram): time
@@ -699,8 +711,8 @@ the `listen` value as written):
 
 | Change | Effect |
 |--------|--------|
-| Same `name`, `listen` and `web_config_file` | Routes and limits are swapped atomically; the socket and open connections are kept. |
-| Same `listen`, other `web_config_file`, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully. |
+| Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2 and `rate_limit` settings in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
+| Same `listen`, other `web_config_file` or TLS, HTTP/2 or `rate_limit` changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully. |
 | New `listen` address | Bound at reload. |
 | New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
 | Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. |
@@ -708,7 +720,9 @@ the `listen` value as written):
 During a reload, requests already running on the previous handler still
 count against its `max_concurrent_requests`, while new requests use the new
 one: for a few seconds, a listener may serve up to twice its limit. Metric
-series of removed listeners and routes are deleted.
+series of removed listeners and routes are deleted, and requests of these
+still draining do not create them again. Idle upstream connections of a
+replaced or stopped handler are closed.
 
 Since the address is compared as written, changing `":9100"` into
 `"0.0.0.0:9100"` is seen as a new address and fails with "address already in
@@ -723,9 +737,12 @@ while running, like exporter-toolkit does:
   renewed certificate is picked up without restart.
 
 Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`)
-and `rate_limit` are read when the listener starts: changing them requires a
-reload (the listener is restarted on its socket if its `web_config_file`
-path changes) or a restart. Replace these files atomically
+and `rate_limit` are read when the listener starts: after changing them,
+reload (the listener is then restarted on its socket, even if its
+`web_config_file` path is the same) or restart. Until then, the listener
+keeps its previous settings; in particular, removing `tls_server_config`
+from a running TLS listener's file makes new TLS handshakes fail until the
+reload. Replace these files atomically
 (write a temporary file, then rename it) so that a half-written file is
 never read.
 

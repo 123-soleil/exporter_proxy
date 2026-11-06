@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/time/rate"
 
+	"github.com/123-soleil/exporter_proxy/internal/errfmt"
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
 	"github.com/123-soleil/exporter_proxy/internal/webconfig"
 )
@@ -19,11 +21,22 @@ import (
 // bcrypt is deliberately slow (about 250 ms at cost 12): without a limit,
 // random passwords would keep a CPU busy and delay legitimate scrapes.
 const (
+	// clientVerifyRate and clientVerifyBurst bound uncached bcrypt
+	// verifications per client IP address: a brute force from one address
+	// cannot use up the verifications of the other clients. Scrapers whose
+	// credentials were already verified are served from the cache and
+	// never limited.
+	clientVerifyRate  = 2 // per second
+	clientVerifyBurst = 5
+
 	// verifyRate and verifyBurst bound uncached bcrypt verifications per
-	// listener. Scrapers whose credentials were already verified are
-	// served from the cache and never limited.
-	verifyRate  = 5 // per second
-	verifyBurst = 10
+	// listener, all clients together: the last guard against an attack
+	// from many addresses.
+	verifyRate  = 10 // per second
+	verifyBurst = 20
+
+	// maxTrackedClients bounds the per-address limiters kept in memory.
+	maxTrackedClients = 4096
 
 	// successCacheSize bounds the cache of verified credentials. Only
 	// valid credentials enter it, so an attacker cannot fill or evict it.
@@ -56,8 +69,10 @@ type authHandler struct {
 	// limiter is the rate_limit of the web configuration, fixed at start
 	// like exporter-toolkit; nil when not configured.
 	limiter *rate.Limiter
-	// verifyLimiter bounds uncached bcrypt verifications.
-	verifyLimiter *rate.Limiter
+	// clientLimiters and verifyLimiter bound uncached bcrypt
+	// verifications, per client address and per listener.
+	clientLimiters *clientLimiters
+	verifyLimiter  *rate.Limiter
 	// verifyMu runs one bcrypt verification at a time, like exporter-toolkit.
 	verifyMu  sync.Mutex
 	successes *successCache
@@ -65,13 +80,14 @@ type authHandler struct {
 
 func newAuthHandler(listener, webConfig string, rl webRateLimit, next http.Handler, logger *slog.Logger, rec proxy.Recorder) *authHandler {
 	h := &authHandler{
-		listener:      listener,
-		webConfig:     webConfig,
-		next:          next,
-		logger:        logger.With("listener", listener),
-		rec:           rec,
-		verifyLimiter: rate.NewLimiter(verifyRate, verifyBurst),
-		successes:     newSuccessCache(successCacheSize),
+		listener:       listener,
+		webConfig:      webConfig,
+		next:           next,
+		logger:         logger.With("listener", listener),
+		rec:            rec,
+		clientLimiters: newClientLimiters(clientVerifyRate, clientVerifyBurst, maxTrackedClients),
+		verifyLimiter:  rate.NewLimiter(verifyRate, verifyBurst),
+		successes:      newSuccessCache(successCacheSize),
 	}
 	if rl.interval > 0 {
 		h.limiter = rate.NewLimiter(rate.Every(rl.interval), rl.burst)
@@ -86,15 +102,16 @@ type webRateLimit struct {
 }
 
 func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	c, err := webconfig.Load(h.webConfig)
-	if err != nil {
-		h.logger.Error("cannot load web configuration", "web_config_file", h.webConfig, "err", oneLine(err))
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	// Before reading the web configuration: refused requests cost nothing.
+	if h.limiter != nil && !h.limiter.Allow() {
+		h.refuse(w, r, proxy.AuthRateLimited, "", http.StatusTooManyRequests)
 		return
 	}
 
-	if h.limiter != nil && !h.limiter.Allow() {
-		h.refuse(w, r, proxy.AuthRateLimited, "", http.StatusTooManyRequests)
+	c, err := webconfig.Load(h.webConfig)
+	if err != nil {
+		h.logger.Error("cannot load web configuration", "web_config_file", h.webConfig, "err", errfmt.OneLine(err))
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
@@ -126,7 +143,7 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.verifyLimiter.Allow() {
+	if !h.clientLimiters.allow(clientIP(r)) || !h.verifyLimiter.Allow() {
 		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
 		return
 	}
@@ -193,6 +210,58 @@ func (c *successCache) add(k [sha256.Size]byte) {
 		clear(c.keys)
 	}
 	c.keys[k] = struct{}{}
+}
+
+// clientIP returns the IP address of the client, without the port.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// clientLimiters holds one rate limiter per client address.
+type clientLimiters struct {
+	mu    sync.Mutex
+	limit rate.Limit
+	burst int
+	max   int
+	m     map[string]*rate.Limiter
+}
+
+func newClientLimiters(limit rate.Limit, burst, maxEntries int) *clientLimiters {
+	return &clientLimiters{limit: limit, burst: burst, max: maxEntries, m: map[string]*rate.Limiter{}}
+}
+
+// allow takes a token from the limiter of addr.
+func (c *clientLimiters) allow(addr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	l, ok := c.m[addr]
+	if !ok {
+		if len(c.m) >= c.max {
+			c.evict()
+		}
+		l = rate.NewLimiter(c.limit, c.burst)
+		c.m[addr] = l
+	}
+	return l.Allow()
+}
+
+// evict makes room: limiters with a full bucket are dropped first, since a
+// new limiter behaves the same; if none is full, all are dropped (the
+// per-listener limit still applies).
+func (c *clientLimiters) evict() {
+	now := time.Now()
+	for addr, l := range c.m {
+		if l.TokensAt(now) >= float64(c.burst) {
+			delete(c.m, addr)
+		}
+	}
+	if len(c.m) >= c.max {
+		clear(c.m)
+	}
 }
 
 // serverErrorLog turns net/http server errors into structured log lines and

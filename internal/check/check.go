@@ -11,13 +11,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/exporter-toolkit/web"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/errfmt"
 	"github.com/123-soleil/exporter_proxy/internal/webconfig"
 )
 
@@ -85,12 +85,12 @@ func (c *checker) webConfig(where, path string) {
 	// exporter-toolkit's own validation: strict YAML, bcrypt hashes,
 	// certificate and key readable and matching, client CA readable.
 	if err := web.Validate(path); err != nil {
-		c.add(Problem, where, "%s", oneLine(err))
+		c.add(Problem, where, "%s", errfmt.OneLine(err))
 		return
 	}
 	wc, err := webconfig.Read(path)
 	if err != nil {
-		c.add(Problem, where, "%s", oneLine(err))
+		c.add(Problem, where, "%s", errfmt.OneLine(err))
 		return
 	}
 	if wc.BasicAuthWithoutTLS() {
@@ -120,6 +120,9 @@ func (c *checker) certificates(where, key, path string, bundle bool) {
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			c.add(Problem, where, "%s %s: certificate %d: %v", key, path, count+1, err)
+			if !bundle {
+				return // the leaf certificate is unusable: the next ones are not leaves
+			}
 			continue
 		}
 		count++
@@ -181,9 +184,4 @@ func (c *checker) socket(where, path string) {
 	if err := syscall.Access(path, 2 /* W_OK */); err != nil {
 		c.add(Problem, where, "unix_socket %s is not writable by this user: %v", path, err)
 	}
-}
-
-// oneLine keeps an error on a single log line.
-func oneLine(err error) string {
-	return strings.Join(strings.Fields(err.Error()), " ")
 }

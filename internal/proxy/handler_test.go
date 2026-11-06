@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -374,6 +375,9 @@ func TestHandlerClientCanceled(t *testing.T) {
 
 	if len(rec.failed) != 0 {
 		t.Errorf("client cancellation counted as source failure: %v", rec.failed)
+	}
+	if want := []string{"/metrics 499"}; !slices.Equal(rec.served, want) {
+		t.Errorf("served = %v, want %v (not a 5xx)", rec.served, want)
 	}
 }
 

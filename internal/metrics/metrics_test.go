@@ -83,7 +83,7 @@ func TestRecorder(t *testing.T) {
 		{"requests 200", testutil.ToFloat64(m.requests.WithLabelValues("node", "/metrics", "200")), 2},
 		{"requests 502", testutil.ToFloat64(m.requests.WithLabelValues("node", "/metrics", "502")), 1},
 		{"requests 404 unmatched", testutil.ToFloat64(m.requests.WithLabelValues("node", "", "404")), 1},
-		{"in flight", testutil.ToFloat64(m.inFlight.WithLabelValues("node")), 1},
+		{"in flight", float64(m.inFlight.value("node")), 1},
 		{"rejected", testutil.ToFloat64(m.rejected.WithLabelValues("node")), 1},
 		{"file modified", testutil.ToFloat64(m.fileModified.WithLabelValues("node", "/batch")), 1_800_000_000.5},
 		{"timeout errors", testutil.ToFloat64(m.sourceErrors.WithLabelValues("node", "/metrics", "timeout")), 1},
@@ -193,5 +193,43 @@ func TestConfigReloadDeletesRemovedSeries(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.requests.WithLabelValues("kept", "", "404")); got != 1 {
 		t.Errorf("unmatched series of a kept listener reset: %v", got)
+	}
+}
+
+// Requests of a removed listener that are still draining do not bring its
+// series back, and the in-flight count stays right if it is added back.
+func TestRemovedListenerSeriesStayDeleted(t *testing.T) {
+	m := New()
+	node := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/metrics"}}}}}
+	other := &config.Config{Listeners: []config.Listener{{Name: "other", Routes: []config.Route{{Path: "/metrics"}}}}}
+	m.ConfigLoaded(node, time.Now())
+	m.InFlight("node", 1) // a request starts
+
+	m.ConfigLoaded(other, time.Now()) // "node" removed while the request runs
+	m.SourceFailed("node", "/metrics", source.ReasonTimeout)
+	m.RequestServed("node", "/metrics", 502, time.Second)
+	m.AuthFailed("node", "rate_limited")
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		for _, metric := range f.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "listener" && lp.GetValue() == "node" {
+					t.Errorf("%s: series of removed listener recreated", f.GetName())
+				}
+			}
+		}
+	}
+
+	m.ConfigLoaded(node, time.Now()) // added back before the request ends
+	m.InFlight("node", -1)           // the old request ends
+	if got := m.inFlight.value("node"); got != 0 {
+		t.Errorf("in flight = %d after the request ended, want 0", got)
+	}
+	if n := testutil.CollectAndCount(m.inFlight); n != 1 {
+		t.Errorf("requests_in_flight series = %d, want 1", n)
 	}
 }

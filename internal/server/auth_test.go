@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -272,4 +273,54 @@ func TestServerErrorLog(t *testing.T) {
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	writeWeb(t, filepath.Dir(path), filepath.Base(path), content)
+}
+
+// A brute force from one address does not use up the password checks of
+// another client, whose credentials are not cached yet.
+func TestAuthHandlerVerifyLimitIsPerClient(t *testing.T) {
+	h, _, _, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{})
+
+	for i := 0; i < clientVerifyBurst+10; i++ {
+		do(h, "prometheus", fmt.Sprintf("guess-%d", i)) // from 192.0.2.10
+	}
+	if w := do(h, "prometheus", "guess-x"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("attacker after its burst: code %d, want 429", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "192.0.2.20:40000"
+	req.SetBasicAuth("prometheus", "good-pass")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("other client during the attack: code %d, want 200", w.Code)
+	}
+}
+
+func TestClientLimitersEviction(t *testing.T) {
+	c := newClientLimiters(1, 1, 2)
+	if !c.allow("a") || !c.allow("b") {
+		t.Fatal("first tokens refused")
+	}
+	// Both buckets are empty: the map is full of busy clients and is reset.
+	if !c.allow("c") {
+		t.Error("new client refused")
+	}
+	if len(c.m) != 1 {
+		t.Errorf("%d limiters kept, want 1", len(c.m))
+	}
+}
+
+// The rate_limit of the web configuration applies before the file is read.
+func TestAuthHandlerRateLimitBeforeReadingWebConfig(t *testing.T) {
+	h, _, _, _, path := newTestAuth(t, "{}\n", webRateLimit{interval: time.Hour, burst: 1})
+	if w := do(h, "", ""); w.Code != http.StatusOK {
+		t.Fatalf("first request: code %d", w.Code)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if w := do(h, "", ""); w.Code != http.StatusTooManyRequests {
+		t.Errorf("rate limited request: code %d, want 429 without reading the file", w.Code)
+	}
 }

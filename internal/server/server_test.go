@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -737,5 +740,96 @@ func TestReloadLetsInFlightRequestsFinish(t *testing.T) {
 
 	if r := <-resc; r.code != http.StatusOK || r.body != metrics {
 		t.Errorf("in-flight request during reload: code=%d body=%q, want 200", r.code, r.body)
+	}
+}
+
+// testTLSFiles writes the certificate and key of an httptest TLS server
+// into dir and returns their paths.
+func testTLSFiles(t *testing.T, dir string) (certPath, keyPath string) {
+	t.Helper()
+	ts := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(ts.Close)
+	c := ts.TLS.Certificates[0]
+	keyDER, err := x509.MarshalPKCS8PrivateKey(c.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	writeWeb(t, dir, "cert.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Certificate[0]})))
+	writeWeb(t, dir, "key.pem", string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})))
+	return certPath, keyPath
+}
+
+// TLS enabled in the same web configuration file: the reload restarts the
+// listener with TLS instead of keeping it in clear text.
+func TestReloadEnablesTLSInSameWebConfig(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+	if code, _ := get(t, "http://"+addr+"/metrics", "", ""); code != http.StatusOK {
+		t.Fatalf("before reload: code %d", code)
+	}
+
+	cert, key := testTLSFiles(t, dir)
+	writeWeb(t, dir, "web.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test certificate
+		DisableKeepAlives: true,
+	}}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp, err := client.Get("https://" + addr + "/metrics")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("over TLS after reload: code %d", resp.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not served over TLS after reload: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// rate_limit changed in the same web configuration file applies on reload.
+func TestReloadAppliesRateLimitChange(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+	url := "http://" + addr + "/metrics"
+
+	writeWeb(t, dir, "web.yml", "rate_limit:\n  interval: 1h\n  burst: 1\n")
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	// The previous server may answer a few more requests while it stops.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if code, _ := get(t, url, "", ""); code == http.StatusTooManyRequests {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("rate_limit not applied after reload")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

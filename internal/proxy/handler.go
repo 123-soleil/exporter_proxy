@@ -115,6 +115,20 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 	return h
 }
 
+// CloseIdleConnections closes the idle upstream connections of every route,
+// for a handler replaced by a reload or stopped.
+func (h *Handler) CloseIdleConnections() {
+	for _, r := range h.routes {
+		if c, ok := r.src.(interface{ CloseIdleConnections() }); ok {
+			c.CloseIdleConnections()
+		}
+	}
+}
+
+// statusClientClosedRequest is recorded when the client goes away before
+// the answer (nginx convention), so that it is not counted as a 5xx.
+const statusClientClosedRequest = 499
+
 // ServeHTTP checks the route and method, takes a concurrency slot, then
 // reads, validates and returns the source content.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -176,8 +190,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		if req.Context().Err() != nil {
 			// The client went away: not a source failure, nobody to answer.
+			// Recorded as 499, nothing is written.
 			h.logger.Debug("client canceled the request", "route", rt.path, "err", err)
-			rw.WriteHeader(http.StatusBadGateway)
+			rw.code = statusClientClosedRequest
 			return
 		}
 		reason := source.ReasonOf(err)
