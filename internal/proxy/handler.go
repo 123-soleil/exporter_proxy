@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -161,7 +162,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		h.rec.InFlight(h.listener, -1)
 	}()
 
-	body, err := h.fetch(req.Context(), rt)
+	// Answer before the scraper gives up: its timeout can only shorten the
+	// route timeout, which the source still applies.
+	ctx := req.Context()
+	budget, hasBudget := scrapeBudget(req.Header)
+	if hasBudget {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
+	body, err := h.fetch(ctx, rt)
 	if err != nil {
 		if req.Context().Err() != nil {
 			// The client went away: not a source failure, nobody to answer.
@@ -171,8 +182,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		reason := source.ReasonOf(err)
 		h.rec.SourceFailed(h.listener, rt.path, reason)
-		h.logger.Warn("source rejected", "route", rt.path, "reason", string(reason),
-			"duration_ms", time.Since(start).Milliseconds(), "err", err)
+		attrs := []any{"route", rt.path, "reason", string(reason),
+			"duration_ms", time.Since(start).Milliseconds(), "err", err}
+		if hasBudget {
+			attrs = append(attrs, "scrape_budget_ms", budget.Milliseconds())
+		}
+		h.logger.Warn("source rejected", attrs...)
 		// The client only gets the reason; details (paths, addresses) stay
 		// in the logs.
 		http.Error(rw, "source rejected: "+string(reason), http.StatusBadGateway)
@@ -191,6 +206,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// scrapeTimeoutHeader is sent by Prometheus and vmagent with the scrape
+// timeout of the target, in seconds.
+const scrapeTimeoutHeader = "X-Prometheus-Scrape-Timeout-Seconds"
+
+// scrapeMargin is kept from the scraper's timeout to validate the content
+// and send the answer.
+const scrapeMargin = 500 * time.Millisecond
+
+// scrapeBudget returns the time available to read the source according to
+// the scraper's timeout header: the timeout minus scrapeMargin, or the whole
+// timeout when it is too short for the margin. ok is false when the header
+// is missing or invalid.
+func scrapeBudget(h http.Header) (time.Duration, bool) {
+	v := h.Get(scrapeTimeoutHeader)
+	if v == "" {
+		return 0, false
+	}
+	secs, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
+		return 0, false
+	}
+	// Cap absurd values before converting (a day is far above any route
+	// timeout, which bounds the read anyway).
+	timeout := time.Duration(math.Min(secs, 86400) * float64(time.Second))
+	if timeout > 2*scrapeMargin {
+		return timeout - scrapeMargin, true
+	}
+	return timeout, true
 }
 
 // fetch reads the source and validates its content.

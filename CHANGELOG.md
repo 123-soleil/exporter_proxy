@@ -102,4 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS and basic auth listeners, validated with promtool and vmagent.
 - Documentation: `procps` requirement for `systemctl reload`; the unit was
   tested on Debian 12 (systemd 252) as installed by the README.
+- The scraper's timeout (`X-Prometheus-Scrape-Timeout-Seconds`, sent by
+  Prometheus and vmagent) shortens the source read, minus 500 ms to answer:
+  a slow source gives a `502 timeout` before the scraper gives up. It never
+  extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.

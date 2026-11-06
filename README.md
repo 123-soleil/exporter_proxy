@@ -136,6 +136,14 @@ page) from being exposed through the proxy.
   samples is rejected (default 24000; every line with a value counts, so each
   histogram bucket is one sample, like Prometheus' `sample_limit`). These three
   limits are set globally and can be lowered or raised per route.
+- The scraper's own timeout shortens `timeout` when it is shorter: Prometheus
+  and vmagent send it in the `X-Prometheus-Scrape-Timeout-Seconds` header,
+  and exporter_proxy gives the source that time minus 500 ms (kept to
+  validate and answer; for a scrape timeout of 1 s or less, the whole
+  timeout). The proxy then answers `502` with reason `timeout` before the
+  scraper gives up, instead of the scraper reporting a bare timeout. The
+  header can never extend `timeout`; an invalid value is ignored. The log
+  line of such a failure carries `scrape_budget_ms`.
 - The validated body is returned unchanged with
   `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 - Validation guarantees the format, not the harmlessness of the content:
@@ -735,9 +743,9 @@ scrape_configs:
   - job_name: node
     scheme: https
     metrics_path: /metrics
-    # Keep the route timeout of exporter_proxy (default 10s) below the
-    # scrape timeout: a slow source is then reported as a 502 with its
-    # reason instead of a bare scrape timeout.
+    # Optional. exporter_proxy reads this timeout from the request header
+    # and answers before it expires; keep the route timeout (default 10s)
+    # at or above it so that the scraper's timeout is the one that applies.
     scrape_timeout: 15s
     tls_config:
       ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
@@ -787,10 +795,12 @@ scrape_configs:
   share the listener's authentication.
 - `password_file` keeps the password out of the scrape configuration; the
   file must be readable by Prometheus or vmagent only.
-- Set `scrape_timeout` above the route `timeout` of exporter_proxy (default
-  10 s, and Prometheus' default scrape timeout is also 10 s): a slow source
-  then gives a `502` with its reason (`exporter_proxy_source_errors_total`)
-  rather than a scrape timeout on the scraper side.
+- The scraper's `scrape_timeout` (sent in the
+  `X-Prometheus-Scrape-Timeout-Seconds` header) caps the time given to the
+  source, so a slow source gives a `502` with reason `timeout`
+  (`exporter_proxy_source_errors_total`) before the scraper gives up. The
+  route `timeout` remains the upper bound: if it is shorter than
+  `scrape_timeout`, it is the one that applies.
 - Each scraper and each route counts against `max_concurrent_requests` of
   the listener (default 2) when their scrapes overlap: with several scrapers
   (high availability pairs) or many routes on one listener, raise it.

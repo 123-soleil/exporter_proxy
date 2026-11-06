@@ -429,3 +429,112 @@ func TestNewHandlerFromConfig(t *testing.T) {
 		t.Errorf("code = %d, want 200", resp.StatusCode)
 	}
 }
+
+func TestScrapeBudget(t *testing.T) {
+	tests := []struct {
+		value  string
+		want   time.Duration
+		wantOK bool
+	}{
+		{"", 0, false},
+		{"10", 9500 * time.Millisecond, true},
+		{"14.5", 14 * time.Second, true},
+		{"1", time.Second, true}, // too short for the margin: whole timeout
+		{"0.3", 300 * time.Millisecond, true},
+		{"0", 0, false},
+		{"-5", 0, false},
+		{"abc", 0, false},
+		{"NaN", 0, false},
+		{"+Inf", 0, false},
+		{"1e300", 86400*time.Second - scrapeMargin, true}, // capped, no overflow
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			h := http.Header{}
+			if tt.value != "" {
+				h.Set(scrapeTimeoutHeader, tt.value)
+			}
+			got, ok := scrapeBudget(h)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("scrapeBudget(%q) = %v, %v; want %v, %v", tt.value, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// deadlineSource records the deadline of the context it is given.
+type deadlineSource struct {
+	deadline time.Time
+	has      bool
+}
+
+func (d *deadlineSource) Fetch(ctx context.Context) (*source.Result, error) {
+	d.deadline, d.has = ctx.Deadline()
+	return &source.Result{Body: []byte(metrics)}, nil
+}
+
+func TestHandlerPassesScrapeBudgetToSource(t *testing.T) {
+	src := &deadlineSource{}
+	h := newTestHandler(src, 2, &recorder{}, &bytes.Buffer{}, false)
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if src.has {
+		t.Error("deadline set without the scrape timeout header")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set(scrapeTimeoutHeader, "5")
+	start := time.Now()
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !src.has {
+		t.Fatal("no deadline with the scrape timeout header")
+	}
+	if left := src.deadline.Sub(start); left > 4600*time.Millisecond || left < 4400*time.Millisecond {
+		t.Errorf("deadline in %v, want about 4.5s (5s minus margin)", left)
+	}
+}
+
+// With a real HTTP source slower than the scraper's timeout, the proxy
+// answers 502 "timeout" before the scraper gives up, although the route
+// timeout is longer.
+func TestHandlerAnswersBeforeScraperTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer slow.Close()
+
+	src, err := source.New(config.Route{
+		Path:     "/metrics",
+		Upstream: slow.URL + "/metrics",
+		Limits:   config.Limits{Timeout: 5 * time.Second, MaxBodyBytes: 1 << 20, MaxSamples: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{}
+	var logs bytes.Buffer
+	h := newTestHandler(src, 2, rec, &logs, false)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set(scrapeTimeoutHeader, "1")
+	w := httptest.NewRecorder()
+	start := time.Now()
+	h.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "timeout") {
+		t.Errorf("code %d body %q, want 502 timeout", w.Code, w.Body.String())
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("answered after %v, want within the 1s scrape timeout", elapsed)
+	}
+	if fmt.Sprint(rec.failed) != "[timeout]" {
+		t.Errorf("failed reasons = %v, want [timeout]", rec.failed)
+	}
+	if !strings.Contains(logs.String(), "scrape_budget_ms=1000") {
+		t.Errorf("budget not logged: %s", logs.String())
+	}
+}
