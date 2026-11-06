@@ -8,13 +8,19 @@ authentication** in front of Prometheus exporters that do not support them
 natively (or where configuring each exporter separately is impractical).
 
 A single `exporter_proxy` process serves **several listeners**. Each listener
-has its own address, its own authentication settings and one or more routes
-forwarding a path to an upstream exporter.
+has its own address, its own authentication settings and one or more routes.
+A route serves metrics from one source:
+
+- an HTTP exporter over TCP (`http://127.0.0.1:19100/metrics`);
+- an HTTP exporter over a Unix domain socket (UDS);
+- a static file in the Prometheus text exposition format (`.prom`).
 
 ```
 scraper --mTLS-->  :9100  /metrics           --> http://127.0.0.1:19100/metrics  (node_exporter)
 scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics  (node_exporter)
                           /postgres/metrics  --> http://127.0.0.1:19187/metrics  (postgres_exporter)
+                          /app/metrics       --> unix:/run/app/metrics.sock       (HTTP over UDS)
+                          /batch/metrics     --> /var/lib/batch/metrics.prom      (static file)
 ```
 
 ## Goals
@@ -39,11 +45,77 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 - A **listener** binds one address (`listen`) and references one web
   configuration file (`web_config_file`).
 - A listener holds one or more **routes**. A route maps an exact request path
-  to an upstream URL. Only `GET` requests are forwarded.
+  to one source. Only `GET` (and `HEAD`) requests are accepted.
 - Authentication is **per listener**: all routes of a listener share the same
   TLS/mTLS/basic auth settings. Routes needing different authentication must
   go on different listeners.
 - Request credentials (`Authorization` header) are never forwarded upstream.
+
+### Route sources
+
+Each route has exactly one source:
+
+| Source         | Route keys                     | Behavior                                                                 |
+|----------------|--------------------------------|--------------------------------------------------------------------------|
+| HTTP over TCP  | `upstream`                     | Fetches the URL (`http://` only).                                        |
+| HTTP over UDS  | `upstream` + `unix_socket`     | Connects to the socket instead of the URL host; the URL path and query are sent as is (the host part is ignored, like `curl --unix-socket`). |
+| Static file    | `file`                         | Reads the file on every request.                                         |
+
+- `unix_socket` is only valid together with `upstream`; `file` excludes both.
+- `file` and `unix_socket` must be absolute, clean paths: a relative path, a
+  path containing `..`, `.` or duplicate slashes is rejected at startup, so
+  the configuration never depends on the working directory and the target is
+  exactly what is written.
+- A `file` route requires `max_age` (no default): if the file's modification
+  time is older than `max_age`, the scrape is rejected
+  (`reason="stale"`), so a writer that stopped running cannot go unnoticed
+  behind old values. Choose it as a few times the writer's period (for
+  example `max_age: 15m` for a file written every 5 minutes).
+- Upstream requests are sent with `Accept: text/plain; version=0.0.4`, no
+  client header is forwarded, and redirects are not followed.
+- Whatever the source, the content is validated before being served (see
+  below). Any failure returns `502 Bad Gateway`, is logged and counted, so
+  Prometheus marks the target down instead of scraping partial or unexpected
+  data.
+- Files must be written atomically (temporary file in the same directory,
+  then rename) so that a half-written file is never served.
+
+### Response validation and limits
+
+Content validation is **mandatory and cannot be disabled**: the proxy only
+ever serves data that parses as Prometheus metrics. This prevents a
+misconfigured or compromised source (wrong file path, local admin page, error
+page) from being exposed through the proxy.
+
+- The whole response is read into memory, bounded by `max_body_bytes`, then
+  parsed with the official Prometheus text parser
+  ([`prometheus/common/expfmt`](https://pkg.go.dev/github.com/prometheus/common/expfmt)),
+  not with regular expressions.
+- Only the text exposition format (`version=0.0.4`) is accepted. Protobuf and
+  OpenMetrics are not supported, so native histograms are not available
+  through the proxy.
+- A response larger than `max_body_bytes` is rejected without being fully
+  read (default 10 MiB). A source that does not answer within `timeout` is
+  rejected (default 10 s). A response containing more than `max_samples`
+  samples is rejected (default 50000; every line with a value counts, so each
+  histogram bucket is one sample, like Prometheus' `sample_limit`). These three
+  limits are set globally and can be lowered or raised per route.
+- The validated body is returned unchanged with
+  `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+- Validation guarantees the format, not the harmlessness of the content:
+  label values are still free text chosen by the source.
+- Each listener serves at most `max_concurrent_requests` requests at the same
+  time (default 10). Extra requests are answered immediately with
+  `503 Service Unavailable` instead of queuing.
+- Memory use is therefore bounded by roughly `max_body_bytes` × the sum of
+  `max_concurrent_requests` over all listeners. Parsing is linear in the
+  response size; its cost is exposed as a metric
+  (`exporter_proxy_parse_duration_seconds`) so the limits can be tuned on
+  real data.
+- The service user needs read access to the files and write access to the
+  sockets (`connect()` on a Unix socket requires write permission on it),
+  typically through group membership; the systemd unit and the AppArmor
+  profile must allow these paths.
 
 ### Authentication modes
 
@@ -63,9 +135,37 @@ protected by its own web configuration file. It is a long-running daemon with
 per-route counters, so an HTTP endpoint is used rather than the node_exporter
 textfile collector. Planned metrics (names may change):
 
-- `exporter_proxy_requests_total{listener,route,code}`
-- `exporter_proxy_upstream_errors_total{listener,route}`
-- `exporter_proxy_request_duration_seconds{listener,route}`
+- `exporter_proxy_requests_total{listener,route,code}`: requests served.
+- `exporter_proxy_request_duration_seconds{listener,route}` (histogram): total
+  time to serve a request (fetch + parse).
+- `exporter_proxy_parse_duration_seconds{listener,route}` (histogram): time
+  spent validating the content with the Prometheus parser.
+- `exporter_proxy_response_size_bytes{listener,route}` (histogram): size of
+  the content read from the source.
+- `exporter_proxy_samples{listener,route}` (histogram): number of samples in
+  the content read from the source.
+- `exporter_proxy_source_errors_total{listener,route,reason}`: rejected
+  scrapes, with `reason` in a fixed set: `unavailable` (connection, file or
+  HTTP status error), `timeout`, `too_large`, `too_many_samples`, `invalid`
+  (parse error), `stale` (file older than `max_age`).
+- `exporter_proxy_file_modified_timestamp_seconds{listener,route}` (gauge):
+  modification time of the file of each `file` route, updated on every scrape.
+- `exporter_proxy_build_info{version,revision,branch,goversion,goos,goarch,tags}`
+  (gauge, always 1): version of the running binary, from
+  [`prometheus/common/version`](https://pkg.go.dev/github.com/prometheus/common/version),
+  like other Prometheus exporters.
+- `exporter_proxy_config_hash` (gauge): hash of the main configuration file
+  as loaded, like Alertmanager's `alertmanager_config_hash`. It is the
+  SHA-256 of the raw file bytes, truncated to its first 48 bits so that the
+  value is exact in a float64. Comparing it across servers, or before and
+  after a deployment, shows which configuration is actually running. Any byte
+  change, comments included, changes the hash. Web configuration files are
+  not included: exporter-toolkit re-reads them on new connections, so they
+  are not part of the loaded state.
+- `exporter_proxy_requests_in_flight{listener}` (gauge): requests being
+  served.
+- `exporter_proxy_requests_rejected_total{listener}`: requests refused with
+  `503` because `max_concurrent_requests` was reached.
 
 Labels only take values from the configuration (listener and route names),
 never client addresses or user names, to keep cardinality low.
@@ -80,10 +180,17 @@ metrics:
   listen: "127.0.0.1:9999"
   web_config_file: /etc/exporter_proxy/web-metrics.yml
 
+# Defaults applied to every route, each one can be overridden per route.
+defaults:
+  timeout: 10s              # maximum time to read a source
+  max_body_bytes: 10485760  # 10 MiB, larger responses are rejected
+  max_samples: 50000        # responses with more samples are rejected
+
 listeners:
   - name: node                 # used as metric label, must be unique
     listen: ":9100"
     web_config_file: /etc/exporter_proxy/web-mtls.yml
+    max_concurrent_requests: 10   # extra requests get 503 (default 10)
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics
@@ -96,6 +203,15 @@ listeners:
         upstream: http://127.0.0.1:19100/metrics
       - path: /postgres/metrics
         upstream: http://127.0.0.1:19187/metrics
+        timeout: 20s                     # per-route override
+      # HTTP exporter listening on a Unix domain socket.
+      - path: /app/metrics
+        upstream: http://localhost/metrics   # host ignored, path sent as is
+        unix_socket: /run/app/metrics.sock
+      # Static file in the Prometheus text exposition format.
+      - path: /batch/metrics
+        file: /var/lib/batch/metrics.prom
+        max_age: 15m                     # required for file routes
 ```
 
 Example mTLS web configuration (`web-mtls.yml`):
@@ -138,7 +254,16 @@ Planned command line:
 
 ```sh
 exporter_proxy --config /etc/exporter_proxy/config.yml
+exporter_proxy --version
 ```
+
+| Flag        | Description                                                        |
+|-------------|--------------------------------------------------------------------|
+| `--config`  | Path to the configuration file (default `/etc/exporter_proxy/config.yml`). |
+| `--version` | Print version, revision and Go version on one line, then exit 0.   |
+
+The version is injected at build time (`-ldflags -X`) from the git tag; a
+build outside a tag reports the output of `git describe --tags --dirty`.
 
 The process will run in the foreground, log JSON to stdout/stderr, exit with
 a non-zero code on invalid configuration, and shut down gracefully on
