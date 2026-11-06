@@ -35,7 +35,8 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
   and bcrypt-hashed basic auth users, instead of a custom format.
 - Run unattended under a hardened systemd unit, as a static Go binary
   (`CGO_ENABLED=0`).
-- Structured JSON logs (one event per line) and Prometheus metrics about the
+- Classic exporter logs (`logfmt`, one event per line, no access log by
+  default) and Prometheus metrics about the
   proxy itself.
 
 ## Design
@@ -265,12 +266,43 @@ exporter_proxy --version
 |-------------|--------------------------------------------------------------------|
 | `--config`  | Path to the configuration file (default `/etc/exporter_proxy/config.yml`). |
 | `--check`   | Check the whole setup without starting anything, then exit (see below). |
+| `--log.level` | Minimum log level: `debug`, `info`, `warn`, `error` (default `info`). |
+| `--log.format` | Log format: `logfmt` or `json` (default `logfmt`).              |
+| `--log.access` | Log one line per served request (default off).                  |
 | `--version` | Print version, revision and Go version on one line, then exit 0.   |
+
+The version is injected at build time (`-ldflags -X`) from the git tag; a
+build outside a tag reports the output of `git describe --tags --dirty`.
+
+The process runs in the foreground, logs to stderr, exits with a non-zero
+code on invalid configuration, and shuts down gracefully on `SIGTERM`.
+
+### Logs
+
+Logs use the same format and flags as the other Prometheus exporters
+([`prometheus/common/promslog`](https://pkg.go.dev/github.com/prometheus/common/promslog)):
+one event per line, in `logfmt` by default, for example:
+
+```
+time=2026-11-06T14:00:00.000Z level=WARN source=handler.go:42 msg="source rejected" listener=shared route=/postgres/metrics reason=timeout duration_ms=10001
+```
+
+`--log.format=json` switches to one JSON object per line with the same fields,
+for log pipelines that prefer JSON.
+
+- No access log by default: a successful scrape logs nothing. Failures
+  (rejected sources, refused requests, reload results) are always logged at
+  `warn` or `error`.
+- `--log.access` adds one `info` line per request (listener, route, status
+  code, duration, size, client address), useful for debugging but noisy at
+  normal scrape rates.
+- Context is always in separate fields, never concatenated into `msg`. No
+  colors are used.
 
 ### Checking a setup (`--check`)
 
 `--check` goes further than validating the configuration syntax. It reports
-every problem found (one JSON log line each, not only the first one) and
+every problem found (one log line each, not only the first one) and
 exits with `0` if everything is correct, `1` otherwise:
 
 - the main configuration is parsed and validated (same rules as at startup);
@@ -309,13 +341,6 @@ and validated again:
 
 Web configuration files themselves do not need a reload: exporter-toolkit
 re-reads them on new connections.
-
-The version is injected at build time (`-ldflags -X`) from the git tag; a
-build outside a tag reports the output of `git describe --tags --dirty`.
-
-The process will run in the foreground, log JSON to stdout/stderr, exit with
-a non-zero code on invalid configuration, and shut down gracefully on
-`SIGTERM`.
 
 ## Development
 
