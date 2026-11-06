@@ -63,4 +63,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration file, re-read while running): web configurations validated
   and every address bound before serving, graceful shutdown on `SIGTERM` and
   `SIGINT` (15 s), HTTP server timeouts, `--log.access` flag.
+- Startup warning for listeners using basic authentication without TLS.
 - `.gitignore` for Go builds, local configuration and key material.

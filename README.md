@@ -175,6 +175,11 @@ All modes are expressed in the web configuration file of the listener:
 | Basic auth         | `basic_auth_users` (bcrypt hashes); should be combined with TLS   |
 | mTLS + basic auth  | both of the above                                                 |
 
+Basic authentication without TLS sends the credentials in clear text on the
+network. exporter_proxy still starts in that case, but logs a `warn` line for
+each such listener at startup (`msg="basic authentication without TLS:
+credentials travel in clear text"`), so that it shows up in log alerts.
+
 ### Proxy metrics
 
 `exporter_proxy` exposes its own metrics on a dedicated listener (`/metrics`),

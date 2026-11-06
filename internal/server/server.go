@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/exporter-toolkit/web"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
@@ -67,6 +69,12 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("invalid web configuration: %s", strings.Join(problems, "; "))
+	}
+	for _, l := range cfg.Listeners {
+		if clear, err := basicAuthWithoutTLS(l.WebConfigFile); err == nil && clear {
+			logger.Warn("basic authentication without TLS: credentials travel in clear text",
+				"listener", l.Name, "web_config_file", l.WebConfigFile)
+		}
 	}
 
 	// 2. Handlers.
@@ -187,6 +195,40 @@ func (s *Server) closeListeners() {
 	for _, l := range s.listeners {
 		_ = l.ln.Close()
 	}
+}
+
+// webConfigSummary holds the web configuration keys that decide whether TLS
+// is enabled (same rule as exporter-toolkit's TLSConfig.IsEnabled) and
+// whether basic authentication users are defined.
+type webConfigSummary struct {
+	TLS struct {
+		Cert           string `yaml:"cert"`
+		Key            string `yaml:"key"`
+		CertFile       string `yaml:"cert_file"`
+		KeyFile        string `yaml:"key_file"`
+		ClientCA       string `yaml:"client_ca"`
+		ClientCAFile   string `yaml:"client_ca_file"`
+		ClientAuthType string `yaml:"client_auth_type"`
+	} `yaml:"tls_server_config"`
+	Users map[string]string `yaml:"basic_auth_users"`
+}
+
+// basicAuthWithoutTLS reports whether a web configuration defines basic
+// authentication users without enabling TLS. The file was validated by
+// exporter-toolkit beforehand; unknown keys are ignored here.
+func basicAuthWithoutTLS(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	var c webConfigSummary
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return false, err
+	}
+	t := c.TLS
+	tlsEnabled := t.Cert != "" || t.Key != "" || t.CertFile != "" || t.KeyFile != "" ||
+		t.ClientCA != "" || t.ClientCAFile != "" || t.ClientAuthType != ""
+	return len(c.Users) > 0 && !tlsEnabled, nil
 }
 
 // oneLine keeps an error on a single log line.
