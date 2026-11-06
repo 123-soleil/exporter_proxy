@@ -177,9 +177,13 @@ func TestLogLevelFiltersInfo(t *testing.T) {
 func validConfig(t *testing.T) string {
 	t.Helper()
 	return writeFile(t, `
+metrics:
+  listen: "127.0.0.1:9999"
+  web_config_file: /etc/exporter_proxy/web-metrics.yml
 listeners:
   - name: node
     listen: ":9100"
+    web_config_file: /etc/exporter_proxy/web.yml
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics

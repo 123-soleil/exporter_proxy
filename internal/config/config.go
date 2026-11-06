@@ -7,6 +7,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +32,22 @@ const (
 type Config struct {
 	Metrics   MetricsEndpoint
 	Listeners []Listener
+
+	// Hash identifies the configuration file content: the first 48 bits of
+	// the SHA-256 of the raw bytes. 48 bits fit exactly in a float64, so the
+	// value survives being exported as a Prometheus gauge.
+	Hash uint64
+}
+
+// HashString returns Hash as 12 hexadecimal digits, for logs.
+func (c *Config) HashString() string {
+	return fmt.Sprintf("%012x", c.Hash)
+}
+
+// hash48 returns the first 48 bits of the SHA-256 of data.
+func hash48(data []byte) uint64 {
+	sum := sha256.Sum256(data)
+	return binary.BigEndian.Uint64(sum[:8]) >> 16
 }
 
 // MetricsEndpoint is where exporter_proxy exposes its own metrics.
@@ -115,14 +133,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	cfg, err := Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
-	}
-	return cfg, nil
+	// Callers log the path next to the error, do not repeat it here.
+	return Parse(data)
 }
 
-// Parse decodes a configuration document and resolves defaults.
+// Parse decodes and validates a configuration document, then resolves
+// defaults. Validation problems are returned together as a *ValidationError.
 func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -140,7 +156,13 @@ func Parse(data []byte) (*Config, error) {
 		return nil, errors.New("configuration must contain a single YAML document")
 	}
 
-	return resolve(&fc), nil
+	if err := validate(&fc); err != nil {
+		return nil, err
+	}
+
+	cfg := resolve(&fc)
+	cfg.Hash = hash48(data)
+	return cfg, nil
 }
 
 // resolve applies the precedence: route/listener value, then the `defaults`

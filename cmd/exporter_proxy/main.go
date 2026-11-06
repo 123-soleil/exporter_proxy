@@ -83,7 +83,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		routes += len(l.Routes)
 	}
 	logger.Info("configuration loaded", "path", opts.configPath,
-		"listeners", len(cfg.Listeners), "routes", routes)
+		"listeners", len(cfg.Listeners), "routes", routes, "hash", cfg.HashString())
 
 	// The proxy itself is not implemented yet: fail loudly rather than
 	// pretending to run.

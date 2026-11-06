@@ -36,4 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Strict configuration loading: unknown keys, empty files and multiple YAML
   documents are errors; limits resolve from route or listener, then the
   `defaults` section, then built-in defaults (documented in the README).
+- Configuration validation reporting all problems at once: unique listener
+  names and addresses, clean unique route paths, exactly one source per
+  route, `http://` upstreams without credentials, absolute clean paths,
+  required `web_config_file`, `metrics` section and `max_age` on file routes,
+  strictly positive limits.
+- Configuration hash (first 48 bits of SHA-256), logged at startup.
 - `.gitignore` for Go builds, local configuration and key material.

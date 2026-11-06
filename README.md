@@ -180,7 +180,7 @@ never client addresses or user names, to keep cardinality low.
 Main file (default `/etc/exporter_proxy/config.yml`, option `--config`):
 
 ```yaml
-# Endpoint exposing exporter_proxy's own metrics.
+# Endpoint exposing exporter_proxy's own metrics (required).
 metrics:
   listen: "127.0.0.1:9999"
   web_config_file: /etc/exporter_proxy/web-metrics.yml
@@ -229,6 +229,32 @@ listeners:
 - Durations use Go syntax with a unit (`500ms`, `10s`, `15m`, `1h`); a bare
   number such as `10` is rejected.
 - Sizes are plain integers in bytes.
+
+### Validation rules
+
+After parsing, the configuration is validated. **All** problems are reported
+together on one log line (each prefixed with its location, e.g.
+`listener "shared" route "/metrics": ...`), and the process exits with code
+`1`.
+
+| Scope      | Rule |
+|------------|------|
+| `metrics`  | Required, with `listen` and `web_config_file`. |
+| Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label). |
+| `listen`   | Required, `host:port` with a port from 1 to 65535, not shared with another listener or with `metrics`. |
+| `web_config_file` | Required on every listener and on `metrics`. |
+| Routes     | At least one per listener. |
+| `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
+| Source     | Exactly one: `upstream` or `file`. `unix_socket` only together with `upstream`. |
+| `upstream` | `http://` only, with a host, without credentials (`user:password@`) or fragment. |
+| Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
+| `max_age`  | Required on `file` routes, forbidden on other routes. |
+| Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
+
+Once valid, the configuration is identified by a hash: the first 48 bits of
+the SHA-256 of the file, logged as 12 hexadecimal digits at startup
+(`msg="configuration loaded" ... hash=85c73f060656`) and exported later as
+`exporter_proxy_config_hash`.
 
 ### Default values
 

@@ -96,6 +96,10 @@ func TestParseResolvesDefaultsAndOverrides(t *testing.T) {
 		},
 	}
 
+	if cfg.Hash == 0 {
+		t.Error("Hash not computed")
+	}
+	want.Hash = cfg.Hash
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("resolved config mismatch\n got: %+v\nwant: %+v", cfg, want)
 	}
@@ -103,9 +107,13 @@ func TestParseResolvesDefaultsAndOverrides(t *testing.T) {
 
 func TestParseBuiltinDefaults(t *testing.T) {
 	cfg, err := Parse([]byte(`
+metrics:
+  listen: "127.0.0.1:9999"
+  web_config_file: /etc/exporter_proxy/web-metrics.yml
 listeners:
   - name: node
     listen: ":9100"
+    web_config_file: /etc/exporter_proxy/web.yml
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics
@@ -231,8 +239,8 @@ func TestLoad(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("nope: 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), bad) {
-		t.Errorf("Load(invalid file) error = %v, want it to name the file", err)
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "field nope not found") {
+		t.Errorf("Load(invalid file) error = %v, want unknown field error", err)
 	}
 
 	if _, err := Load(filepath.Join(dir, "missing.yml")); err == nil {
