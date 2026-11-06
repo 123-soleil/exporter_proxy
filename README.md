@@ -721,6 +721,84 @@ path changes) or a restart. Replace these files atomically
 (write a temporary file, then rename it) so that a half-written file is
 never read.
 
+### Scraping from Prometheus or VictoriaMetrics
+
+Prometheus (`prometheus.yml`), vmagent and single-node VictoriaMetrics
+(`-promscrape.config`) use the same `scrape_configs` format. Example for the
+configuration of `deploy/config/config.yml.exemple`: an mTLS listener on
+port 9100, a basic auth listener with two routes on port 9443, and the proxy
+metrics on port 9999.
+
+```yaml
+scrape_configs:
+  # mTLS listener "node": node_exporter behind /metrics.
+  - job_name: node
+    scheme: https
+    metrics_path: /metrics
+    # Keep the route timeout of exporter_proxy (default 10s) below the
+    # scrape timeout: a slow source is then reported as a 502 with its
+    # reason instead of a bare scrape timeout.
+    scrape_timeout: 15s
+    tls_config:
+      ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
+      cert_file: /etc/prometheus/tls/scraper.crt
+      key_file: /etc/prometheus/tls/scraper.key
+    static_configs:
+      - targets: ["server1.example.org:9100", "server2.example.org:9100"]
+
+  # Basic auth listener "apps": one job per route (metrics_path).
+  - job_name: app
+    scheme: https
+    metrics_path: /app/metrics
+    basic_auth:
+      username: prometheus
+      password_file: /etc/prometheus/exporter_proxy.password
+    tls_config:
+      ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
+    static_configs:
+      - targets: ["server1.example.org:9443"]
+
+  - job_name: batch
+    scheme: https
+    metrics_path: /batch/metrics
+    basic_auth:
+      username: prometheus
+      password_file: /etc/prometheus/exporter_proxy.password
+    tls_config:
+      ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
+    static_configs:
+      - targets: ["server1.example.org:9443"]
+
+  # exporter_proxy's own metrics (metrics listener, mTLS).
+  - job_name: exporter_proxy
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
+      cert_file: /etc/prometheus/tls/scraper.crt
+      key_file: /etc/prometheus/tls/scraper.key
+    static_configs:
+      - targets: ["server1.example.org:9999", "server2.example.org:9999"]
+```
+
+- The scraper trusts the CA that signed exporter_proxy's server certificate
+  (`ca_file`). If the certificate names the host by DNS name and the target
+  uses another name or an IP address, set `tls_config.server_name`.
+- Each route of a listener is a job with its own `metrics_path`; all of them
+  share the listener's authentication.
+- `password_file` keeps the password out of the scrape configuration; the
+  file must be readable by Prometheus or vmagent only.
+- Set `scrape_timeout` above the route `timeout` of exporter_proxy (default
+  10 s, and Prometheus' default scrape timeout is also 10 s): a slow source
+  then gives a `502` with its reason (`exporter_proxy_source_errors_total`)
+  rather than a scrape timeout on the scraper side.
+- Each scraper and each route counts against `max_concurrent_requests` of
+  the listener (default 2) when their scrapes overlap: with several scrapers
+  (high availability pairs) or many routes on one listener, raise it.
+
+These files were validated with `promtool check config` (Prometheus 3.7)
+and `vmagent -dryRun` (vmagent 1.128), then used to scrape a running
+exporter_proxy: all targets were up in both.
+
 ## Development
 
 Requirements: Go 1.26 or later (required by `prometheus/common`), git, make,
