@@ -207,8 +207,8 @@ textfile collector. Planned metrics (names may change):
   value is exact in a float64. Comparing it across servers, or before and
   after a deployment, shows which configuration is actually running. Any byte
   change, comments included, changes the hash. Web configuration files are
-  not included: exporter-toolkit re-reads them on new connections, so they
-  are not part of the loaded state.
+  not included: exporter-toolkit re-reads them while running (see
+  "Configuration reload"), so they are not part of the loaded state.
 - `exporter_proxy_config_last_reload_successful` (gauge, 0 or 1): whether
   the last configuration load (startup or `SIGHUP`) succeeded.
 - `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
@@ -366,7 +366,7 @@ can be bypassed.
 
 ## Usage
 
-Planned command line:
+Command line:
 
 ```sh
 exporter_proxy --config /etc/exporter_proxy/config.yml
@@ -376,7 +376,7 @@ exporter_proxy --version
 | Flag        | Description                                                        |
 |-------------|--------------------------------------------------------------------|
 | `--config`  | Path to the configuration file (default `/etc/exporter_proxy/config.yml`). |
-| `--check`   | Check the whole setup without starting anything, then exit (see below). |
+| `--check`   | *Not implemented yet.* Check the whole setup without starting anything, then exit (see below). |
 | `--log.level` | Minimum log level: `debug`, `info`, `warn`, `error` (default `info`). |
 | `--log.format` | Log format: `logfmt` or `json` (default `logfmt`).              |
 | `--log.access` | Log one line per served request (default off).                  |
@@ -385,8 +385,24 @@ exporter_proxy --version
 The version is injected at build time (`-ldflags -X`) from the git tag; a
 build outside a tag reports the output of `git describe --tags --dirty`.
 
-The process runs in the foreground, logs to stderr, exits with a non-zero
-code on invalid configuration, and shuts down gracefully on `SIGTERM`.
+The process runs in the foreground and logs to stderr. At startup it:
+
+1. loads and validates the configuration;
+2. validates every web configuration file (all problems reported at once);
+3. binds **every** listener address before serving any: if one address
+   cannot be bound (port in use, permission), the already bound ones are
+   released and the process exits with code `1`, so a half-started proxy
+   never runs;
+4. serves all listeners.
+
+On `SIGTERM` (`systemctl stop`) or `SIGINT`, it stops accepting connections,
+waits up to 15 seconds for in-flight requests to complete, closes the
+remaining connections and exits with code `0` (`1` if connections had to be
+closed or if a listener failed while running).
+
+HTTP server limits: 10 s to receive the request (headers included), write
+deadline of the longest route `timeout` plus 10 s, 60 s keep-alive idle
+timeout, 16 KiB of request headers.
 
 ### Logs
 
@@ -450,8 +466,18 @@ and validated again:
   configuration file changed are stopped gracefully (in-flight requests are
   completed) and restarted; `exporter_proxy_config_hash` is updated.
 
-Web configuration files themselves do not need a reload: exporter-toolkit
-re-reads them on new connections.
+Web configuration files themselves do not need a reload, exporter-toolkit
+re-reads them while running:
+
+- `basic_auth_users` and `http_server_config.headers` on every request: a
+  user added, removed or with a new password takes effect immediately;
+- TLS settings (certificate, key, client CA) on every new connection, so a
+  renewed certificate is picked up without restart.
+
+Whether a listener uses TLS at all is decided at startup: adding or removing
+`tls_server_config` requires a restart. Replace these files atomically
+(write a temporary file, then rename it) so that a half-written file is
+never read.
 
 ## Development
 

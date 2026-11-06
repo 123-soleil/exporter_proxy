@@ -59,4 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise, `404` for unknown paths), `max_concurrent_requests` slots with
   immediate `503`, `502` with the failure reason only, failures logged at
   `warn`, optional access log, hooks for the proxy metrics.
+- Listeners served with exporter-toolkit (TLS, mTLS, basic auth from the web
+  configuration file, re-read while running): web configurations validated
+  and every address bound before serving, graceful shutdown on `SIGTERM` and
+  `SIGINT` (15 s), HTTP server timeouts, `--log.access` flag.
 - `.gitignore` for Go builds, local configuration and key material.

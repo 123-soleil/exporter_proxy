@@ -3,14 +3,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/server"
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
 )
@@ -19,6 +23,10 @@ const (
 	appName = "exporter_proxy"
 
 	defaultConfigPath = "/etc/exporter_proxy/config.yml"
+
+	// shutdownTimeout bounds the wait for in-flight requests on SIGTERM;
+	// it stays well below systemd's default TimeoutStopSec (90 s).
+	shutdownTimeout = 15 * time.Second
 )
 
 // Exit codes.
@@ -32,6 +40,7 @@ const (
 type options struct {
 	configPath  string
 	showVersion bool
+	accessLog   bool
 	logConfig   *promslog.Config
 }
 
@@ -47,12 +56,15 @@ func main() {
 	// Log timestamps in UTC whatever the server time zone, so that lines from
 	// different servers compare directly once centralized.
 	time.Local = time.UTC
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	// SIGTERM (systemctl stop) and SIGINT trigger a graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
 
 // run is the testable entry point: it parses args, writes to the given
-// streams and returns the process exit code.
-func run(args []string, stdout, stderr io.Writer) int {
+// streams, serves until ctx is done and returns the process exit code.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	opts, err := parseFlags(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -85,10 +97,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 	logger.Info("configuration loaded", "path", opts.configPath,
 		"listeners", len(cfg.Listeners), "routes", routes, "hash", cfg.HashString())
 
-	// The proxy itself is not implemented yet: fail loudly rather than
-	// pretending to run.
-	logger.Error("proxy not implemented yet")
-	return exitError
+	srv, err := server.Start(cfg, server.Options{Logger: logger, AccessLog: opts.accessLog})
+	if err != nil {
+		logger.Error("cannot start listeners", "err", err)
+		return exitError
+	}
+
+	code := exitOK
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down", "timeout", shutdownTimeout)
+	case err := <-srv.Err():
+		logger.Error("listener failed, shutting down", "err", err)
+		code = exitError
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("shutdown incomplete, connections closed", "err", err)
+		code = exitError
+	}
+	logger.Info("stopped")
+	return code
 }
 
 // parseFlags parses the command line. Flag names follow the conventions of
@@ -106,6 +137,7 @@ func parseFlags(args []string, stderr io.Writer) (*options, error) {
 	fs.SetOutput(stderr)
 	fs.StringVar(&opts.configPath, "config", defaultConfigPath, "path to the configuration file")
 	fs.BoolVar(&opts.showVersion, "version", false, "print version information and exit")
+	fs.BoolVar(&opts.accessLog, "log.access", false, "log one line per served request")
 	fs.Var(opts.logConfig.Level, "log.level", "minimum log level: debug, info, warn, error")
 	fs.Var(opts.logConfig.Format, "log.format", "log format: logfmt, json")
 

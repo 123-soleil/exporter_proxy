@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunExitCodes(t *testing.T) {
@@ -54,10 +60,10 @@ func TestRunExitCodes(t *testing.T) {
 			wantStderr: `unexpected argument "extra"`,
 		},
 		{
-			name:       "not implemented yet",
+			name:       "web config file missing",
 			args:       []string{"--config=" + validConfig(t)},
 			wantCode:   exitError,
-			wantStderr: "proxy not implemented yet",
+			wantStderr: "cannot start listeners",
 		},
 		{
 			name:       "missing config file",
@@ -76,7 +82,7 @@ func TestRunExitCodes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(tt.args, &stdout, &stderr)
+			code := run(context.Background(), tt.args, &stdout, &stderr)
 
 			if code != tt.wantCode {
 				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tt.wantCode, stderr.String())
@@ -147,7 +153,7 @@ func TestLogFormats(t *testing.T) {
 				args = append(args, "--log.format="+tt.format)
 			}
 			var stdout, stderr bytes.Buffer
-			run(args, &stdout, &stderr)
+			run(context.Background(), args, &stdout, &stderr)
 
 			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 			if len(lines) == 0 || lines[0] == "" {
@@ -162,13 +168,13 @@ func TestLogFormats(t *testing.T) {
 
 func TestLogLevelFiltersInfo(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	run([]string{"--config=" + validConfig(t), "--log.level=error"}, &stdout, &stderr)
+	run(context.Background(), []string{"--config=" + validConfig(t), "--log.level=error"}, &stdout, &stderr)
 
 	out := stderr.String()
 	if strings.Contains(out, "starting") {
 		t.Errorf("info line logged at level error: %q", out)
 	}
-	if !strings.Contains(out, "proxy not implemented yet") {
+	if !strings.Contains(out, "cannot start listeners") {
 		t.Errorf("error line missing: %q", out)
 	}
 }
@@ -198,4 +204,104 @@ func writeFile(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// freePort returns a TCP port that was free a moment ago.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// servingConfig writes a configuration serving a metrics file on port, with
+// an empty web configuration (plain HTTP, no authentication).
+func servingConfig(t *testing.T, port int) string {
+	t.Helper()
+	dir := t.TempDir()
+	prom := filepath.Join(dir, "m.prom")
+	web := filepath.Join(dir, "web.yml")
+	if err := os.WriteFile(prom, []byte("up 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(web, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return writeFile(t, fmt.Sprintf(`
+metrics:
+  listen: "127.0.0.1:1"
+  web_config_file: %s
+listeners:
+  - name: files
+    listen: "127.0.0.1:%d"
+    web_config_file: %s
+    routes:
+      - path: /metrics
+        file: %s
+        max_age: 1h
+`, web, port, web, prom))
+}
+
+func TestRunServesUntilCanceled(t *testing.T) {
+	port := freePort(t)
+	cfg := servingConfig(t, port)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, []string{"--config=" + cfg}, io.Discard, &stderr) }()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
+	var body string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				body = string(b)
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if body != "up 1\n" {
+		t.Fatalf("served body = %q, want %q", body, "up 1\n")
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != exitOK {
+			t.Errorf("exit code = %d, want 0 (stderr: %s)", code, &stderr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not stop after cancellation")
+	}
+	if !strings.Contains(stderr.String(), "shutting down") {
+		t.Errorf("shutdown not logged: %s", &stderr)
+	}
+}
+
+func TestRunFailsWhenPortIsBusy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	cfg := servingConfig(t, ln.Addr().(*net.TCPAddr).Port)
+
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{"--config=" + cfg}, io.Discard, &stderr)
+	if code != exitError {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "address already in use") {
+		t.Errorf("stderr = %s, want bind error", &stderr)
+	}
 }
