@@ -291,7 +291,7 @@ func TestShutdownWaitsForInFlightRequests(t *testing.T) {
 	if _, err := http.Get(url); err == nil {
 		t.Error("server still accepts connections after Shutdown")
 	}
-	if !strings.Contains(logs.String(), "Listening on") {
+	if !strings.Contains(logs.String(), "msg=listening") {
 		t.Errorf("listener start not logged: %s", &logs)
 	}
 }

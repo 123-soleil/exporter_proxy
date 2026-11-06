@@ -422,3 +422,66 @@ func TestE2ECertificateRotation(t *testing.T) {
 		t.Errorf("server certificate not renewed for new connections (serial %v)", after)
 	}
 }
+
+// Refused connections and requests are visible in the proxy metrics.
+func TestE2EAuthFailuresAreCounted(t *testing.T) {
+	e := startE2E(t)
+
+	// mTLS without a client certificate: TLS handshake failure.
+	if resp, err := e.client(t, nil, 0).Get(e.mtlsURL); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("mTLS request without certificate succeeded")
+	}
+	// Basic auth: one wrong password, one request without credentials.
+	client := e.client(t, nil, 0)
+	req, _ := http.NewRequest(http.MethodGet, e.basicURL, nil)
+	req.SetBasicAuth("prometheus", "wrong")
+	for _, r := range []*http.Request{req, mustRequest(t, e.basicURL)} {
+		resp, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	want := []string{
+		`exporter_proxy_auth_failures_total{listener="basic",reason="invalid_credentials"} 1`,
+		`exporter_proxy_auth_failures_total{listener="basic",reason="missing_credentials"} 1`,
+		`exporter_proxy_auth_failures_total{listener="basic",reason="rate_limited"} 0`,
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp, err := e.client(t, &e.clientCert, 0).Get(e.metricsURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		m := string(body)
+		missing := ""
+		for _, w := range want {
+			if !strings.Contains(m, w) {
+				missing = w
+			}
+		}
+		// The handshake failure is reported asynchronously by net/http.
+		tlsCounted := strings.Contains(m, `exporter_proxy_auth_failures_total{listener="mtls",reason="tls_handshake"} `) &&
+			!strings.Contains(m, `exporter_proxy_auth_failures_total{listener="mtls",reason="tls_handshake"} 0`)
+		if missing == "" && tlsCounted {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metrics lack %q (tls_handshake counted: %v)", missing, tlsCounted)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func mustRequest(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return req
+}

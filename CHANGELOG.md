@@ -59,8 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise, `404` for unknown paths), `max_concurrent_requests` slots with
   immediate `503`, `502` with the failure reason only, failures logged at
   `warn`, optional access log, hooks for the proxy metrics.
-- Listeners served with exporter-toolkit (TLS, mTLS, basic auth from the web
-  configuration file, re-read while running): web configurations validated
+- Listeners configured with exporter-toolkit web configuration files (TLS,
+  mTLS, basic auth, re-read while running): web configurations validated
   and every address bound before serving, graceful shutdown on `SIGTERM` and
   `SIGINT` (15 s), HTTP server timeouts, `--log.access` flag.
 - Startup warning for listeners using basic authentication without TLS.
@@ -89,4 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deployment files: commented configuration and web configuration examples,
   `/etc/default` file for extra options, sysusers declaration and hardened
   systemd unit with reload (`systemd-analyze security`: 1.4).
+- TLS and basic authentication enforced in-process (web configuration still
+  validated and TLS settings built with exporter-toolkit): every refusal is
+  logged and counted in `exporter_proxy_auth_failures_total{reason}`
+  (`tls_handshake`, `missing_credentials`, `invalid_credentials`,
+  `rate_limited`).
+- Rate limiting of uncached bcrypt password checks (5/s, burst 10 per
+  listener, answered `429`); verified credentials are cached as a SHA-256
+  and never limited. The web configuration `rate_limit` is supported.
+- Documentation: mTLS preferred over basic authentication.
 - `.gitignore` for Go builds, local configuration and key material.

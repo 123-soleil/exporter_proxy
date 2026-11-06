@@ -96,6 +96,8 @@ func (r *recorder) ContentParsed(_, _ string, samples int, _ time.Duration) {
 	r.parsed = append(r.parsed, samples)
 }
 
+func (r *recorder) AuthFailed(string, AuthReason) {}
+
 func (r *recorder) SourceFailed(_, _ string, reason source.Reason) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

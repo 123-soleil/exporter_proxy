@@ -379,7 +379,7 @@ listeners:
 					t.Errorf("stderr lacks %q:\n%s", w, &stderr)
 				}
 			}
-			if strings.Contains(stderr.String(), "Listening on") {
+			if strings.Contains(stderr.String(), "msg=listening") {
 				t.Error("--check started a listener")
 			}
 		})

@@ -36,7 +36,25 @@ type Recorder interface {
 	ContentParsed(listener, route string, samples int, duration time.Duration)
 	// SourceFailed is called for every rejected scrape.
 	SourceFailed(listener, route string, reason source.Reason)
+	// AuthFailed is called for every request or connection refused before
+	// routing (TLS handshake, basic authentication, rate limiting).
+	AuthFailed(listener string, reason AuthReason)
 }
+
+// AuthReason classifies a refused authentication. Values are metric label
+// values: keep the set small and fixed.
+type AuthReason string
+
+// Authentication failure reasons.
+const (
+	AuthTLSHandshake       AuthReason = "tls_handshake"       // TLS or mTLS handshake failed
+	AuthMissingCredentials AuthReason = "missing_credentials" // basic auth required, none sent
+	AuthInvalidCredentials AuthReason = "invalid_credentials" // unknown user or wrong password
+	AuthRateLimited        AuthReason = "rate_limited"        // too many attempts, answered 429
+)
+
+// AuthReasons lists every AuthReason, to initialize metric series.
+var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited}
 
 // Options configures a handler.
 type Options struct {
@@ -87,7 +105,7 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 		h.logger = slog.New(slog.DiscardHandler)
 	}
 	if h.rec == nil {
-		h.rec = nopRecorder{}
+		h.rec = NopRecorder{}
 	}
 	h.logger = h.logger.With("listener", listener)
 	for _, r := range routes {
@@ -227,12 +245,14 @@ func (w *statusWriter) status() int {
 // Unwrap lets http.ResponseController reach the underlying writer.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-type nopRecorder struct{}
+// NopRecorder is a Recorder that records nothing.
+type NopRecorder struct{}
 
-func (nopRecorder) RequestServed(string, string, int, time.Duration) {}
-func (nopRecorder) InFlight(string, int)                             {}
-func (nopRecorder) RequestRejected(string)                           {}
-func (nopRecorder) SourceRead(string, string, int)                   {}
-func (nopRecorder) FileModified(string, string, time.Time)           {}
-func (nopRecorder) ContentParsed(string, string, int, time.Duration) {}
-func (nopRecorder) SourceFailed(string, string, source.Reason)       {}
+func (NopRecorder) RequestServed(string, string, int, time.Duration) {}
+func (NopRecorder) InFlight(string, int)                             {}
+func (NopRecorder) RequestRejected(string)                           {}
+func (NopRecorder) SourceRead(string, string, int)                   {}
+func (NopRecorder) FileModified(string, string, time.Time)           {}
+func (NopRecorder) ContentParsed(string, string, int, time.Duration) {}
+func (NopRecorder) AuthFailed(string, AuthReason)                    {}
+func (NopRecorder) SourceFailed(string, string, source.Reason)       {}

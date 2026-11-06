@@ -4,8 +4,10 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -66,6 +68,7 @@ type Server struct {
 }
 
 type listener struct {
+	tls     bool
 	spec    spec
 	ln      net.Listener
 	srv     *http.Server
@@ -145,7 +148,14 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 			closeAll(sockets)
 			return nil, fmt.Errorf("listener %q: %w", sp.name, err)
 		}
-		bound = append(bound, s.newListener(sp, ln))
+		l, err := s.newListener(sp, ln)
+		if err != nil {
+			_ = ln.Close()
+			closeListeners(bound)
+			closeAll(sockets)
+			return nil, err
+		}
+		bound = append(bound, l)
 	}
 
 	for _, l := range bound {
@@ -210,7 +220,13 @@ func (s *Server) Reload(cfg *config.Config) error {
 			closeListeners(started)
 			return fmt.Errorf("listener %q: %w", sp.name, err)
 		}
-		started = append(started, s.newListener(sp, ln))
+		l, err := s.newListener(sp, ln)
+		if err != nil {
+			_ = ln.Close()
+			closeListeners(started)
+			return err
+		}
+		started = append(started, l)
 	}
 
 	// Commit: nothing below can fail.
@@ -291,41 +307,87 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	return specs, nil
 }
 
-func (s *Server) newListener(sp spec, ln net.Listener) *listener {
-	sh := newSwapHandler(sp)
-	return &listener{
-		spec:    sp,
-		ln:      ln,
-		handler: sh,
-		srv: &http.Server{
-			Handler:           sh,
-			ReadHeaderTimeout: readHeaderTimeout,
-			ReadTimeout:       readHeaderTimeout,
-			// Baseline until the handler sets the per-request deadline.
-			WriteTimeout:   writeMargin,
-			IdleTimeout:    idleTimeout,
-			MaxHeaderBytes: maxHeaderBytes,
-			// TLS handshake failures (wrong or missing client certificate)
-			// are security relevant: log them.
-			ErrorLog: slog.NewLogLogger(s.logger.With("listener", sp.name).Handler(), slog.LevelWarn),
-		},
+// newListener prepares the HTTP server of sp on ln: TLS settings and the
+// authentication layer come from its web configuration file. It does not
+// serve yet.
+func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
+	wc, err := webconfig.Load(sp.webConfig)
+	if err != nil {
+		return nil, fmt.Errorf("listener %q: %w", sp.name, err)
 	}
+
+	sh := newSwapHandler(sp)
+	auth := newAuthHandler(sp.name, sp.webConfig,
+		webRateLimit{interval: wc.RateLimiterConfig.Interval, burst: wc.RateLimiterConfig.Burst},
+		sh, s.logger, s.recorder())
+	srv := &http.Server{
+		Handler:           auth,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readHeaderTimeout,
+		// Baseline until the handler sets the per-request deadline.
+		WriteTimeout:   writeMargin,
+		IdleTimeout:    idleTimeout,
+		MaxHeaderBytes: maxHeaderBytes,
+		// TLS handshake failures are counted and logged as such.
+		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder()}, "", 0),
+	}
+
+	l := &listener{spec: sp, ln: ln, srv: srv, handler: sh}
+	if !wc.TLSConfig.IsEnabled() {
+		return l, nil
+	}
+
+	tlsCfg, err := web.ConfigToTLSConfig(&wc.TLSConfig)
+	if err != nil {
+		return nil, fmt.Errorf("listener %q: web_config_file %s: %w", sp.name, sp.webConfig, err)
+	}
+	nextProtos := []string{"http/1.1"}
+	if wc.HTTPConfig.HTTP2 {
+		nextProtos = []string{"h2", "http/1.1"}
+	} else {
+		// A non-nil empty map disables HTTP/2 in net/http.
+		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	}
+	tlsCfg.NextProtos = nextProtos
+	// Certificates, key and client CA are re-read on every new connection,
+	// like exporter-toolkit: renewed files apply without restart.
+	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
+	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		c, err := webconfig.Load(webConfig)
+		if err == nil {
+			var cfg *tls.Config
+			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
+				cfg.NextProtos = nextProtos
+				return cfg, nil
+			}
+		}
+		logger.Error("cannot load TLS settings for a new connection", "web_config_file", webConfig, "err", oneLine(err))
+		return nil, err
+	}
+	srv.TLSConfig = tlsCfg
+	l.tls = true
+	return l, nil
 }
 
-// serve runs web.Serve for l in the background.
-func (s *Server) serve(l *listener) {
-	webConfig := l.spec.webConfig
-	systemdSocket := false
-	flags := &web.FlagConfig{
-		WebListenAddresses: &[]string{},
-		WebSystemdSocket:   &systemdSocket,
-		WebConfigFile:      &webConfig,
+func (s *Server) recorder() proxy.Recorder {
+	if s.opts.Recorder == nil {
+		return proxy.NopRecorder{}
 	}
-	llog := s.logger.With("listener", l.spec.name)
+	return s.opts.Recorder
+}
+
+// serve serves l in the background.
+func (s *Server) serve(l *listener) {
+	s.logger.Info("listening", "listener", l.spec.name, "address", l.ln.Addr().String(), "tls", l.tls)
 	s.serving.Add(1)
 	go func() {
 		defer s.serving.Done()
-		err := web.Serve(l.ln, l.srv, flags, llog)
+		var err error
+		if l.tls {
+			err = l.srv.ServeTLS(l.ln, "", "")
+		} else {
+			err = l.srv.Serve(l.ln)
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			select {
 			case s.errc <- fmt.Errorf("listener %q: %w", l.spec.name, err):

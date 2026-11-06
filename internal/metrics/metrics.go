@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/proxy"
 	"github.com/123-soleil/exporter_proxy/internal/source"
 )
 
@@ -44,6 +45,7 @@ type Metrics struct {
 	sourceErrors    *prometheus.CounterVec
 	inFlight        *prometheus.GaugeVec
 	rejected        *prometheus.CounterVec
+	authFailures    *prometheus.CounterVec
 	fileModified    *prometheus.GaugeVec
 
 	configHash          prometheus.Gauge
@@ -97,6 +99,10 @@ func New() *Metrics {
 			Namespace: namespace, Name: "requests_rejected_total",
 			Help: "Requests refused with 503 because max_concurrent_requests was reached.",
 		}, []string{"listener"}),
+		authFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "auth_failures_total",
+			Help: "Connections or requests refused before routing, by reason: tls_handshake, missing_credentials, invalid_credentials, rate_limited.",
+		}, []string{"listener", "reason"}),
 		fileModified: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "file_modified_timestamp_seconds",
 			Help: "Modification time of the file of a file route, updated on every scrape.",
@@ -117,7 +123,7 @@ func New() *Metrics {
 
 	m.registry.MustRegister(
 		m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples,
-		m.sourceErrors, m.inFlight, m.rejected, m.fileModified,
+		m.sourceErrors, m.inFlight, m.rejected, m.authFailures, m.fileModified,
 		m.configHash, m.reloadSuccessful, m.reloadSuccessTstamp,
 		versioncollector.NewCollector(namespace),
 		collectors.NewGoCollector(),
@@ -156,9 +162,15 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 
 	// Initialize the series of every configured listener and route, so that
 	// rates and alerts work from the first scrape.
+	for _, reason := range proxy.AuthReasons {
+		m.authFailures.WithLabelValues(config.MetricsListenerName, string(reason))
+	}
 	for _, l := range cfg.Listeners {
 		m.inFlight.WithLabelValues(l.Name)
 		m.rejected.WithLabelValues(l.Name)
+		for _, reason := range proxy.AuthReasons {
+			m.authFailures.WithLabelValues(l.Name, string(reason))
+		}
 		for _, r := range l.Routes {
 			for _, reason := range reasons {
 				m.sourceErrors.WithLabelValues(l.Name, r.Path, string(reason))
@@ -179,6 +191,7 @@ func (m *Metrics) deleteSeries(labels prometheus.Labels) {
 	if _, ok := labels["route"]; !ok {
 		m.inFlight.DeletePartialMatch(labels)
 		m.rejected.DeletePartialMatch(labels)
+		m.authFailures.DeletePartialMatch(labels)
 	}
 }
 
@@ -236,6 +249,11 @@ func (m *Metrics) FileModified(listener, route string, t time.Time) {
 func (m *Metrics) ContentParsed(listener, route string, samples int, d time.Duration) {
 	m.parseDuration.WithLabelValues(listener, route).Observe(d.Seconds())
 	m.samples.WithLabelValues(listener, route).Observe(float64(samples))
+}
+
+// AuthFailed implements proxy.Recorder.
+func (m *Metrics) AuthFailed(listener string, reason proxy.AuthReason) {
+	m.authFailures.WithLabelValues(listener, string(reason)).Inc()
 }
 
 // SourceFailed implements proxy.Recorder.

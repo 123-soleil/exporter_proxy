@@ -11,7 +11,18 @@ tls_server_config:
   cert_file: /etc/exporter_proxy/tls/CHANGE_ME.crt
   key_file: /etc/exporter_proxy/tls/CHANGE_ME.key
 
+# Prefer mTLS (web-mtls.yml) when the scraper supports client certificates:
+# each new password tried costs a bcrypt check (about 250 ms of CPU at cost
+# 12). exporter_proxy caches verified credentials and limits other checks to
+# 5 per second per listener (answered 429 beyond).
 basic_auth_users:
   # user: bcrypt hash of the password, generated with:
   #   htpasswd -nBC 12 "" | tr -d ':\n'
   prometheus: CHANGE_ME
+
+# Optional: cap ALL requests of the listener, legitimate ones included
+# (exporter-toolkit semantics, read when the listener starts). Usually not
+# needed: the built-in limit only applies to password checks.
+# rate_limit:
+#   interval: 1s   # one request per interval on average
+#   burst: 10      # requests allowed at once

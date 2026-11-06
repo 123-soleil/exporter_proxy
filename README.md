@@ -31,8 +31,10 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
   exporter, several exporters behind one listener, or a mix of both.
 - Reuse the standard Prometheus
   [web configuration format](https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md)
-  (via `prometheus/exporter-toolkit`) for TLS, client certificate verification
-  and bcrypt-hashed basic auth users, instead of a custom format.
+  for TLS, client certificate verification and bcrypt-hashed basic auth
+  users, instead of a custom format. Files are validated and TLS settings
+  built with `prometheus/exporter-toolkit`; authentication is enforced by
+  exporter_proxy itself, so that every refusal is logged and counted.
 - Run unattended under a hardened systemd unit, as a static Go binary
   (`CGO_ENABLED=0`).
 - Classic exporter logs (`logfmt`, one event per line, no access log by
@@ -175,10 +177,52 @@ All modes are expressed in the web configuration file of the listener:
 | Basic auth         | `basic_auth_users` (bcrypt hashes); should be combined with TLS   |
 | mTLS + basic auth  | both of the above                                                 |
 
+**Prefer mTLS.** A client certificate is checked during the TLS handshake,
+before any HTTP processing, at a negligible CPU cost; it cannot be guessed,
+and it expires. Basic authentication relies on bcrypt, which is slow on
+purpose (about 250 ms of CPU per check at cost 12): every new password tried
+by an attacker costs the server that time. exporter_proxy limits this (see
+below), but mTLS removes the problem. Use basic authentication when the
+scraper cannot present a client certificate, and always with TLS.
+
 Basic authentication without TLS sends the credentials in clear text on the
 network. exporter_proxy still starts in that case, but logs a `warn` line for
 each such listener at startup (`msg="basic authentication without TLS:
 credentials travel in clear text"`), so that it shows up in log alerts.
+
+### Refused authentications
+
+Every refusal is logged and counted in
+`exporter_proxy_auth_failures_total{listener,reason}`:
+
+| `reason` | When | Response | Log |
+|----------|------|----------|-----|
+| `tls_handshake` | TLS or mTLS handshake failed: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks) | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
+| `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
+| `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
+| `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
+
+### Rate limiting of password checks
+
+Credentials that already passed a bcrypt check are remembered (as a SHA-256
+of user, stored hash and password: the password itself is not kept in
+memory), so a scraper is checked once and then served without any bcrypt
+cost. Only checks of credentials not yet known to be valid are limited,
+per listener: **5 per second, with a burst of 10**, one at a time. Beyond
+that, the request gets `429` without any bcrypt computation.
+
+As a result, a brute force attack costs at most a few bcrypt checks per
+second and never slows down a scraper whose credentials are already
+verified. A scraper verified for the first time during an attack may get a
+`429` and succeed on its next scrape. Unknown users are checked against a
+fixed hash, so that they take the same time as known ones (no user
+enumeration). Changing a password in the web configuration invalidates the
+remembered credentials of that user.
+
+The `rate_limit` section of the web configuration (exporter-toolkit format,
+`interval` and `burst`) is also supported: it limits **all** requests of the
+listener, legitimate ones included, and is read at startup. Prefer the
+built-in limit above unless all requests must be capped.
 
 ### Proxy metrics
 
@@ -219,12 +263,15 @@ Besides the standard `go_*`, `process_*` and
   value is exact in a float64. Comparing it across servers, or before and
   after a deployment, shows which configuration is actually running. Any byte
   change, comments included, changes the hash. Web configuration files are
-  not included: exporter-toolkit re-reads them while running (see
+  not included: they are re-read while running (see
   "Configuration reload"), so they are not part of the loaded state.
 - `exporter_proxy_config_last_reload_successful` (gauge, 0 or 1): whether
   the last configuration load (startup or `SIGHUP`) succeeded.
 - `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
   of the last successful configuration load.
+- `exporter_proxy_auth_failures_total{listener,reason}`: connections and
+  requests refused before routing (see "Refused authentications"); the
+  metrics endpoint is reported as `listener="metrics"`.
 - `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
@@ -244,6 +291,8 @@ Example alerts:
 increase(exporter_proxy_source_errors_total[15m]) > 0
 # A metrics file stopped being updated (also caught by max_age).
 time() - exporter_proxy_file_modified_timestamp_seconds > 3600
+# Someone is trying credentials or certificates.
+increase(exporter_proxy_auth_failures_total{reason=~"invalid_credentials|rate_limited"}[15m]) > 10
 # Scrapes are refused: raise max_concurrent_requests or reduce scrapers.
 increase(exporter_proxy_requests_rejected_total[15m]) > 0
 # Configuration differs between servers that should be identical.
@@ -643,16 +692,18 @@ Since the address is compared as written, changing `":9100"` into
 `"0.0.0.0:9100"` is seen as a new address and fails with "address already in
 use": restart the service for such a change.
 
-Web configuration files themselves do not need a reload, exporter-toolkit
-re-reads them while running:
+Web configuration files themselves do not need a reload, they are re-read
+while running, like exporter-toolkit does:
 
 - `basic_auth_users` and `http_server_config.headers` on every request: a
   user added, removed or with a new password takes effect immediately;
 - TLS settings (certificate, key, client CA) on every new connection, so a
   renewed certificate is picked up without restart.
 
-Whether a listener uses TLS at all is decided at startup: adding or removing
-`tls_server_config` requires a restart. Replace these files atomically
+Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`)
+and `rate_limit` are read when the listener starts: changing them requires a
+reload (the listener is restarted on its socket if its `web_config_file`
+path changes) or a restart. Replace these files atomically
 (write a temporary file, then rename it) so that a half-written file is
 never read.
 

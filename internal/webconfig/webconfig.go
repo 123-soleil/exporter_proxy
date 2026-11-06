@@ -1,25 +1,48 @@
-// Package webconfig reads the few keys of an exporter-toolkit web
-// configuration file that exporter_proxy inspects itself: whether TLS is
-// enabled, the TLS file paths and whether basic auth users are defined.
+// Package webconfig loads exporter-toolkit web configuration files.
 //
-// Full validation stays with exporter-toolkit (web.Validate); this package
-// ignores unknown keys.
+// Validation stays with exporter-toolkit (web.Validate); Load parses a file
+// the same way exporter-toolkit does internally (same defaults, strict YAML,
+// paths relative to the file), so that exporter_proxy can serve TLS and
+// basic authentication itself.
 package webconfig
 
 import (
+	"crypto/tls"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"go.yaml.in/yaml/v3"
+	"github.com/prometheus/exporter-toolkit/web"
+	"go.yaml.in/yaml/v2"
 )
 
-// Summary is what exporter_proxy needs to know about a web configuration.
+// Load reads and parses the web configuration file at path.
+func Load(path string) (*web.Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// Same defaults as exporter-toolkit.
+	c := &web.Config{
+		TLSConfig: web.TLSConfig{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+		},
+		HTTPConfig: web.HTTPConfig{HTTP2: true},
+	}
+	if err := yaml.UnmarshalStrict(data, c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	c.TLSConfig.SetDirectory(filepath.Dir(path))
+	return c, nil
+}
+
+// Summary is what exporter_proxy reports about a web configuration.
 type Summary struct {
 	TLSEnabled bool
 	// CertFile, KeyFile and ClientCAFile are resolved against the directory
-	// of the web configuration file, like exporter-toolkit does. Empty when
-	// not set (inline PEM or no TLS).
+	// of the web configuration file. Empty when not set (inline PEM or no
+	// TLS).
 	CertFile     string
 	KeyFile      string
 	ClientCAFile string
@@ -29,45 +52,17 @@ type Summary struct {
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
 func (s Summary) BasicAuthWithoutTLS() bool { return s.HasUsers && !s.TLSEnabled }
 
-type file struct {
-	TLS struct {
-		Cert           string `yaml:"cert"`
-		Key            string `yaml:"key"`
-		CertFile       string `yaml:"cert_file"`
-		KeyFile        string `yaml:"key_file"`
-		ClientCA       string `yaml:"client_ca"`
-		ClientCAFile   string `yaml:"client_ca_file"`
-		ClientAuthType string `yaml:"client_auth_type"`
-	} `yaml:"tls_server_config"`
-	Users map[string]string `yaml:"basic_auth_users"`
-}
-
-// Read parses the web configuration file at path.
+// Read loads the file at path and summarizes it.
 func Read(path string) (Summary, error) {
-	data, err := os.ReadFile(path)
+	c, err := Load(path)
 	if err != nil {
 		return Summary{}, err
 	}
-	var f file
-	if err := yaml.Unmarshal(data, &f); err != nil {
-		return Summary{}, fmt.Errorf("parse %s: %w", path, err)
-	}
-	t := f.TLS
-	dir := filepath.Dir(path)
 	return Summary{
-		// Same rule as exporter-toolkit's TLSConfig.IsEnabled.
-		TLSEnabled: t.Cert != "" || t.Key != "" || t.CertFile != "" || t.KeyFile != "" ||
-			t.ClientCA != "" || t.ClientCAFile != "" || t.ClientAuthType != "",
-		CertFile:     resolve(dir, t.CertFile),
-		KeyFile:      resolve(dir, t.KeyFile),
-		ClientCAFile: resolve(dir, t.ClientCAFile),
-		HasUsers:     len(f.Users) > 0,
+		TLSEnabled:   c.TLSConfig.IsEnabled(),
+		CertFile:     c.TLSConfig.TLSCertPath,
+		KeyFile:      c.TLSConfig.TLSKeyPath,
+		ClientCAFile: c.TLSConfig.ClientCAs,
+		HasUsers:     len(c.Users) > 0,
 	}, nil
-}
-
-func resolve(dir, p string) string {
-	if p == "" || filepath.IsAbs(p) {
-		return p
-	}
-	return filepath.Join(dir, p)
 }
