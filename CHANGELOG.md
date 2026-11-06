@@ -67,4 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - systemd socket activation: `listen: "systemd:<name>"` takes the socket named
   by `FileDescriptorName=`, so ports below 1024 need no capability; unused
   passed sockets are closed.
+- Proxy metrics on the `metrics` listener (own web configuration, `systemd:`
+  supported): requests, durations, parse time, response size, samples,
+  source errors by reason, in-flight and rejected requests, file
+  modification time, `build_info`, configuration hash and load status, plus
+  Go and process metrics; series pre-initialized at 0.
 - `.gitignore` for Go builds, local configuration and key material.

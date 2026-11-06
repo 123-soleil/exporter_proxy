@@ -28,13 +28,23 @@ const (
 	idleTimeout       = 60 * time.Second // keep-alive between scrapes
 	maxHeaderBytes    = 16 << 10         // scrape requests are tiny
 	writeMargin       = 10 * time.Second // parsing and sending after the source read
+
+	// metricsWriteTimeout covers promhttp's own 10 s timeout.
+	metricsWriteTimeout = 10*time.Second + writeMargin
 )
+
+// MetricsListener is the name of the metrics endpoint in logs and in
+// Server.Addr. Configuration validation reserves it.
+const MetricsListener = config.MetricsListenerName
 
 // Options configures the servers.
 type Options struct {
 	Logger    *slog.Logger
 	Recorder  proxy.Recorder
 	AccessLog bool
+	// MetricsHandler serves the metrics endpoint described by cfg.Metrics.
+	// Nil: the metrics endpoint is not started.
+	MetricsHandler http.Handler
 }
 
 // Server is the set of running listeners.
@@ -51,6 +61,16 @@ type listener struct {
 	srv  *http.Server
 }
 
+// spec describes one server to start: a configured listener or the metrics
+// endpoint.
+type spec struct {
+	name         string
+	listen       string
+	webConfig    string
+	handler      http.Handler
+	writeTimeout time.Duration
+}
+
 // Start validates the web configuration files, binds every listener address,
 // then serves them all. Nothing is served unless every listener could be
 // set up: on error, already bound addresses are released.
@@ -60,27 +80,18 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 
-	// 1. Web configuration files: report every invalid one at once.
-	var problems []string
+	// 1. Handlers.
+	var specs []spec
+	if opts.MetricsHandler != nil {
+		specs = append(specs, spec{
+			name:         MetricsListener,
+			listen:       cfg.Metrics.Listen,
+			webConfig:    cfg.Metrics.WebConfigFile,
+			handler:      opts.MetricsHandler,
+			writeTimeout: metricsWriteTimeout,
+		})
+	}
 	for _, l := range cfg.Listeners {
-		if err := web.Validate(l.WebConfigFile); err != nil {
-			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
-				l.Name, l.WebConfigFile, oneLine(err)))
-		}
-	}
-	if len(problems) > 0 {
-		return nil, fmt.Errorf("invalid web configuration: %s", strings.Join(problems, "; "))
-	}
-	for _, l := range cfg.Listeners {
-		if clear, err := basicAuthWithoutTLS(l.WebConfigFile); err == nil && clear {
-			logger.Warn("basic authentication without TLS: credentials travel in clear text",
-				"listener", l.Name, "web_config_file", l.WebConfigFile)
-		}
-	}
-
-	// 2. Handlers.
-	handlers := make([]http.Handler, len(cfg.Listeners))
-	for i, l := range cfg.Listeners {
 		h, err := proxy.NewHandler(l, proxy.Options{
 			Logger:    logger,
 			Recorder:  opts.Recorder,
@@ -89,35 +100,63 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		handlers[i] = h
+		var maxTimeout time.Duration
+		for _, r := range l.Routes {
+			maxTimeout = max(maxTimeout, r.Limits.Timeout)
+		}
+		specs = append(specs, spec{
+			name:         l.Name,
+			listen:       l.Listen,
+			webConfig:    l.WebConfigFile,
+			handler:      h,
+			writeTimeout: maxTimeout + writeMargin,
+		})
+	}
+
+	// 2. Web configuration files: report every invalid one at once.
+	var problems []string
+	for _, sp := range specs {
+		if err := web.Validate(sp.webConfig); err != nil {
+			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
+				sp.name, sp.webConfig, oneLine(err)))
+		}
+	}
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("invalid web configuration: %s", strings.Join(problems, "; "))
+	}
+	for _, sp := range specs {
+		if clear, err := basicAuthWithoutTLS(sp.webConfig); err == nil && clear {
+			logger.Warn("basic authentication without TLS: credentials travel in clear text",
+				"listener", sp.name, "web_config_file", sp.webConfig)
+		}
 	}
 
 	// 3. Bind every address (or take every systemd socket) before serving
 	// any, so that a port conflict fails the whole startup.
-	sockets, err := takeSystemdSockets(cfg.Listeners, logger)
+	sockets, err := takeSystemdSockets(specs, logger)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{logger: logger, errc: make(chan error, len(cfg.Listeners))}
-	for i, l := range cfg.Listeners {
+	s := &Server{logger: logger, errc: make(chan error, len(specs))}
+	for _, sp := range specs {
 		var ln net.Listener
-		if name, ok := config.SystemdSocketName(l.Listen); ok {
+		if name, ok := config.SystemdSocketName(sp.listen); ok {
 			ln = sockets[name]
-		} else if ln, err = net.Listen("tcp", l.Listen); err != nil {
+		} else if ln, err = net.Listen("tcp", sp.listen); err != nil {
 			s.closeListeners()
 			closeAll(sockets)
-			return nil, fmt.Errorf("listener %q: %w", l.Name, err)
+			return nil, fmt.Errorf("listener %q: %w", sp.name, err)
 		}
 		s.listeners = append(s.listeners, &listener{
-			name: l.Name,
+			name: sp.name,
 			ln:   ln,
-			srv:  newHTTPServer(handlers[i], l, logger),
+			srv:  newHTTPServer(sp, logger),
 		})
 	}
 
 	// 4. Serve.
 	for i, l := range s.listeners {
-		webConfig := cfg.Listeners[i].WebConfigFile
+		webConfig := specs[i].webConfig
 		systemdSocket := false
 		flags := &web.FlagConfig{
 			WebListenAddresses: &[]string{},
@@ -137,21 +176,17 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 	return s, nil
 }
 
-func newHTTPServer(h http.Handler, l config.Listener, logger *slog.Logger) *http.Server {
-	var maxTimeout time.Duration
-	for _, r := range l.Routes {
-		maxTimeout = max(maxTimeout, r.Limits.Timeout)
-	}
+func newHTTPServer(sp spec, logger *slog.Logger) *http.Server {
 	return &http.Server{
-		Handler:           h,
+		Handler:           sp.handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readHeaderTimeout,
-		WriteTimeout:      maxTimeout + writeMargin,
+		WriteTimeout:      sp.writeTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 		// TLS handshake failures (wrong or missing client certificate)
 		// are security relevant: log them.
-		ErrorLog: slog.NewLogLogger(logger.With("listener", l.Name).Handler(), slog.LevelWarn),
+		ErrorLog: slog.NewLogLogger(logger.With("listener", sp.name).Handler(), slog.LevelWarn),
 	}
 }
 
@@ -206,11 +241,11 @@ var systemdListeners = activation.ListenersWithNames
 // takeSystemdSockets returns, by name, the socket of each listener whose
 // listen value is "systemd:<name>". Each name must match exactly one
 // stream socket; sockets passed by systemd but not configured are closed.
-func takeSystemdSockets(listeners []config.Listener, logger *slog.Logger) (map[string]net.Listener, error) {
+func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Listener, error) {
 	wanted := map[string]string{} // socket name -> listener name
-	for _, l := range listeners {
-		if name, ok := config.SystemdSocketName(l.Listen); ok {
-			wanted[name] = l.Name
+	for _, sp := range specs {
+		if name, ok := config.SystemdSocketName(sp.listen); ok {
+			wanted[name] = sp.name
 		}
 	}
 	if len(wanted) == 0 {

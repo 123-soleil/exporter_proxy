@@ -182,14 +182,21 @@ credentials travel in clear text"`), so that it shows up in log alerts.
 
 ### Proxy metrics
 
-`exporter_proxy` exposes its own metrics on a dedicated listener (`/metrics`),
-protected by its own web configuration file. It is a long-running daemon with
-per-route counters, so an HTTP endpoint is used rather than the node_exporter
-textfile collector. Planned metrics (names may change):
+`exporter_proxy` exposes its own metrics on a dedicated listener, configured
+in the `metrics` section (`listen`, which also accepts `systemd:<name>`, and
+its own `web_config_file`, so it can use different credentials or
+certificates than the proxied exporters). It serves `/metrics` only (other
+paths get `404`) and is named `metrics` in logs, so no listener may use that
+name. It is a long-running daemon with per-route counters, so an HTTP
+endpoint is used rather than the node_exporter textfile collector.
 
-- `exporter_proxy_requests_total{listener,route,code}`: requests served.
+Besides the standard `go_*`, `process_*` and
+`promhttp_metric_handler_errors_total` metrics, it exports:
+
+- `exporter_proxy_requests_total{listener,route,code}`: requests served;
+  `route` is empty for paths that match no route (`404`).
 - `exporter_proxy_request_duration_seconds{listener,route}` (histogram): total
-  time to serve a request (fetch + parse).
+  time to serve a request (fetch + parse), for matched routes only.
 - `exporter_proxy_parse_duration_seconds{listener,route}` (histogram): time
   spent validating the content with the Prometheus parser.
 - `exporter_proxy_response_size_bytes{listener,route}` (histogram): size of
@@ -218,13 +225,30 @@ textfile collector. Planned metrics (names may change):
   the last configuration load (startup or `SIGHUP`) succeeded.
 - `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
   of the last successful configuration load.
-- `exporter_proxy_requests_in_flight{listener}` (gauge): requests being
-  served.
+- `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
+  concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
 
-Labels only take values from the configuration (listener and route names),
-never client addresses or user names, to keep cardinality low.
+Labels only take values from the configuration (listener names and route
+paths), from a fixed set (`reason`) or from HTTP status codes, never client
+addresses, user names or requested paths, to keep cardinality low. The
+series of every configured listener and route, including every `reason`, are
+created at 0 at startup, so `rate()` and `increase()` alerts work from the
+first scrape.
+
+Example alerts:
+
+```promql
+# A source keeps failing.
+increase(exporter_proxy_source_errors_total[15m]) > 0
+# A metrics file stopped being updated (also caught by max_age).
+time() - exporter_proxy_file_modified_timestamp_seconds > 3600
+# Scrapes are refused: raise max_concurrent_requests or reduce scrapers.
+increase(exporter_proxy_requests_rejected_total[15m]) > 0
+# Configuration differs between servers that should be identical.
+count(count_values("hash", exporter_proxy_config_hash)) > 1
+```
 
 ## Configuration
 
@@ -291,7 +315,7 @@ together on one log line (each prefixed with its location, e.g.
 | Scope      | Rule |
 |------------|------|
 | `metrics`  | Required, with `listen` and `web_config_file`. |
-| Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label). |
+| Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label); `metrics` is reserved for the metrics endpoint. |
 | `listen`   | Required, `host:port` with a port from 1 to 65535, or `systemd:<name>` (socket activation, see below); not shared with another listener or with `metrics`. |
 | `web_config_file` | Required on every listener and on `metrics`. |
 | Routes     | At least one per listener. |

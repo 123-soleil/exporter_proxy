@@ -476,3 +476,32 @@ func TestSystemdSocketErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestMetricsEndpoint(t *testing.T) {
+	webConfig := filepath.Join(t.TempDir(), "web.yml")
+	basicAuthWebConfig(t, webConfig, "vm", "metrics-pass")
+	plain := filepath.Join(t.TempDir(), "plain.yml")
+	if err := os.WriteFile(plain, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "exporter_proxy_up 1\n")
+	})
+	s, err := Start(&config.Config{
+		Metrics:   config.MetricsEndpoint{Listen: "127.0.0.1:0", WebConfigFile: webConfig},
+		Listeners: []config.Listener{listenerConfig("node", plain, "http://127.0.0.1:1")},
+	}, Options{MetricsHandler: metricsHandler})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	url := "http://" + s.Addr(MetricsListener).String() + "/metrics"
+	if code, _ := get(t, url, "", ""); code != http.StatusUnauthorized {
+		t.Errorf("metrics without credentials: code %d, want 401 (own web config)", code)
+	}
+	if code, body := get(t, url, "vm", "metrics-pass"); code != http.StatusOK || body != "exporter_proxy_up 1\n" {
+		t.Errorf("metrics with credentials: code %d body %q", code, body)
+	}
+}

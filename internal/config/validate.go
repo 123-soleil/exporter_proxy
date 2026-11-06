@@ -69,6 +69,8 @@ func validate(fc *fileConfig) error {
 			v.addf(where, "name must only contain letters, digits, '_', '.' and '-'")
 		case names[l.Name]:
 			v.addf(where, "duplicate listener name")
+		case l.Name == MetricsListenerName:
+			v.addf(where, "name %q is reserved for the metrics endpoint", MetricsListenerName)
 		}
 		names[l.Name] = true
 
@@ -160,6 +162,10 @@ func (v *validator) checkUpstream(where, raw string) {
 		v.addf(where, "upstream must not contain a fragment")
 	}
 }
+
+// MetricsListenerName names the metrics endpoint in logs; listeners cannot
+// use it.
+const MetricsListenerName = "metrics"
 
 // systemdPrefix marks a listen value taken from systemd socket activation.
 const systemdPrefix = "systemd:"

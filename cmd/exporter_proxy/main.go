@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/metrics"
 	"github.com/123-soleil/exporter_proxy/internal/server"
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
@@ -97,7 +98,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	logger.Info("configuration loaded", "path", opts.configPath,
 		"listeners", len(cfg.Listeners), "routes", routes, "hash", cfg.HashString())
 
-	srv, err := server.Start(cfg, server.Options{Logger: logger, AccessLog: opts.accessLog})
+	m := metrics.New()
+	m.ConfigLoaded(cfg, time.Now())
+
+	srv, err := server.Start(cfg, server.Options{
+		Logger:         logger,
+		Recorder:       m,
+		AccessLog:      opts.accessLog,
+		MetricsHandler: m.Handler(logger.With("listener", server.MetricsListener)),
+	})
 	if err != nil {
 		logger.Error("cannot start listeners", "err", err)
 		return exitError

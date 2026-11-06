@@ -106,6 +106,11 @@ func TestValidateRejects(t *testing.T) {
 			wantErr: `listener "a": duplicate listener name`,
 		},
 		{
+			name:    "reserved listener name",
+			yaml:    withListeners("  - name: metrics\n    listen: \":9100\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
+			wantErr: `name "metrics" is reserved for the metrics endpoint`,
+		},
+		{
 			name:    "listener without listen",
 			yaml:    withListeners("  - name: a\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
 			wantErr: `listener "a": listen is required`,

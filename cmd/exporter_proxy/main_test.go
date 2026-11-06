@@ -218,9 +218,10 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// servingConfig writes a configuration serving a metrics file on port, with
-// an empty web configuration (plain HTTP, no authentication).
-func servingConfig(t *testing.T, port int) string {
+// servingConfig writes a configuration serving a metrics file on port and
+// the proxy metrics on metricsPort, with an empty web configuration (plain
+// HTTP, no authentication).
+func servingConfig(t *testing.T, port, metricsPort int) string {
 	t.Helper()
 	dir := t.TempDir()
 	prom := filepath.Join(dir, "m.prom")
@@ -233,7 +234,7 @@ func servingConfig(t *testing.T, port int) string {
 	}
 	return writeFile(t, fmt.Sprintf(`
 metrics:
-  listen: "127.0.0.1:1"
+  listen: "127.0.0.1:%d"
   web_config_file: %s
 listeners:
   - name: files
@@ -243,12 +244,12 @@ listeners:
       - path: /metrics
         file: %s
         max_age: 1h
-`, web, port, web, prom))
+`, metricsPort, web, port, web, prom))
 }
 
 func TestRunServesUntilCanceled(t *testing.T) {
-	port := freePort(t)
-	cfg := servingConfig(t, port)
+	port, metricsPort := freePort(t), freePort(t)
+	cfg := servingConfig(t, port, metricsPort)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var stderr bytes.Buffer
@@ -274,6 +275,26 @@ func TestRunServesUntilCanceled(t *testing.T) {
 		t.Fatalf("served body = %q, want %q", body, "up 1\n")
 	}
 
+	// The proxy's own metrics reflect the scrape above.
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	for _, want := range []string{
+		`exporter_proxy_requests_total{code="200",listener="files",route="/metrics"} 1`,
+		`exporter_proxy_source_errors_total{listener="files",reason="stale",route="/metrics"} 0`,
+		`exporter_proxy_build_info{`,
+		`exporter_proxy_config_hash `,
+		`exporter_proxy_config_last_reload_successful 1`,
+		`exporter_proxy_file_modified_timestamp_seconds{listener="files",route="/metrics"}`,
+	} {
+		if !strings.Contains(string(m), want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+
 	cancel()
 	select {
 	case code := <-done:
@@ -294,7 +315,7 @@ func TestRunFailsWhenPortIsBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	cfg := servingConfig(t, ln.Addr().(*net.TCPAddr).Port)
+	cfg := servingConfig(t, ln.Addr().(*net.TCPAddr).Port, freePort(t))
 
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{"--config=" + cfg}, io.Discard, &stderr)
