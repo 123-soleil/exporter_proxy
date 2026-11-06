@@ -105,6 +105,15 @@ page) from being exposed through the proxy.
 - Only the text exposition format (`version=0.0.4`) is accepted. Protobuf and
   OpenMetrics are not supported, so native histograms are not available
   through the proxy.
+- The parser runs in UTF-8 mode, like Prometheus 3: classic names and quoted
+  UTF-8 names (`{"my.metric", zone="a"} 1`) are both accepted.
+- The format requires the last line to end with a newline: a body without
+  it is rejected. An empty body (or comments only) is valid and has 0
+  samples.
+- Parse errors are logged with the line number and the kind of error only
+  (e.g. `line 1: expected float as value`), never with the offending content:
+  a misconfigured source pointing to sensitive data must not leak it into
+  the logs.
 - A response larger than `max_body_bytes` is rejected without being fully
   read (default 10 MiB). A source that does not answer within `timeout` is
   rejected (default 10 s). A response containing more than `max_samples`
@@ -118,11 +127,23 @@ page) from being exposed through the proxy.
 - Each listener serves at most `max_concurrent_requests` requests at the same
   time (default 10, set in `defaults` or per listener). Extra requests are answered immediately with
   `503 Service Unavailable` instead of queuing.
-- Memory use is therefore bounded by roughly `max_body_bytes` × the sum of
-  `max_concurrent_requests` over all listeners. Parsing is linear in the
-  response size; its cost is exposed as a metric
-  (`exporter_proxy_parse_duration_seconds`) so the limits can be tuned on
-  real data.
+- Parsing is linear in the response size, but the parser allocates about
+  **10 times the body size** while it runs. Peak memory is therefore bounded
+  by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
+  all listeners: with the defaults (10 MiB, 10 requests) and one listener,
+  about 1.1 GiB in the worst case. Lower `max_body_bytes` to what the
+  exporters really produce (see `exporter_proxy_response_size_bytes`), and
+  size `MemoryMax=` in the systemd unit accordingly.
+- Parse cost is exposed as `exporter_proxy_parse_duration_seconds`.
+  Reference measurements on synthetic node_exporter-like data (single
+  parse on a laptop, Intel Core 7 150U, `go test -bench=Validate -benchmem
+  ./internal/content/`):
+
+  | Samples | Body size | Parse time | Allocated |
+  |---------|-----------|------------|-----------|
+  | 2,000   | ~130 KB   | ~5 ms      | ~1.4 MB   |
+  | 10,000  | ~650 KB   | ~28 ms     | ~6.8 MB   |
+  | 50,000  | ~3.3 MB   | ~90 ms     | ~34 MB    |
 - The service user needs read access to the files and write access to the
   sockets (`connect()` on a Unix socket requires write permission on it),
   typically through group membership; the systemd unit and the AppArmor

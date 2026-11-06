@@ -47,4 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure reasons (`unavailable`, `timeout`, `too_large`, `stale`); no proxy
   from the environment, no redirects, no client header forwarded, FIFOs and
   non-regular files rejected without blocking.
+- Mandatory content validation with the Prometheus text parser (UTF-8
+  names), `max_samples` limit counted like Prometheus' `sample_limit`, parse
+  duration measured; parse errors never include the offending content.
+  Benchmark on synthetic data in `internal/content`.
 - `.gitignore` for Go builds, local configuration and key material.

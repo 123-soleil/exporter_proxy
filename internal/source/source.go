@@ -26,7 +26,17 @@ const (
 	ReasonTimeout     Reason = "timeout"     // timeout reached
 	ReasonTooLarge    Reason = "too_large"   // content larger than max_body_bytes
 	ReasonStale       Reason = "stale"       // file older than max_age
+
+	// Returned by content validation, kept here so that all reasons form
+	// one set.
+	ReasonInvalid        Reason = "invalid"          // not in the Prometheus text format
+	ReasonTooManySamples Reason = "too_many_samples" // more samples than max_samples
 )
+
+// NewError returns an *Error with the given reason.
+func NewError(reason Reason, format string, args ...any) *Error {
+	return newError(reason, format, args...)
+}
 
 // Error is a failed read with its reason.
 type Error struct {
