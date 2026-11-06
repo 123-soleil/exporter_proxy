@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/prometheus/exporter-toolkit/web"
 	"go.yaml.in/yaml/v3"
 
@@ -91,13 +92,20 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		handlers[i] = h
 	}
 
-	// 3. Bind every address before serving any, so that a port conflict
-	// fails the whole startup.
+	// 3. Bind every address (or take every systemd socket) before serving
+	// any, so that a port conflict fails the whole startup.
+	sockets, err := takeSystemdSockets(cfg.Listeners, logger)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{logger: logger, errc: make(chan error, len(cfg.Listeners))}
 	for i, l := range cfg.Listeners {
-		ln, err := net.Listen("tcp", l.Listen)
-		if err != nil {
+		var ln net.Listener
+		if name, ok := config.SystemdSocketName(l.Listen); ok {
+			ln = sockets[name]
+		} else if ln, err = net.Listen("tcp", l.Listen); err != nil {
 			s.closeListeners()
+			closeAll(sockets)
 			return nil, fmt.Errorf("listener %q: %w", l.Name, err)
 		}
 		s.listeners = append(s.listeners, &listener{
@@ -189,6 +197,74 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	// One line, unlike errors.Join.
 	return errors.New(strings.Join(msgs, "; "))
+}
+
+// systemdListeners returns the sockets passed by systemd socket activation,
+// by FileDescriptorName=. Replaced in tests.
+var systemdListeners = activation.ListenersWithNames
+
+// takeSystemdSockets returns, by name, the socket of each listener whose
+// listen value is "systemd:<name>". Each name must match exactly one
+// stream socket; sockets passed by systemd but not configured are closed.
+func takeSystemdSockets(listeners []config.Listener, logger *slog.Logger) (map[string]net.Listener, error) {
+	wanted := map[string]string{} // socket name -> listener name
+	for _, l := range listeners {
+		if name, ok := config.SystemdSocketName(l.Listen); ok {
+			wanted[name] = l.Name
+		}
+	}
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+
+	passed, err := systemdListeners()
+	if err != nil {
+		return nil, fmt.Errorf("systemd socket activation: %w", err)
+	}
+	sockets := make(map[string]net.Listener, len(wanted))
+	var problems []string
+	for name, lns := range passed {
+		var stream []net.Listener
+		for _, ln := range lns {
+			if ln != nil { // nil for non-stream sockets (datagram, FIFO)
+				stream = append(stream, ln)
+			}
+		}
+		listener, used := wanted[name]
+		switch {
+		case !used:
+			logger.Warn("systemd socket not used by any listener, closing it", "socket", name)
+			closeAll(nil, stream...)
+		case len(stream) != 1:
+			problems = append(problems, fmt.Sprintf("listener %q: systemd socket %q must be exactly one stream socket, got %d",
+				listener, name, len(stream)))
+			closeAll(nil, stream...)
+		default:
+			sockets[name] = stream[0]
+		}
+	}
+	for name, listener := range wanted {
+		if _, ok := passed[name]; !ok {
+			problems = append(problems, fmt.Sprintf("listener %q: no systemd socket named %q (FileDescriptorName=)", listener, name))
+		}
+	}
+	if len(problems) > 0 {
+		closeAll(sockets)
+		return nil, errors.New(strings.Join(problems, "; "))
+	}
+	return sockets, nil
+}
+
+// closeAll closes the listeners of a map and the extra ones given.
+func closeAll(m map[string]net.Listener, extra ...net.Listener) {
+	for _, ln := range m {
+		if ln != nil {
+			_ = ln.Close()
+		}
+	}
+	for _, ln := range extra {
+		_ = ln.Close()
+	}
 }
 
 func (s *Server) closeListeners() {

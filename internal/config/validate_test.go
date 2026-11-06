@@ -51,6 +51,7 @@ func TestValidateAcceptsValidConfigs(t *testing.T) {
     web_config_file: /etc/ep/web.yml
     routes:
 ` + okRoute)},
+		{"systemd socket", withListeners("  - name: a\n    listen: \"systemd:node\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute)},
 		{"ipv6 listen", withListeners("  - name: a\n    listen: \"[::1]:9100\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute)},
 		{"positive overrides", withRoutes("      - path: /m\n        upstream: http://h/m\n        timeout: 1ms\n        max_body_bytes: 1\n        max_samples: 1\n")},
 	}
@@ -118,6 +119,22 @@ func TestValidateRejects(t *testing.T) {
 			name:    "listen port out of range",
 			yaml:    withListeners("  - name: a\n    listen: \":70000\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
 			wantErr: "port must be between 1 and 65535",
+		},
+		{
+			name:    "empty systemd socket name",
+			yaml:    withListeners("  - name: a\n    listen: \"systemd:\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
+			wantErr: "systemd socket name must only contain",
+		},
+		{
+			name:    "invalid systemd socket name",
+			yaml:    withListeners("  - name: a\n    listen: \"systemd:my socket\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
+			wantErr: "systemd socket name must only contain",
+		},
+		{
+			name: "same systemd socket twice",
+			yaml: withListeners("  - name: a\n    listen: \"systemd:s\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute +
+				"  - name: b\n    listen: \"systemd:s\"\n    web_config_file: /etc/ep/web.yml\n    routes:\n" + okRoute),
+			wantErr: `listen "systemd:s" is already used by listener "a"`,
 		},
 		{
 			name:    "listen address shared with metrics",

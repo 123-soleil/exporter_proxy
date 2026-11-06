@@ -64,4 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every address bound before serving, graceful shutdown on `SIGTERM` and
   `SIGINT` (15 s), HTTP server timeouts, `--log.access` flag.
 - Startup warning for listeners using basic authentication without TLS.
+- systemd socket activation: `listen: "systemd:<name>"` takes the socket named
+  by `FileDescriptorName=`, so ports below 1024 need no capability; unused
+  passed sockets are closed.
 - `.gitignore` for Go builds, local configuration and key material.

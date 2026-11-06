@@ -292,7 +292,7 @@ together on one log line (each prefixed with its location, e.g.
 |------------|------|
 | `metrics`  | Required, with `listen` and `web_config_file`. |
 | Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label). |
-| `listen`   | Required, `host:port` with a port from 1 to 65535, not shared with another listener or with `metrics`. |
+| `listen`   | Required, `host:port` with a port from 1 to 65535, or `systemd:<name>` (socket activation, see below); not shared with another listener or with `metrics`. |
 | `web_config_file` | Required on every listener and on `metrics`. |
 | Routes     | At least one per listener. |
 | `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
@@ -332,6 +332,44 @@ Other built-in defaults:
 | `--log.level`     | `info`                            |
 | `--log.format`    | `logfmt`                          |
 | `--log.access`    | off                               |
+
+### systemd socket activation
+
+A listener can take its socket from systemd instead of binding it: set
+`listen: "systemd:<name>"`, where `<name>` is the `FileDescriptorName=` of a
+socket unit. systemd opens the port, so exposing the proxy on a port below
+1024 needs no capability in the service (`CAP_NET_BIND_SERVICE`), and the
+service can keep `CapabilityBoundingSet=` empty.
+
+```ini
+# /etc/systemd/system/exporter_proxy-node.socket
+[Socket]
+ListenStream=443
+FileDescriptorName=node
+Service=exporter_proxy.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+```yaml
+listeners:
+  - name: node
+    listen: "systemd:node"
+    web_config_file: /etc/exporter_proxy/web-mtls.yml
+    routes: ...
+```
+
+- Each `systemd:<name>` must match exactly one stream socket (one
+  `ListenStream=` per socket unit). Startup fails if it is missing.
+- Sockets passed by systemd but not used by any listener are closed, with a
+  `warn` log line.
+- Listeners using `systemd:` and listeners binding `host:port` can be mixed.
+- The service unit must declare the socket units (`Sockets=` or
+  `Requires=`/`After=`); ready-to-use files will be provided in `deploy/`.
+- See
+  [systemd.socket(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html)
+  for `FileDescriptorName=`.
 
 ### Web configuration examples
 

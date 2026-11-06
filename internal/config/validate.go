@@ -161,19 +161,36 @@ func (v *validator) checkUpstream(where, raw string) {
 	}
 }
 
+// systemdPrefix marks a listen value taken from systemd socket activation.
+const systemdPrefix = "systemd:"
+
+// SystemdSocketName returns the socket name of a "systemd:<name>" listen
+// value: the FileDescriptorName= of the socket unit.
+func SystemdSocketName(listen string) (string, bool) {
+	name, ok := strings.CutPrefix(listen, systemdPrefix)
+	return name, ok
+}
+
 func (v *validator) checkListen(where, addr string, seen map[string]string) {
 	if addr == "" {
 		v.addf(where, "listen is required")
 		return
 	}
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		v.addf(where, "listen %q is not host:port: %v", addr, err)
-		return
-	}
-	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-		v.addf(where, "listen %q: port must be between 1 and 65535", addr)
-		return
+	if name, ok := SystemdSocketName(addr); ok {
+		if !namePattern.MatchString(name) {
+			v.addf(where, "listen %q: systemd socket name must only contain letters, digits, '_', '.' and '-'", addr)
+			return
+		}
+	} else {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			v.addf(where, "listen %q is not host:port or systemd:<name>: %v", addr, err)
+			return
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			v.addf(where, "listen %q: port must be between 1 and 65535", addr)
+			return
+		}
 	}
 	if other, ok := seen[addr]; ok {
 		v.addf(where, "listen %q is already used by %s", addr, other)

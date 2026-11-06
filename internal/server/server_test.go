@@ -358,3 +358,121 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+// fakeSystemd replaces systemd socket activation with the given sockets.
+func fakeSystemd(t *testing.T, sockets map[string][]net.Listener) {
+	t.Helper()
+	orig := systemdListeners
+	systemdListeners = func() (map[string][]net.Listener, error) { return sockets, nil }
+	t.Cleanup(func() { systemdListeners = orig })
+}
+
+func tcpListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
+}
+
+// isClosed reports whether ln no longer accepts connections.
+func isClosed(ln net.Listener) bool {
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 500*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	_ = conn.Close()
+	return false
+}
+
+func TestSystemdSocketActivation(t *testing.T) {
+	webConfig := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(webConfig, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+
+	activated := tcpListener(t)
+	unused := tcpListener(t)
+	fakeSystemd(t, map[string][]net.Listener{
+		"node":  {activated},
+		"spare": {unused},
+	})
+
+	viaSystemd := listenerConfig("node", webConfig, up.URL)
+	viaSystemd.Listen = "systemd:node"
+	direct := listenerConfig("direct", webConfig, up.URL)
+
+	var logs syncBuffer
+	s := startServer(t, &config.Config{Listeners: []config.Listener{viaSystemd, direct}}, &logs)
+
+	if got := s.Addr("node").String(); got != activated.Addr().String() {
+		t.Errorf("node listener address = %s, want the systemd socket %s", got, activated.Addr())
+	}
+	for _, name := range []string{"node", "direct"} {
+		if code, body := get(t, "http://"+s.Addr(name).String()+"/metrics", "", ""); code != http.StatusOK || body != metrics {
+			t.Errorf("%s: code=%d body=%q", name, code, body)
+		}
+	}
+	if !isClosed(unused) {
+		t.Error("unused systemd socket left open")
+	}
+	if !strings.Contains(logs.String(), "systemd socket not used") {
+		t.Errorf("unused socket not logged: %s", logs.String())
+	}
+}
+
+func TestSystemdSocketErrors(t *testing.T) {
+	webConfig := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(webConfig, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		sockets func(t *testing.T) map[string][]net.Listener
+		wantErr string
+	}{
+		{
+			name:    "socket missing",
+			sockets: func(*testing.T) map[string][]net.Listener { return map[string][]net.Listener{} },
+			wantErr: `no systemd socket named "node"`,
+		},
+		{
+			name: "two sockets with the same name",
+			sockets: func(t *testing.T) map[string][]net.Listener {
+				return map[string][]net.Listener{"node": {tcpListener(t), tcpListener(t)}}
+			},
+			wantErr: "must be exactly one stream socket, got 2",
+		},
+		{
+			name: "datagram socket only",
+			sockets: func(*testing.T) map[string][]net.Listener {
+				return map[string][]net.Listener{"node": {nil}}
+			},
+			wantErr: "must be exactly one stream socket, got 0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sockets := tt.sockets(t)
+			fakeSystemd(t, sockets)
+			l := listenerConfig("node", webConfig, "http://127.0.0.1:1")
+			l.Listen = "systemd:node"
+
+			_, err := Start(&config.Config{Listeners: []config.Listener{l}}, Options{})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Start error = %v, want %q", err, tt.wantErr)
+			}
+			for _, lns := range sockets {
+				for _, ln := range lns {
+					if ln != nil && !isClosed(ln) {
+						t.Error("socket left open after failed start")
+					}
+				}
+			}
+		})
+	}
+}
