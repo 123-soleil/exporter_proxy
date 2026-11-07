@@ -334,3 +334,14 @@ func TestLoadRejectsRateLimitWithoutBurst(t *testing.T) {
 		t.Errorf("Load error = %v, want burst must be at least 1", err)
 	}
 }
+
+func TestLoadRejectsMinAboveMaxVersion(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  min_version: TLS13\n  max_version: TLS12\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "min_version is above max_version") {
+		t.Errorf("Load error = %v, want min_version is above max_version", err)
+	}
+}

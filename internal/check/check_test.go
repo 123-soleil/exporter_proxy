@@ -327,7 +327,8 @@ func indent(s string) string {
 	return b.String()
 }
 
-// Every certificate of cert_file (leaf and intermediates) is date-checked.
+// Intermediates of cert_file outside their dates are warnings (clients
+// usually skip an expired cross-signature); the leaf stays a problem.
 func TestCertFileIntermediateDates(t *testing.T) {
 	dir := t.TempDir()
 	goodCert, _ := writeCert(t, dir, "leaf", now.Add(-time.Hour), now.Add(365*24*time.Hour))
@@ -344,5 +345,5 @@ func TestCertFileIntermediateDates(t *testing.T) {
 	writeFile(t, chain, string(leafPEM)+string(intPEM))
 	c := &checker{now: now}
 	c.certificates("here", "cert_file", chain, false)
-	expect(t, c.findings, want{Problem, `"CN=intermediate" expired on`})
+	expect(t, c.findings, want{Warning, `"CN=intermediate" expired on`})
 }

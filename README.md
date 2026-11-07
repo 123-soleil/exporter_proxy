@@ -726,7 +726,8 @@ otherwise; warnings do not fail the check:
   certificate and key readable and matching, client CA readable;
 - the certificates (files or inline) are within their validity dates: an
   expired or not-yet-valid server certificate is a problem, one expiring
-  within 30 days is a warning. A client CA bundle is judged as TLS uses it:
+  within 30 days is a warning; an intermediate outside its dates is a
+  warning (clients usually skip an expired cross-signature). A client CA bundle is judged as TLS uses it:
   expired, not-yet-valid or unparseable certificates in it are warnings
   (normal while rotating CAs), and it is a problem only if none is
   currently valid. This date check is stricter than startup, reload and
@@ -844,8 +845,8 @@ certificate. With HTTP/2 enabled (the default) and `min_version` below
 `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` or
 `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, which net/http requires for
 HTTP/2: otherwise the listener would stop right after starting. A server
-certificate chain (leaf or intermediate) outside its validity dates makes
-that listener's new TLS connections fail as a server-side error
+certificate (the leaf) outside its validity dates makes that listener's
+new TLS connections fail as a server-side error
 (`web_config_read_error`), whether it is found at startup or reload (also
 logged at `error` level; the other listeners keep running) or expires
 while running.

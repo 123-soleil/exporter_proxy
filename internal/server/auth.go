@@ -177,11 +177,20 @@ func (t *tlsHealth) recover() bool {
 	t.mu.Lock()
 	failing, gen := t.failing, t.gen
 	t.mu.Unlock()
-	if !failing || !t.limit.Allow() || t.recheck() != nil {
+	if !failing || !t.limit.Allow() {
 		return false
 	}
+	err := t.recheck()
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err != nil {
+		if t.failing {
+			// Still failing: report it again, so that a reload resetting
+			// the metrics does not hide it until the next handshake.
+			t.report(false)
+		}
+		return false
+	}
 	if !t.failing || t.gen != gen {
 		return false
 	}

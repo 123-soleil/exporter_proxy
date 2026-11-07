@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
@@ -1816,7 +1817,9 @@ func TestTLSHealthSucceededSince(t *testing.T) {
 	}
 }
 
-func TestCheckCertDatesWholeChain(t *testing.T) {
+// Only the leaf's dates refuse connections: an expired intermediate (an old
+// cross-signature) is skipped by clients building another path.
+func TestCheckCertDatesLeafOnly(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := testTLSFiles(t, dir)
 	good, err := tls.LoadX509KeyPair(cert, key)
@@ -1830,10 +1833,37 @@ func TestCheckCertDatesWholeChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	chain := tls.Certificate{Certificate: [][]byte{good.Certificate[0], expired.Certificate[0]}}
-	if err := checkCertDates(&chain, time.Now()); !errors.Is(err, errCertDates) {
-		t.Errorf("expired intermediate: err = %v, want errCertDates", err)
+	if err := checkCertDates(&chain, time.Now()); err != nil {
+		t.Errorf("expired intermediate refused: %v", err)
+	}
+	if err := checkCertDates(&expired, time.Now()); !errors.Is(err, errCertDates) {
+		t.Errorf("expired leaf: err = %v, want errCertDates", err)
 	}
 	if err := checkCertDates(&good, time.Now()); err != nil {
 		t.Errorf("valid certificate: %v", err)
+	}
+}
+
+// A reload resetting the metrics does not hide that new TLS connections
+// still fail: the next request reports it again.
+func TestTLSFailureReportedAgainAfterReload(t *testing.T) {
+	m := newMTLSTest(t, "")
+	writeExpiredServerCert(t, m.cert, m.key)
+	_ = tlsGet(m.client(t, false, false), m.url()) // fails, reported
+	// The metrics reset by a reload is simulated by a healthy report.
+	m.rec.WebConfigRead("node", true, true)
+	if ok, _ := m.rec.lastTLSRead(); !ok {
+		t.Fatal("setup: reset not recorded")
+	}
+	// A plain request (no TLS: the listener refuses new handshakes, so use
+	// the auth handler directly) rechecks and reports the failure again.
+	m.s.mu.Lock()
+	auth := m.s.listeners["node"].auth
+	m.s.mu.Unlock()
+	auth.tlsHealth.limit = rate.NewLimiter(rate.Inf, 1)
+	w := httptest.NewRecorder()
+	auth.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if ok, _ := m.rec.lastTLSRead(); ok {
+		t.Error("TLS failure not reported again after the reset")
 	}
 }

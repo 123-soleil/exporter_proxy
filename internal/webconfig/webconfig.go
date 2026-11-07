@@ -61,6 +61,9 @@ func load(path string, checkCA bool) (*web.Config, error) {
 	// before the checks that read them.
 	c.TLSConfig.SetDirectory(filepath.Dir(path))
 	if c.TLSConfig.IsEnabled() {
+		if c.TLSConfig.MinVersion > c.TLSConfig.MaxVersion {
+			return nil, fmt.Errorf("parse %s: min_version is above max_version: no TLS version left", path)
+		}
 		if err := validateClientCA(&c.TLSConfig, checkCA); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}

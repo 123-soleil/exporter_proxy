@@ -225,24 +225,24 @@ func serverTLSConfig(c *web.Config) (*tls.Config, error) {
 // dates.
 var errCertDates = errors.New("server certificate outside its validity dates")
 
-// checkCertDates refuses a server certificate chain (leaf and the
-// intermediates sent with it) outside its validity dates: clients would
-// reject it, and the failure would look like theirs.
+// checkCertDates refuses a server certificate (the leaf) outside its
+// validity dates: clients would reject it, and the failure would look like
+// theirs. Intermediates are not checked: chains commonly carry an expired
+// cross-signed certificate that clients skip by building another path to
+// their trust store (only --check warns about them).
 func checkCertDates(cert *tls.Certificate, now time.Time) error {
 	if len(cert.Certificate) == 0 {
 		return errors.New("no server certificate")
 	}
-	for i, der := range cert.Certificate {
-		c, err := x509.ParseCertificate(der)
-		if err != nil {
-			return fmt.Errorf("server certificate %d: %w", i+1, err)
-		}
-		switch {
-		case now.After(c.NotAfter):
-			return fmt.Errorf("%w: %q expired on %s", errCertDates, c.Subject, c.NotAfter.UTC().Format(time.RFC3339))
-		case now.Before(c.NotBefore):
-			return fmt.Errorf("%w: %q is not valid before %s", errCertDates, c.Subject, c.NotBefore.UTC().Format(time.RFC3339))
-		}
+	c, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("server certificate: %w", err)
+	}
+	switch {
+	case now.After(c.NotAfter):
+		return fmt.Errorf("%w: %q expired on %s", errCertDates, c.Subject, c.NotAfter.UTC().Format(time.RFC3339))
+	case now.Before(c.NotBefore):
+		return fmt.Errorf("%w: %q is not valid before %s", errCertDates, c.Subject, c.NotBefore.UTC().Format(time.RFC3339))
 	}
 	return nil
 }
@@ -718,6 +718,11 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		return err
 	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
 	auth.tlsHealth = health
+	if _, err := l.tlsConfigFor(wc); err != nil {
+		// Logged by prepare (a certificate outside its dates): reported
+		// from the start, not only at the first handshake.
+		health.failed()
+	}
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {

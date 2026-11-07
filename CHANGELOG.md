@@ -125,13 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; lowering authentication on purpose takes a restart. A web
   configuration caught half-written by a reload can no longer open a
   listener.
-- A server certificate chain (leaf or intermediate) outside its validity
-  dates is refused on every new TLS connection (TLS 1.3 session resumption
+- A server certificate (the leaf; an expired cross-signed intermediate is
+  left to clients, `--check` warns about it) outside its validity dates is
+  refused on every new TLS connection (TLS 1.3 session resumption
   included, the certificate being checked and pinned per connection) as a
   server-side failure (`web_config_read_error`), instead of being sent and
   counted as client `tls_handshake` failures; found at startup or reload,
-  it is logged and only stops that listener's TLS connections. `--check`
-  checks intermediates too. A file whose ciphers cannot carry the HTTP/2
+  it is logged, reported in `web_config_read_error` from the start and
+  again after a reload resetting the metrics, and only stops that
+  listener's TLS connections. `min_version` above `max_version` is
+  invalid. A file whose ciphers cannot carry the HTTP/2
   the listener offers is refused at runtime too. Users found by a reload that
   keeps a listener are required from then on (fail closed). The client CA
   pool is checked as read once per connection (no second read a rewrite
