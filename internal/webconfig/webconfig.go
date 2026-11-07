@@ -24,7 +24,15 @@ import (
 )
 
 // Load reads and parses the web configuration file at path.
-func Load(path string) (*web.Config, error) {
+func Load(path string) (*web.Config, error) { return load(path, true) }
+
+// LoadForRequest is Load without reading the client CA: requests on
+// connections already open do not use it (it is checked on every new TLS
+// connection), so a client CA file briefly missing while being rotated does
+// not fail them.
+func LoadForRequest(path string) (*web.Config, error) { return load(path, false) }
+
+func load(path string, checkCA bool) (*web.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -50,7 +58,7 @@ func Load(path string) (*web.Config, error) {
 	// before the checks that read them.
 	c.TLSConfig.SetDirectory(filepath.Dir(path))
 	if c.TLSConfig.IsEnabled() {
-		if err := validateClientCA(&c.TLSConfig); err != nil {
+		if err := validateClientCA(&c.TLSConfig, checkCA); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		if err := validateHTTP2Ciphers(c); err != nil {
@@ -155,11 +163,6 @@ func ClientCertPolicy(clientAuth string) (required, verified bool) {
 	return false, false // NoClientCert, RequestClientCert
 }
 
-// validateAllowedSANs rejects client_allowed_sans that would not restrict
-// clients as written: an empty list (exporter-toolkit then refuses every
-// certificate, and panics on clients without one), or a list with a
-// client_auth_type that does not verify certificates, since any client
-// could then present a self-signed certificate carrying an allowed name.
 // validateClientCA rejects a client_auth_type that verifies client
 // certificates without a client CA: crypto/tls would then verify them
 // against the system roots, accepting any client certificate from a CA the
@@ -170,7 +173,7 @@ func ClientCertPolicy(clientAuth string) (required, verified bool) {
 // RequireClientCert reads like "verify") is ignored, and any self-signed
 // certificate is accepted. A client CA without any certificate refuses
 // every client.
-func validateClientCA(tc *web.TLSConfig) error {
+func validateClientCA(tc *web.TLSConfig, checkContent bool) error {
 	hasCA := tc.ClientCAs != "" || tc.ClientCAsText != ""
 	_, verified := ClientCertPolicy(tc.ClientAuth)
 	switch {
@@ -180,7 +183,7 @@ func validateClientCA(tc *web.TLSConfig) error {
 	case !verified && hasCA:
 		return fmt.Errorf("client_auth_type %s does not verify client certificates, so the client CA would be ignored: "+
 			"use RequireAndVerifyClientCert", NormalizeClientAuth(tc.ClientAuth))
-	case !hasCA:
+	case !hasCA || !checkContent:
 		return nil
 	}
 	return checkClientCAContent(tc)
@@ -271,6 +274,11 @@ func validateHTTP2Ciphers(c *web.Config) error {
 		"(or set http_server_config.http2: false)")
 }
 
+// validateAllowedSANs rejects client_allowed_sans that would not restrict
+// clients as written: an empty list (exporter-toolkit then refuses every
+// certificate, and panics on clients without one), or a list with a
+// client_auth_type that does not verify certificates, since any client
+// could then present a self-signed certificate carrying an allowed name.
 func validateAllowedSANs(tc *web.TLSConfig) error {
 	if tc.ClientAllowedSans == nil {
 		return nil

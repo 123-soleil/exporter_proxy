@@ -573,10 +573,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		MaxHeaderBytes: maxHeaderBytes,
 		// TLS handshake failures are counted and logged as such.
 		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder(),
-			clientLogs: clientLogs, serverLogs: serverLogs,
-			// Over a Unix socket, the client chooses its own address and
-			// could imitate the server-side marker.
-			trustMarker: ln.Addr().Network() == "tcp"}, "", 0),
+			clientLogs: clientLogs, serverLogs: serverLogs}, "", 0),
 	}
 
 	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh}
@@ -596,16 +593,17 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
 	tlsCfg.NextProtos = nextProtos
-	// While new TLS connections fail, requests on connections already open
-	// check whether the TLS settings load again, so that the failure is not
-	// reported until the next handshake only.
-	health := &tlsHealth{recheck: func(c *web.Config) error {
+	health := newTLSHealth(func() error {
+		c, err := webconfig.Load(sp.webConfig)
+		if err != nil {
+			return err
+		}
 		if err := l.checkClientAuth(&c.TLSConfig); err != nil {
 			return err
 		}
-		_, err := web.ConfigToTLSConfig(&c.TLSConfig)
+		_, err = web.ConfigToTLSConfig(&c.TLSConfig)
 		return err
-	}}
+	})
 	auth.tlsHealth = health
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
@@ -619,13 +617,13 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 			var cfg *tls.Config
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
 				restrictSANsOnResumption(cfg, c.TLSConfig)
-				health.failing.Store(false)
+				health.succeeded()
 				rec.WebConfigRead(name, true, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
-		health.failing.Store(true)
+		health.failed()
 		rec.WebConfigRead(name, true, false)
 		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
 			"web_config_file", webConfig, "err", errfmt.OneLine(err))
@@ -649,15 +647,19 @@ func (s *Server) recorder() proxy.Recorder {
 // update l.spec meanwhile.
 func (s *Server) serve(l *listener) {
 	name, tlsEnabled, srv, ln := l.spec.name, l.settings.tls, l.srv, l.ln
+	served := ln
+	if ln.Addr().Network() == "unix" {
+		served = unixClientsListener{ln}
+	}
 	s.logger.Info("listening", "listener", name, "address", ln.Addr().String(), "tls", tlsEnabled)
 	s.serving.Add(1)
 	go func() {
 		defer s.serving.Done()
 		var err error
 		if tlsEnabled {
-			err = srv.ServeTLS(ln, "", "")
+			err = srv.ServeTLS(served, "", "")
 		} else {
-			err = srv.Serve(ln)
+			err = srv.Serve(served)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// Serve may fail before taking ownership of ln (HTTP/2 setup):
@@ -687,6 +689,29 @@ func (s *Server) drain(l *listener) {
 		closeIdle(handler.cur.Load().h)
 	}()
 }
+
+// unixClientsListener gives every client of a Unix socket listener the
+// same remote address, "unix". A client may bind its socket to any path,
+// which would otherwise show as its remote address in logs and could
+// imitate the server-side handshake marker; those paths identify nothing.
+type unixClientsListener struct{ net.Listener }
+
+func (l unixClientsListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return unixClientConn{c}, nil
+}
+
+type unixClientConn struct{ net.Conn }
+
+func (unixClientConn) RemoteAddr() net.Addr { return unixRemote{} }
+
+type unixRemote struct{}
+
+func (unixRemote) Network() string { return "unix" }
+func (unixRemote) String() string  { return "unix" }
 
 // dupListener returns a new listener on the same socket as ln, so that
 // ln can be closed without closing the port.

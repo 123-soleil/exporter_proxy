@@ -13,7 +13,6 @@ import (
 	"time"
 
 	config_util "github.com/prometheus/common/config"
-	"github.com/prometheus/exporter-toolkit/web"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
@@ -121,12 +120,54 @@ func fakeHashFor(users map[string]config_util.Secret) []byte {
 }
 
 // tlsHealth tracks whether new TLS connections of a listener fail on its
-// TLS settings.
+// TLS settings. While they do, requests on connections already open check,
+// at most once per second, whether the settings load again, so that the
+// failure is not reported until the next handshake only.
 type tlsHealth struct {
-	failing atomic.Bool
-	// recheck loads the TLS settings of a web configuration like a new
+	mu      sync.Mutex
+	failing bool
+	gen     uint64 // bumped by every failed handshake
+
+	limit *rate.Limiter
+	// recheck loads the web configuration and its TLS settings like a new
 	// connection would.
-	recheck func(*web.Config) error
+	recheck func() error
+}
+
+func newTLSHealth(recheck func() error) *tlsHealth {
+	return &tlsHealth{limit: rate.NewLimiter(1, 1), recheck: recheck}
+}
+
+func (t *tlsHealth) failed() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = true
+	t.gen++
+}
+
+func (t *tlsHealth) succeeded() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = false
+}
+
+// recover rechecks the TLS settings while handshakes fail, and reports
+// whether the failure is cleared. A handshake failing during the recheck
+// keeps it: the recheck may have read the file before it broke.
+func (t *tlsHealth) recover() bool {
+	t.mu.Lock()
+	failing, gen := t.failing, t.gen
+	t.mu.Unlock()
+	if !failing || !t.limit.Allow() || t.recheck() != nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.failing || t.gen != gen {
+		return false
+	}
+	t.failing = false
+	return true
 }
 
 // logGate lowers log lines to debug level beyond logRate per listener.
@@ -252,7 +293,7 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := webconfig.Load(h.webConfig)
+	c, err := webconfig.LoadForRequest(h.webConfig)
 	if err == nil && !h.tls && c.TLSConfig.IsEnabled() {
 		err = errTLSAdded
 	}
@@ -264,11 +305,10 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.rec.WebConfigRead(h.listener, false, err == nil)
-	if err == nil && h.tlsHealth != nil && h.tlsHealth.failing.Load() && h.tlsHealth.recheck(c) == nil {
+	if err == nil && h.tlsHealth != nil && h.tlsHealth.recover() {
 		// New TLS connections failed, and the settings load again: report
 		// it now rather than at the next handshake, which a scraper keeping
 		// its connection open may not make for a long time.
-		h.tlsHealth.failing.Store(false)
 		h.rec.WebConfigRead(h.listener, true, true)
 	}
 	if err != nil {
@@ -474,9 +514,6 @@ type serverErrorLog struct {
 	listener string
 	logger   *slog.Logger
 	rec      proxy.Recorder
-	// trustMarker: the listener is TCP, so the remote address before the
-	// error text is an IP address the client cannot shape.
-	trustMarker bool
 	// clientLogs gates client handshake failures and the net/http lines
 	// clients can cause, serverLogs accept errors and panics, which client
 	// noise must not hide.
@@ -493,9 +530,10 @@ func (l *serverErrorLog) Write(p []byte) (int, error) {
 		// A prefix match: the marker starts the error returned by
 		// GetConfigForClient, while client-chosen text (such as an ALPN
 		// protocol name) can only appear later in other errors.
-		// Only on TCP listeners: a Unix socket client chooses its own path,
-		// shown as the remote address, and could put the marker in it.
-		if l.trustMarker && strings.HasPrefix(detail, serverTLSUnavailable+": ") {
+		// The remote address is never client-chosen text (an IP address,
+		// or "unix" for Unix socket clients, see unixClientsListener), so
+		// the client cannot put the marker at the start of the detail.
+		if strings.HasPrefix(detail, serverTLSUnavailable+": ") {
 			// Already logged and shown by exporter_proxy_web_config_read_error:
 			// not a client failure.
 			l.logger.Debug("TLS handshake refused, server TLS settings unavailable",

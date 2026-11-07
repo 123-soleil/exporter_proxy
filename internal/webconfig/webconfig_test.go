@@ -277,3 +277,20 @@ func TestClientCACheckCachedUntilChange(t *testing.T) {
 		t.Errorf("changed CA file not checked again: %v", err)
 	}
 }
+
+// Requests do not read the client CA: a file briefly missing while being
+// rotated fails new TLS connections (Load), not requests on open ones.
+func TestLoadForRequestSkipsClientCA(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: missing.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadForRequest(p); err != nil {
+		t.Errorf("LoadForRequest = %v, want nil", err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Error("Load accepted a missing client CA file")
+	}
+}

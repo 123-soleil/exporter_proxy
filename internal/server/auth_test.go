@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	config_util "github.com/prometheus/common/config"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
 	"github.com/123-soleil/exporter_proxy/internal/webconfig"
@@ -522,7 +524,7 @@ func TestAuthHandlerLogsAreRateLimited(t *testing.T) {
 func TestServerErrorLogServerSideTLS(t *testing.T) {
 	rec := &authRecorder{}
 	logs := &syncBuffer{}
-	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(), trustMarker: true,
+	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
 		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 
 	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 192.0.2.1:5000: %s: open /etc/cert.pem: permission denied\n", serverTLSUnavailable)
@@ -615,16 +617,38 @@ func TestAuthHandlerTLSAddedToPlainListener(t *testing.T) {
 	}
 }
 
-// The server-side marker is only trusted after an IP address: a Unix
-// socket client chooses its own path and could put the marker in it.
-func TestServerErrorLogMarkerAfterUnixPath(t *testing.T) {
-	rec := &authRecorder{}
-	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
-		logger: slog.New(slog.DiscardHandler)}
-	// The client bound its socket to a path imitating "IP:port: marker".
-	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 1.2.3.4:5: %s: x: tls: bad certificate\n", serverTLSUnavailable)
-	if got := rec.got(); len(got) != 1 {
-		t.Errorf("handshake failure from a Unix socket path hidden: %v", got)
+// Unix socket clients all show as "unix", whatever path they bound their
+// socket to: they cannot put the server-side marker in front of their own
+// handshake failures.
+func TestUnixClientsListenerHidesClientPaths(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ucl") // short path: Unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "s"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := ln.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The client binds its socket to a path of its choice.
+	client, err := net.DialUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "c: x"), Net: "unix"}, ln.Addr().(*net.UnixAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	c, err := unixClientsListener{ln}.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if got := c.RemoteAddr().String(); got != "unix" {
+		t.Errorf("remote address = %q, want \"unix\"", got)
 	}
 }
 
@@ -635,5 +659,41 @@ func TestServerErrorLogHTTP2Panic(t *testing.T) {
 	_, _ = fmt.Fprint(l, "http2: panic serving 192.0.2.1:5000: boom\n")
 	if got := l.serverLogs.l.Tokens(); got > logBurst-0.5 {
 		t.Errorf("HTTP/2 panic not counted in the server log budget (%.1f tokens left)", got)
+	}
+}
+
+// A recheck does not clear a failure recorded while it ran (it may have
+// read the file before it broke), and rechecks are rate limited.
+func TestTLSHealthRecover(t *testing.T) {
+	var h *tlsHealth
+	calls := 0
+	h = newTLSHealth(func() error {
+		calls++
+		if calls == 1 {
+			h.failed() // a handshake fails while the recheck runs
+		}
+		return nil
+	})
+	if h.recover() {
+		t.Error("recovered while not failing")
+	}
+	h.failed()
+	if h.recover() {
+		t.Error("recovered although a handshake failed during the recheck")
+	}
+	h.limit = rate.NewLimiter(rate.Inf, 1) // let the next recheck run now
+	if !h.recover() {
+		t.Error("not recovered by a clean recheck")
+	}
+
+	h.failed()
+	h.limit = rate.NewLimiter(1, 1)
+	h.recover()
+	before := calls
+	for range 10 {
+		h.recover()
+	}
+	if calls != before {
+		t.Errorf("%d rechecks within a second, want 0 more", calls-before)
 	}
 }

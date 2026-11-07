@@ -343,8 +343,11 @@ Besides the standard `go_*`, `process_*` and
   could not load the file, certificate, key or client CA (refused). Both
   are tracked apart, so requests on connections already open do not hide
   a TLS failure. Back to 0 when both succeed again: after a TLS failure,
-  requests on connections already open also check whether the TLS
-  settings load again, so the gauge does not wait for the next handshake.
+  requests on connections already open also check (at most once per
+  second) whether the TLS settings load again, so the gauge does not wait
+  for the next handshake. Requests do not read the client CA, checked on
+  every new connection: a CA file briefly missing while being rotated does
+  not fail requests on connections already open.
   Reset by a successful reload; `listener="metrics"` for the metrics
   endpoint.
 

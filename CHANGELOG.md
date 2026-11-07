@@ -115,10 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plain HTTP listener whose web configuration enables TLS answers `518`
   until a reload, instead of serving in clear text.
 - `OPTIONS *` goes through authentication instead of net/http's automatic
-  empty `200`; HTTP/2 handler panics use the server log budget; the
-  server-side handshake marker is only trusted on TCP listeners, where a
-  client cannot shape the remote address (on a Unix socket, it chooses its
-  own path).
+  empty `200`; HTTP/2 handler panics use the server log budget; Unix
+  socket clients all show as remote address `unix`, so a client cannot
+  shape it (with the path it binds to) to hide its handshake failures
+  behind the server-side marker.
 - A reload never weakens authentication: one that would remove basic
   authentication, lower client certificate requirements or lose TLS (also
   through renamed or swapped listeners) is refused, keeping the running
@@ -126,8 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration caught half-written by a reload can no longer open a
   listener.
 - `web_config_read_error` returns to 0 when TLS settings load again, also
-  through requests on connections already open, without waiting for a new
-  handshake.
+  through requests on connections already open (at most one recheck per
+  second, never clearing a failure recorded meanwhile), without waiting for
+  a new handshake. Requests no longer read the client CA, so one briefly
+  missing during a rotation does not answer `518` on open connections.
 - `--check` judges client CA bundles like TLS does (expired or unparseable
   certificates are warnings while one is valid, normal while rotating CAs)
   and checks the dates of inline certificates; startup and reload report
