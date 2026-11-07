@@ -132,10 +132,13 @@ type tlsHealth struct {
 	// recheck loads the web configuration and its TLS settings like a new
 	// connection would.
 	recheck func() error
+	// report records the state in the metrics. It is called with mu held,
+	// so that the metric always follows the state.
+	report func(ok bool)
 }
 
-func newTLSHealth(recheck func() error) *tlsHealth {
-	return &tlsHealth{limit: rate.NewLimiter(1, 1), recheck: recheck}
+func newTLSHealth(recheck func() error, report func(ok bool)) *tlsHealth {
+	return &tlsHealth{limit: rate.NewLimiter(1, 1), recheck: recheck, report: report}
 }
 
 func (t *tlsHealth) failed() {
@@ -143,12 +146,14 @@ func (t *tlsHealth) failed() {
 	defer t.mu.Unlock()
 	t.failing = true
 	t.gen++
+	t.report(false)
 }
 
 func (t *tlsHealth) succeeded() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.failing = false
+	t.report(true)
 }
 
 // recover rechecks the TLS settings while handshakes fail, and reports
@@ -167,6 +172,7 @@ func (t *tlsHealth) recover() bool {
 		return false
 	}
 	t.failing = false
+	t.report(true)
 	return true
 }
 
@@ -305,11 +311,12 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.rec.WebConfigRead(h.listener, false, err == nil)
-	if err == nil && h.tlsHealth != nil && h.tlsHealth.recover() {
-		// New TLS connections failed, and the settings load again: report
-		// it now rather than at the next handshake, which a scraper keeping
-		// its connection open may not make for a long time.
-		h.rec.WebConfigRead(h.listener, true, true)
+	if err == nil && h.tlsHealth != nil {
+		// While new TLS connections fail, check whether the settings load
+		// again and report it now (recover records it), rather than at the
+		// next handshake, which a scraper keeping its connection open may
+		// not make for a long time.
+		h.tlsHealth.recover()
 	}
 	if err != nil {
 		h.logger.Log(r.Context(), h.serverLogs.level(slog.LevelError), "cannot load web configuration",

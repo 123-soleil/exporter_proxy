@@ -510,7 +510,12 @@ listeners:
 ```
 
 - Each `systemd:<name>` must match exactly one stream socket (one
-  `ListenStream=` per socket unit). Startup fails if it is missing.
+  `ListenStream=` per socket unit, TCP or Unix). Startup fails if it is
+  missing, or if it is a datagram or sequential packet socket
+  (`ListenDatagram=`, `ListenSequentialPacket=`).
+- Clients of a Unix socket listener all appear as `remote=unix` in logs:
+  the path a client binds its socket to is chosen by the client and
+  identifies nothing.
 - Sockets passed by systemd but not used by any listener are closed, with a
   `warn` log line.
 - Listeners using `systemd:` and listeners binding `host:port` can be mixed.

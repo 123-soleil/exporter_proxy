@@ -603,11 +603,11 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		}
 		_, err = web.ConfigToTLSConfig(&c.TLSConfig)
 		return err
-	})
+	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
 	auth.tlsHealth = health
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
-	name, webConfig, logger, rec := sp.name, sp.webConfig, s.logger.With("listener", sp.name), s.recorder()
+	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		c, err := webconfig.Load(webConfig)
 		if err == nil {
@@ -618,13 +618,11 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
 				restrictSANsOnResumption(cfg, c.TLSConfig)
 				health.succeeded()
-				rec.WebConfigRead(name, true, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
 		health.failed()
-		rec.WebConfigRead(name, true, false)
 		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
 			"web_config_file", webConfig, "err", errfmt.OneLine(err))
 		// The marker tells serverErrorLog that the server, not the client,
@@ -811,12 +809,20 @@ func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Liste
 	sockets := make(map[string]net.Listener, len(wanted))
 	var problems []string
 	for name, lns := range passed {
-		var stream []net.Listener
+		// Only TCP and Unix stream sockets can be served: datagram ones
+		// fail on Accept, and Unix seqpacket ones would show the path a
+		// client binds to as its address (see unixClientsListener).
+		var stream, other []net.Listener
 		for _, ln := range lns {
-			if ln != nil { // nil for non-stream sockets (datagram, FIFO)
+			switch {
+			case ln == nil:
+			case ln.Addr().Network() == "tcp" || ln.Addr().Network() == "unix":
 				stream = append(stream, ln)
+			default:
+				other = append(other, ln)
 			}
 		}
+		closeAll(nil, other...)
 		listener, used := wanted[name]
 		switch {
 		case !used:

@@ -667,13 +667,14 @@ func TestServerErrorLogHTTP2Panic(t *testing.T) {
 func TestTLSHealthRecover(t *testing.T) {
 	var h *tlsHealth
 	calls := 0
+	var reports []bool
 	h = newTLSHealth(func() error {
 		calls++
 		if calls == 1 {
 			h.failed() // a handshake fails while the recheck runs
 		}
 		return nil
-	})
+	}, func(ok bool) { reports = append(reports, ok) })
 	if h.recover() {
 		t.Error("recovered while not failing")
 	}
@@ -684,6 +685,11 @@ func TestTLSHealthRecover(t *testing.T) {
 	h.limit = rate.NewLimiter(rate.Inf, 1) // let the next recheck run now
 	if !h.recover() {
 		t.Error("not recovered by a clean recheck")
+	}
+	// The metric followed the state: failed, failed during the recheck,
+	// then recovered.
+	if !slices.Equal(reports, []bool{false, false, true}) {
+		t.Errorf("reports = %v, want [false false true]", reports)
 	}
 
 	h.failed()

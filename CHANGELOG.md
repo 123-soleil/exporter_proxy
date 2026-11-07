@@ -125,6 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; lowering authentication on purpose takes a restart. A web
   configuration caught half-written by a reload can no longer open a
   listener.
+- systemd datagram and sequential packet sockets are refused at startup
+  (they failed on Accept, or bypassed the Unix client address masking).
 - `web_config_read_error` returns to 0 when TLS settings load again, also
   through requests on connections already open (at most one recheck per
   second, never clearing a failure recorded meanwhile), without waiting for

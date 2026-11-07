@@ -1535,3 +1535,38 @@ func TestStartReportsEveryWebConfigRuleViolation(t *testing.T) {
 		t.Errorf("Start error = %v, want both listeners reported", err)
 	}
 }
+
+// otherNetworkListener is a listener reporting another network, like a
+// datagram or seqpacket socket passed by systemd.
+type otherNetworkListener struct {
+	net.Listener
+	network string
+}
+
+func (l otherNetworkListener) Addr() net.Addr { return otherNetworkAddr(l.network) }
+
+type otherNetworkAddr string
+
+func (a otherNetworkAddr) Network() string { return string(a) }
+func (a otherNetworkAddr) String() string  { return "/run/x.sock" }
+
+// systemd sockets that are not TCP or Unix stream sockets are refused at
+// startup, instead of failing on Accept or showing client-chosen paths.
+func TestSystemdNonStreamSocketsRefused(t *testing.T) {
+	for _, network := range []string{"unixgram", "unixpacket"} {
+		t.Run(network, func(t *testing.T) {
+			ln := otherNetworkListener{tcpListener(t), network}
+			fakeSystemd(t, map[string][]net.Listener{"node": {ln}})
+			web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+			l := listenerConfig("node", web, "http://127.0.0.1:1")
+			l.Listen = "systemd:node"
+			_, err := Start(&config.Config{Listeners: []config.Listener{l}}, Options{Logger: slog.New(slog.DiscardHandler)})
+			if err == nil || !strings.Contains(err.Error(), "stream socket") {
+				t.Errorf("Start error = %v, want a refused non-stream socket", err)
+			}
+			if !isClosed(ln.Listener) {
+				t.Error("refused socket left open")
+			}
+		})
+	}
+}
