@@ -91,7 +91,7 @@ func (r *recorder) FileModified(_, _ string, t time.Time) {
 	r.modTimes = append(r.modTimes, t)
 }
 
-func (r *recorder) ContentParsed(_, _ string, samples int, _ time.Duration) {
+func (r *recorder) ContentParsed(_, _ string, samples int, _ time.Duration, _ bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.parsed = append(r.parsed, samples)
@@ -99,7 +99,7 @@ func (r *recorder) ContentParsed(_, _ string, samples int, _ time.Duration) {
 
 func (r *recorder) AuthFailed(string, AuthReason) {}
 
-func (r *recorder) WebConfigRead(string, bool) {}
+func (r *recorder) WebConfigRead(string, bool, bool) {}
 
 func (r *recorder) SourceFailed(_, _ string, reason source.Reason) {
 	r.mu.Lock()
@@ -449,8 +449,12 @@ func TestScrapeBudget(t *testing.T) {
 		{"", 0, false},
 		{"10", 9500 * time.Millisecond, true},
 		{"14.5", 14 * time.Second, true},
-		{"1", time.Second, true}, // too short for the margin: whole timeout
-		{"0.3", 300 * time.Millisecond, true},
+		{"1", time.Second, true},     // too short for the margin: whole timeout
+		{"0.3", time.Second, true},   // raised to minScrapeBudget
+		{"1e-9", time.Second, true},  // cannot make healthy sources time out
+		{"1.001", time.Second, true}, // margin taken, floor kept
+		{"1.2", time.Second, true},
+		{"2", 1500 * time.Millisecond, true},
 		{"0", 0, false},
 		{"-5", 0, false},
 		{"abc", 0, false},
@@ -566,5 +570,23 @@ func TestHandlerCloseIdleConnections(t *testing.T) {
 	h.CloseIdleConnections()
 	if src.closed != 1 {
 		t.Errorf("CloseIdleConnections called %d times, want 1", src.closed)
+	}
+}
+
+// Source failures a client can trigger at will are not all logged at warn.
+func TestHandlerWarnLogsAreRateLimited(t *testing.T) {
+	var logs bytes.Buffer
+	rec := &recorder{}
+	h := newTestHandler(fakeSource{err: source.NewError(source.ReasonUnavailable, "down")}, 2, rec, &logs, false)
+	const n = logBurst + 20
+	for range n {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	}
+	if len(rec.failed) != n {
+		t.Errorf("counted %d failures, want %d (all)", len(rec.failed), n)
+	}
+	warns := strings.Count(logs.String(), "level=WARN")
+	if warns < logBurst || warns > logBurst+2 {
+		t.Errorf("%d warn lines for %d failures, want about %d", warns, n, logBurst)
 	}
 }

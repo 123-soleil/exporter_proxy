@@ -85,6 +85,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	// SIGHUP (systemctl reload) reloads the configuration. Registered
+	// first, so that a SIGHUP received while starting does not kill the
+	// process: it is buffered and applied once serving.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	if opts.showVersion {
 		if _, err := fmt.Fprintln(stdout, versionLine()); err != nil {
 			return exitError
@@ -112,12 +119,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	logger.Info("configuration loaded", "path", opts.configPath,
 		"listeners", len(cfg.Listeners), "routes", routes, "hash", cfg.HashString())
 
-	// SIGHUP (systemctl reload) reloads the configuration. Registered
-	// before serving, so that an early SIGHUP does not kill the process.
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-
 	m := metrics.New()
 	m.ConfigLoaded(cfg, time.Now())
 
@@ -144,7 +145,7 @@ loop:
 			code = exitError
 			break loop
 		case <-hup:
-			if next := reload(opts.configPath, cfg.Hash, srv, m, logger); next != nil {
+			if next := reload(opts.configPath, cfg, srv, m, logger); next != nil {
 				cfg = next
 			}
 		}
@@ -163,20 +164,21 @@ loop:
 // reload loads the configuration again and applies it, returning the new
 // configuration. On any error it returns nil: the running configuration is
 // kept and the reload metric is set to 0.
-func reload(path string, runningHash uint64, srv *server.Server, m *metrics.Metrics, logger *slog.Logger) *config.Config {
+func reload(path string, running *config.Config, srv *server.Server, m *metrics.Metrics, logger *slog.Logger) *config.Config {
 	logger.Info("reloading configuration", "path", path)
 	cfg, err := config.Load(path)
 	if err == nil {
+		m.PrepareReload(cfg)
 		err = srv.Reload(cfg)
 	}
 	if err != nil {
-		m.ConfigLoadFailed()
+		m.ReloadFailed(running)
 		logger.Error("configuration reload failed, keeping the running configuration", "path", path, "err", err)
 		return nil
 	}
 	m.ConfigLoaded(cfg, time.Now())
 	logger.Info("configuration reloaded", "path", path, "hash", cfg.HashString(),
-		"changed", cfg.Hash != runningHash, "listeners", len(cfg.Listeners))
+		"changed", cfg.Hash != running.Hash, "listeners", len(cfg.Listeners))
 	return cfg
 }
 

@@ -1,6 +1,9 @@
 package webconfig
 
 import (
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,14 +20,14 @@ func TestRead(t *testing.T) {
 		clearCreds bool
 	}{
 		{"empty", "{}\n", Summary{}, false},
-		{"users without TLS", "basic_auth_users:\n  u: hash\n", Summary{HasUsers: true}, true},
+		{"users without TLS", "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{HasUsers: true}, true},
 		{
 			"users with TLS files, relative paths",
-			"tls_server_config:\n  cert_file: tls/c.crt\n  key_file: /etc/k.key\nbasic_auth_users:\n  u: hash\n",
+			"tls_server_config:\n  cert_file: tls/c.crt\n  key_file: /etc/k.key\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n",
 			Summary{TLSEnabled: true, CertFile: "DIR/tls/c.crt", KeyFile: "/etc/k.key", HasUsers: true},
 			false,
 		},
-		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: hash\n", Summary{TLSEnabled: true, HasUsers: true}, false},
+		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{TLSEnabled: true, HasUsers: true}, false},
 		{
 			"mTLS only",
 			"tls_server_config:\n  client_ca_file: ca.crt\n  client_auth_type: RequireAndVerifyClientCert\n",
@@ -40,6 +43,7 @@ func TestRead(t *testing.T) {
 			if err := os.WriteFile(p, []byte(tt.yaml), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			writeTestCA(t, filepath.Join(dir, "ca.crt")) // read by the client CA check
 			got, err := Read(p)
 			if err != nil {
 				t.Fatal(err)
@@ -96,6 +100,157 @@ func TestLoadRejectsHeadersLikeExporterToolkit(t *testing.T) {
 			}
 			if toolkitErr == nil {
 				t.Error("exporter-toolkit accepts what Load rejects")
+			}
+		})
+	}
+}
+
+// A malformed hash makes the file invalid, like exporter-toolkit at startup.
+func TestLoadRejectsInvalidHash(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(p, []byte("basic_auth_users:\n  u: not-a-hash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), `basic_auth_users "u"`) {
+		t.Errorf("Load error = %v, want an invalid hash error naming the user", err)
+	}
+	if web.Validate(p) == nil {
+		t.Error("exporter-toolkit accepts what Load rejects")
+	}
+}
+
+// client_allowed_sans without a client certificate requested would refuse
+// every client: the file is invalid.
+func TestLoadRejectsSANsWithoutClientCert(t *testing.T) {
+	dir := t.TempDir()
+	for name, auth := range map[string]string{
+		"unset":                "",
+		"NoClientCert":         "  client_auth_type: NoClientCert\n",
+		"RequestClientCert":    "  client_auth_type: RequestClientCert\n",
+		"RequireAnyClientCert": "  client_auth_type: RequireAnyClientCert\n", // not verified: names could be forged
+	} {
+		p := filepath.Join(dir, name+".yml")
+		content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n" + auth + "  client_allowed_sans:\n    - a\n"
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "client_allowed_sans needs") {
+			t.Errorf("%s: Load error = %v, want client_allowed_sans needs a verifying client_auth_type", name, err)
+		}
+	}
+}
+
+func TestClientCertPolicy(t *testing.T) {
+	for v, want := range map[string][2]bool{
+		"": {false, false}, "NoClientCert": {false, false}, "RequestClientCert": {false, false},
+		"RequireAnyClientCert": {true, false}, "RequireClientCert": {true, false},
+		"VerifyClientCertIfGiven":    {false, true},
+		"RequireAndVerifyClientCert": {true, true},
+	} {
+		if req, ver := ClientCertPolicy(v); req != want[0] || ver != want[1] {
+			t.Errorf("ClientCertPolicy(%q) = %v, %v; want %v", v, req, ver, want)
+		}
+	}
+}
+
+func TestLoadRejectsEmptyAllowedSANs(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_allowed_sans: []\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "client_allowed_sans is empty") {
+		t.Errorf("Load error = %v, want client_allowed_sans is empty", err)
+	}
+}
+
+// Verifying client certificates without a client CA would trust the system
+// roots: the file is invalid.
+func TestLoadRejectsVerificationWithoutClientCA(t *testing.T) {
+	dir := t.TempDir()
+	for _, auth := range []string{"RequireAndVerifyClientCert", "VerifyClientCertIfGiven"} {
+		p := filepath.Join(dir, auth+".yml")
+		content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: " + auth + "\n"
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "no client_ca_file or client_ca") {
+			t.Errorf("%s: Load error = %v, want missing client CA", auth, err)
+		}
+	}
+}
+
+// writeTestCA writes a PEM certificate (that of an httptest TLS server) to path.
+func writeTestCA(t *testing.T, path string) {
+	t.Helper()
+	ts := httptest.NewTLSServer(http.NotFoundHandler())
+	defer ts.Close()
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Client CA rules: not ignored, not empty.
+func TestLoadClientCARules(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	writeTestCA(t, ca)
+	empty := filepath.Join(dir, "empty.crt")
+	if err := os.WriteFile(empty, []byte("no certificate here\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ auth, caFile, wantErr string }{
+		"verified":                {"RequireAndVerifyClientCert", ca, ""},
+		"CA ignored (RequireAny)": {"RequireAnyClientCert", ca, "would be ignored"},
+		"CA ignored (old name)":   {"RequireClientCert", ca, "would be ignored"},
+		"CA ignored (Request)":    {"RequestClientCert", ca, "would be ignored"},
+		"CA without certificate":  {"RequireAndVerifyClientCert", empty, "contains no certificate"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".yml")
+			content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: " + tc.auth + "\n  client_ca_file: " + tc.caFile + "\n"
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("Load = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Load error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// HTTP/2 needs one of its required cipher suites below TLS 1.3.
+func TestLoadRejectsHTTP2WithoutRequiredCipher(t *testing.T) {
+	dir := t.TempDir()
+	base := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  cipher_suites:\n    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\n"
+	for name, tc := range map[string]struct{ extra, wantErr string }{
+		"http2 on, TLS 1.2": {"", "cipher_suites must include"},
+		"http2 off":         {"http_server_config:\n  http2: false\n", ""},
+		"TLS 1.3 only":      {"  min_version: TLS13\n", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".yml")
+			content := base + tc.extra
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("Load = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Load error = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}

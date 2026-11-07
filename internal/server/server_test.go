@@ -1,14 +1,20 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +30,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
+	"github.com/123-soleil/exporter_proxy/internal/proxy"
 )
 
 const metrics = "# TYPE up gauge\nup 1\n"
@@ -866,5 +873,639 @@ func TestTLSWebConfigUnreadableIsRecorded(t *testing.T) {
 	}
 	if got := rec.reads(); !slices.Equal(got, []bool{false}) {
 		t.Errorf("web configuration reads recorded %v, want [false]", got)
+	}
+}
+
+// Users removed from the file of a listener started with basic auth: 518
+// until a reload, which then removes authentication on purpose.
+func TestUsersRemovedFailClosedUntilReload(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := filepath.Join(dir, "web.yml")
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	logs := &syncBuffer{}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	addr := s.Addr("node").String()
+	url := "http://" + addr + "/metrics"
+
+	writeWeb(t, dir, "web.yml", "") // emptied while being rewritten
+	if code, body := get(t, url, "", ""); code != StatusWebConfigUnreadable {
+		t.Fatalf("without users: code %d body %q, want 518", code, body)
+	}
+
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if code, _ := get(t, url, "", ""); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("authentication not removed by the reload")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
+		t.Errorf("removal of authentication not warned: %s", logs.String())
+	}
+}
+
+// Verified credentials survive a restart of the listener on reload.
+func TestSuccessCacheKeptAcrossListenerRestart(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := filepath.Join(dir, "web.yml")
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
+	if code, _ := get(t, "http://"+addr+"/metrics", "prometheus", "s3cret-test"); code != http.StatusOK {
+		t.Fatalf("first scrape: code %d", code)
+	}
+	before := s.successes["node"]
+
+	// rate_limit added in the same file: the listener restarts.
+	content, err := os.ReadFile(web)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWeb(t, dir, "web.yml", string(content)+"rate_limit:\n  interval: 1ms\n  burst: 100\n")
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.mu.Lock()
+	after := s.successes["node"]
+	restarted := s.listeners["node"].settings.rateLimit.burst == 100
+	s.mu.Unlock()
+	if !restarted {
+		t.Fatal("listener not restarted")
+	}
+	if after != before || len(after.keys) != 1 {
+		t.Errorf("success cache not kept across the restart (same=%v, entries=%d)", after == before, len(after.keys))
+	}
+}
+
+// Users added then removed while running: 518, and the reload the error
+// asks for removes authentication.
+func TestUsersSeenAtRuntimeClearedByReload(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	logs := &syncBuffer{}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	addr := s.Addr("node").String()
+	url := "http://" + addr + "/metrics"
+
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	if code, _ := get(t, url, "", ""); code != http.StatusUnauthorized {
+		t.Fatalf("users added: code %d, want 401", code)
+	}
+	writeWeb(t, dir, "web.yml", "{}\n")
+	if code, _ := get(t, url, "", ""); code != StatusWebConfigUnreadable {
+		t.Fatalf("users removed: code %d, want 518", code)
+	}
+
+	l.Listen = addr
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if code, _ := get(t, url, "", ""); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("still refused after the reload")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
+		t.Error("removal of authentication not warned")
+	}
+}
+
+// A renamed listener on the same address that loses its users is warned
+// about too.
+func TestRenamedListenerLosingAuthIsWarned(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.yml")
+	basicAuthWebConfig(t, auth, "prometheus", "s3cret-test")
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+
+	l := withAddr(t, listenerConfig("node", auth, up.URL))
+	logs := &syncBuffer{}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	renamed := listenerConfig("node2", plain, up.URL)
+	renamed.Listen = s.Addr("node").String()
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{renamed}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
+		t.Error("renamed listener losing authentication not warned")
+	}
+}
+
+// mtlsTest is a TLS listener whose server certificate also serves as a
+// client certificate.
+type mtlsTest struct {
+	s         *Server
+	l         config.Listener
+	web       string
+	cert, key string
+	logs      *syncBuffer
+	rec       *authRecorder
+}
+
+func newMTLSTest(t *testing.T, clientAuth string) *mtlsTest {
+	t.Helper()
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	m := &mtlsTest{web: filepath.Join(dir, "web.yml"), logs: &syncBuffer{}, rec: &authRecorder{}}
+	m.cert, m.key = testTLSFiles(t, dir)
+	m.writeWeb(t, clientAuth)
+	m.l = withAddr(t, listenerConfig("node", m.web, up.URL))
+	s, err := Start(&config.Config{Listeners: []config.Listener{m.l}},
+		Options{Logger: slog.New(slog.NewTextHandler(m.logs, nil)), Recorder: m.rec})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+	m.s = s
+	m.l.Listen = s.Addr("node").String()
+	return m
+}
+
+func (m *mtlsTest) writeWeb(t *testing.T, clientAuth string) {
+	t.Helper()
+	content := fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", m.cert, m.key)
+	if clientAuth != "" {
+		content += "  client_auth_type: " + clientAuth + "\n"
+	}
+	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), content)
+}
+
+func (m *mtlsTest) url() string { return "https://" + m.l.Listen + "/metrics" }
+
+func (m *mtlsTest) reload(t *testing.T) {
+	t.Helper()
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+}
+
+// tlsClient returns a client, with the test certificate when withCert.
+func (m *mtlsTest) client(t *testing.T, withCert, keepAlive bool) *http.Client {
+	t.Helper()
+	cfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test certificate
+	if withCert {
+		pair, err := tls.LoadX509KeyPair(m.cert, m.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: !keepAlive}}
+}
+
+func tlsGet(c *http.Client, url string) error {
+	resp, err := c.Get(url)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("code %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// A web configuration that stops requiring client certificates while
+// running (half-written or weakened) refuses new connections until a
+// reload, which then applies it and warns.
+func TestClientAuthFailsClosedUntilReload(t *testing.T) {
+	m := newMTLSTest(t, "RequireAnyClientCert")
+	anonymous := m.client(t, false, false)
+	if err := tlsGet(anonymous, m.url()); err == nil {
+		t.Fatal("served without a client certificate at start")
+	}
+	if err := tlsGet(m.client(t, true, false), m.url()); err != nil {
+		t.Fatalf("with a client certificate at start: %v", err)
+	}
+
+	clientFailures := len(m.rec.got()) // the anonymous attempt above
+	m.writeWeb(t, "")                  // client_auth_type lost: half-written or weakened
+	if err := tlsGet(anonymous, m.url()); err == nil {
+		t.Fatal("served without a client certificate after the file lost client_auth_type")
+	}
+	if got := m.rec.reads(); !slices.Contains(got, false) {
+		t.Errorf("weakened file not reported as a failed read: %v", got)
+	}
+	if got := m.rec.got(); len(got) != clientFailures {
+		t.Errorf("server-side refusal counted as a client failure: %v", got)
+	}
+
+	m.reload(t)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(anonymous, m.url()) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("still refused after the reload")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: client certificate requirements") {
+		t.Errorf("weakening not warned: %s", m.logs.String())
+	}
+}
+
+// A reload that requires client certificates closes the connections
+// already open, which were accepted without one.
+func TestClientAuthTightenedByReloadClosesOpenConnections(t *testing.T) {
+	m := newMTLSTest(t, "")
+	c := m.client(t, false, true) // keep-alive, no certificate
+	if err := tlsGet(c, m.url()); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+
+	m.writeWeb(t, "RequireAnyClientCert")
+	m.reload(t)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(c, m.url()) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("open connection still served without a certificate after the reload")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tlsGet(m.client(t, true, false), m.url()); err != nil {
+		t.Errorf("with a certificate after the reload: %v", err)
+	}
+}
+
+// Unchanged client certificate settings keep the listener and its
+// connections on reload.
+func TestReloadKeepsListenerWithSameClientAuth(t *testing.T) {
+	m := newMTLSTest(t, "RequireAnyClientCert")
+	m.s.mu.Lock()
+	before := m.s.listeners["node"]
+	m.s.mu.Unlock()
+	m.reload(t)
+	m.s.mu.Lock()
+	after := m.s.listeners["node"]
+	m.s.mu.Unlock()
+	if before != after {
+		t.Error("listener restarted although its settings did not change")
+	}
+}
+
+// testClientPKI writes a client CA and a client certificate for san, signed
+// by it, and returns their paths.
+func testClientPKI(t *testing.T, dir, san string) (caPath, certPath, keyPath string) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test client CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: san}, DNSNames: []string{san},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPath, certPath, keyPath = filepath.Join(dir, "client-ca.pem"), filepath.Join(dir, "client.pem"), filepath.Join(dir, "client-key.pem")
+	writeWeb(t, dir, "client-ca.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})))
+	writeWeb(t, dir, "client.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
+	writeWeb(t, dir, "client-key.pem", string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})))
+	return caPath, certPath, keyPath
+}
+
+// writeMTLSWeb writes a web configuration verifying client certificates
+// against ca (if set), restricted to sans (if any).
+func (m *mtlsTest) writeMTLSWeb(t *testing.T, ca string, sans ...string) {
+	t.Helper()
+	content := fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_auth_type: RequireAndVerifyClientCert\n", m.cert, m.key)
+	if ca != "" {
+		content += "  client_ca_file: " + ca + "\n"
+	}
+	if len(sans) > 0 {
+		content += "  client_allowed_sans:\n"
+		for _, s := range sans {
+			content += "    - " + s + "\n"
+		}
+	}
+	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), content)
+}
+
+// clientWith returns a client presenting the given certificate, without
+// keep-alive, resuming TLS sessions when the server allows it.
+func clientWith(t *testing.T, cert, key string) *http.Client {
+	t.Helper()
+	pair, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{ //nolint:gosec // test server certificate
+			InsecureSkipVerify: true,
+			Certificates:       []tls.Certificate{pair},
+			ClientSessionCache: tls.NewLRUClientSessionCache(8),
+		},
+		DisableKeepAlives: true,
+	}}
+}
+
+// A client removed from client_allowed_sans while running cannot keep
+// connecting by resuming its TLS session.
+func TestAllowedSANsCheckedOnResumption(t *testing.T) {
+	m := newMTLSTest(t, "")
+	ca, cert, key := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
+	m.writeMTLSWeb(t, ca, "scraper-a")
+	m.reload(t) // apply mTLS (restarts the listener)
+	c := clientWith(t, cert, key)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(c, m.url()) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("allowed client refused")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tlsGet(c, m.url()); err != nil { // a second connection, to get a ticket
+		t.Fatalf("allowed client: %v", err)
+	}
+
+	m.writeMTLSWeb(t, ca, "scraper-b") // scraper-a revoked, no reload
+	if err := tlsGet(c, m.url()); err == nil {
+		t.Error("revoked client served by resuming its TLS session")
+	}
+}
+
+// A client CA removed while running (verification would fall back to the
+// system roots) refuses new connections until a reload, which warns.
+func TestClientCARemovedFailsClosed(t *testing.T) {
+	m := newMTLSTest(t, "")
+	ca, cert, key := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
+	m.writeMTLSWeb(t, ca)
+	m.reload(t)
+	c := clientWith(t, cert, key)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(c, m.url()) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("client refused with its CA configured")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	m.writeMTLSWeb(t, "") // client_ca_file lost, RequireAndVerifyClientCert kept
+	fresh := clientWith(t, cert, key)
+	if err := tlsGet(fresh, m.url()); err == nil {
+		t.Error("served after the client CA was removed")
+	}
+	if got := m.rec.reads(); !slices.Contains(got, false) {
+		t.Errorf("removed client CA not reported as a failed read: %v", got)
+	}
+
+	// Verification without a client CA is invalid: the reload is refused
+	// and the running listener keeps its CA.
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}); err == nil ||
+		!strings.Contains(err.Error(), "no client_ca_file or client_ca") {
+		t.Errorf("Reload error = %v, want the missing client CA", err)
+	}
+	m.writeMTLSWeb(t, ca)
+	if err := tlsGet(clientWith(t, cert, key), m.url()); err != nil {
+		t.Errorf("client refused once the CA is back: %v", err)
+	}
+}
+
+// A reload catching a TLS file emptied serves in clear text: warned.
+func TestReloadLosingTLSIsWarned(t *testing.T) {
+	m := newMTLSTest(t, "")
+	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), "")
+	m.reload(t)
+	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: TLS") {
+		t.Errorf("loss of TLS not warned: %s", m.logs.String())
+	}
+}
+
+// Listeners swapping addresses: the port that loses its protection is
+// warned about, whatever the listener names.
+func TestSwappedListenersLosingAuthAreWarned(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.yml")
+	basicAuthWebConfig(t, auth, "prometheus", "s3cret-test")
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+
+	a := withAddr(t, listenerConfig("a", auth, up.URL))
+	b := withAddr(t, listenerConfig("b", plain, up.URL))
+	logs := &syncBuffer{}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{a, b}}, logs)
+	a.Listen, b.Listen = s.Addr("b").String(), s.Addr("a").String() // swap
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{a, b}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") ||
+		!strings.Contains(logs.String(), "listener=b") {
+		t.Errorf("port losing basic authentication not warned: %s", logs.String())
+	}
+}
+
+// writeWebRaw writes the TLS part of m's web configuration plus extra.
+func (m *mtlsTest) writeWebRaw(t *testing.T, extra string) {
+	t.Helper()
+	content := fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", m.cert, m.key) + extra
+	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), content)
+}
+
+// RequireAnyClientCert (required, not verified) and VerifyClientCertIfGiven
+// (verified, not required) are not ranked: going from one to the other
+// while running weakens what is required, and is refused.
+func TestClientCertRequiredNotTradedForVerified(t *testing.T) {
+	m := newMTLSTest(t, "RequireAnyClientCert")
+	ca, _, _ := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
+	anonymous := m.client(t, false, false)
+
+	m.writeWebRaw(t, "  client_auth_type: VerifyClientCertIfGiven\n  client_ca_file: "+ca+"\n")
+	if err := tlsGet(anonymous, m.url()); err == nil {
+		t.Fatal("client without a certificate served after RequireAny became VerifyIfGiven")
+	}
+
+	// The same change applied by a reload restarts the listener and warns.
+	m.reload(t)
+	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: client certificate requirements") {
+		t.Errorf("reload from RequireAny to VerifyIfGiven not warned: %s", m.logs.String())
+	}
+}
+
+// The reverse: a verified certificate is not traded for any certificate.
+func TestClientCertVerifiedNotTradedForRequired(t *testing.T) {
+	m := newMTLSTest(t, "")
+	ca, cert, key := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
+	m.writeWebRaw(t, "  client_auth_type: VerifyClientCertIfGiven\n  client_ca_file: "+ca+"\n")
+	m.reload(t)
+	if err := tlsGet(clientWith(t, cert, key), m.url()); err != nil {
+		// The restarted listener may take a moment to replace the old one.
+		time.Sleep(100 * time.Millisecond)
+		if err := tlsGet(clientWith(t, cert, key), m.url()); err != nil {
+			t.Fatalf("verified client refused: %v", err)
+		}
+	}
+
+	m.writeWebRaw(t, "  client_auth_type: RequireAnyClientCert\n  client_ca_file: "+ca+"\n")
+	// A self-signed certificate, from no trusted CA.
+	if err := tlsGet(m.client(t, true, false), m.url()); err == nil {
+		t.Error("unverified certificate accepted after VerifyIfGiven became RequireAny")
+	}
+}
+
+// client_allowed_sans with an optional certificate: a client without one
+// is refused as a client failure, without a panic in exporter-toolkit.
+func TestAllowedSANsWithoutClientCert(t *testing.T) {
+	m := newMTLSTest(t, "")
+	ca, _, _ := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
+	m.writeWebRaw(t, "  client_auth_type: VerifyClientCertIfGiven\n  client_ca_file: "+ca+"\n  client_allowed_sans:\n    - scraper-a\n")
+	m.reload(t)
+	time.Sleep(100 * time.Millisecond) // old server stopping
+	before := len(m.rec.got())
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Fatal("client without a certificate served despite client_allowed_sans")
+	}
+	if strings.Contains(m.logs.String(), "panic") {
+		t.Errorf("panic serving a client without a certificate: %s", m.logs.String())
+	}
+	if got := m.rec.got(); len(got) != before+1 || got[len(got)-1] != proxy.AuthTLSHandshake {
+		t.Errorf("refusal not counted as a client tls_handshake failure: %v", got)
+	}
+}
+
+// Client certificates required while running: refused until the reload
+// (even for clients with a certificate), which then restarts the listener
+// and closes the connections opened without a certificate.
+func TestClientAuthTightenedWhileRunningAppliesAtReload(t *testing.T) {
+	m := newMTLSTest(t, "")
+	open := m.client(t, false, true) // keep-alive, no certificate
+	if err := tlsGet(open, m.url()); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+
+	m.writeWeb(t, "RequireAnyClientCert")
+	before := len(m.rec.got())
+	if err := tlsGet(m.client(t, true, false), m.url()); err == nil {
+		t.Fatal("new connection accepted while the file differs from the running settings")
+	}
+	if got := m.rec.got(); len(got) != before {
+		t.Errorf("server-side refusal counted as a client failure: %v", got)
+	}
+	if got := m.rec.reads(); !slices.Contains(got, false) {
+		t.Errorf("changed settings not reported as a failed read: %v", got)
+	}
+
+	m.reload(t)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(open, m.url()) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("connection opened without a certificate still served after the reload")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tlsGet(m.client(t, true, false), m.url()); err != nil {
+		t.Errorf("with a certificate after the reload: %v", err)
+	}
+}
+
+// The client CA content can be rotated without reload.
+func TestClientCARotationWithoutReload(t *testing.T) {
+	m := newMTLSTest(t, "")
+	dir := filepath.Dir(m.web)
+	ca1, cert1, key1 := testClientPKI(t, filepath.Join(dir), "scraper-a")
+	m.writeWebRaw(t, "  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: "+ca1+"\n")
+	m.reload(t)
+	deadline := time.Now().Add(3 * time.Second)
+	for tlsGet(clientWith(t, cert1, key1), m.url()) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("client of the first CA refused")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A second PKI; its CA replaces the content of the same file.
+	other := t.TempDir()
+	ca2, cert2, key2 := testClientPKI(t, other, "scraper-a")
+	data, err := os.ReadFile(ca2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWeb(t, dir, filepath.Base(ca1), string(data))
+	if err := tlsGet(clientWith(t, cert2, key2), m.url()); err != nil {
+		t.Errorf("client of the rotated CA refused without reload: %v", err)
+	}
+	if err := tlsGet(clientWith(t, cert1, key1), m.url()); err == nil {
+		t.Error("client of the replaced CA still accepted on a new connection")
+	}
+}
+
+// "OPTIONS *" goes through authentication, not an automatic empty 200.
+func TestOptionsStarRequiresAuthentication(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := filepath.Join(t.TempDir(), "web.yml")
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	s := startServer(t, &config.Config{Listeners: []config.Listener{listenerConfig("node", web, up.URL)}}, io.Discard)
+
+	conn, err := net.Dial("tcp", s.Addr("node").String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprint(conn, "OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("OPTIONS *: code %d, want 401", resp.StatusCode)
 	}
 }

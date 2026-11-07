@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	config_util "github.com/prometheus/common/config"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 
 	"github.com/123-soleil/exporter_proxy/internal/errfmt"
@@ -50,6 +54,15 @@ const (
 
 	// maxLoggedUserLen truncates user names in logs (client-supplied text).
 	maxLoggedUserLen = 64
+
+	// logRate and logBurst bound the lines a listener logs at their normal
+	// level (warn or error), separately for client failures (refusals,
+	// handshakes) and for server-side errors (518, TLS settings), so that
+	// client noise never hides a server error; beyond, they are logged at
+	// debug level, so that an attacker cannot flood the logs. Every refusal
+	// is still counted in the metrics.
+	logRate  = 1 // per second
+	logBurst = 10
 )
 
 // StatusWebConfigUnreadable answers every request of a listener whose web
@@ -60,6 +73,15 @@ const (
 	StatusWebConfigUnreadable  = 518
 	WebConfigUnreadableMessage = "web configuration unreadable"
 )
+
+// errUsersRemoved fails a web configuration that has no basic_auth_users
+// while the listener started with some: a file emptied or truncated while
+// being rewritten must not open the listener. Removing authentication on
+// purpose takes a reload.
+var errTLSAdded = errors.New("tls_server_config is set, while this listener serves plain HTTP: reload to enable TLS")
+
+var errUsersRemoved = errors.New("basic_auth_users is missing or empty, while this listener requires basic authentication: " +
+	"fix the file, or reload to remove authentication")
 
 // fakeHash is compared against when the user does not exist and no
 // configured hash gives a cost: bcrypt hash of "fakepassword" at cost 10,
@@ -94,6 +116,42 @@ func fakeHashFor(users map[string]config_util.Secret) []byte {
 	return v.([]byte)
 }
 
+// logGate lowers log lines to debug level beyond logRate per listener.
+type logGate struct{ l *rate.Limiter }
+
+func newLogGate() *logGate { return &logGate{l: rate.NewLimiter(logRate, logBurst)} }
+
+// level returns normal while under the rate, slog.LevelDebug beyond. A nil
+// gate never lowers the level.
+func (g *logGate) level(normal slog.Level) slog.Level {
+	if g == nil || g.l.Allow() {
+		return normal
+	}
+	return slog.LevelDebug
+}
+
+// authOptions configures an authHandler.
+type authOptions struct {
+	listener  string
+	webConfig string
+	// rateLimit is the rate_limit of the web configuration when the
+	// listener started.
+	rateLimit webRateLimit
+	// tls: the listener serves TLS. A plain listener whose file enables TLS
+	// fails closed until a reload, instead of serving in clear text.
+	tls bool
+	// requireUsers is set when the listener started with basic
+	// authentication: a file without users then fails closed. It also
+	// becomes set once users are seen while running.
+	requireUsers bool
+	// successes may be shared with a previous server of the same listener,
+	// so that a restart on reload does not verify every scraper again.
+	successes *successCache
+	// clientLogs gates client failure lines, serverLogs server-side error
+	// lines.
+	clientLogs, serverLogs *logGate
+}
+
 // authHandler applies the web configuration of a listener to each request,
 // like exporter-toolkit does, and reports every refusal:
 //
@@ -101,13 +159,13 @@ func fakeHashFor(users map[string]config_util.Secret) []byte {
 //     change without restart;
 //   - the optional rate_limit of the web configuration applies to all
 //     requests (exporter-toolkit semantics);
-//   - basic authentication when basic_auth_users is set.
+//   - basic authentication when basic_auth_users is set, and always if it
+//     was set when the listener started.
 type authHandler struct {
-	listener  string
-	webConfig string
-	next      http.Handler
-	logger    *slog.Logger
-	rec       proxy.Recorder
+	authOptions
+	next   http.Handler
+	logger *slog.Logger
+	rec    proxy.Recorder
 
 	// limiter is the rate_limit of the web configuration, fixed at start
 	// like exporter-toolkit; nil when not configured.
@@ -119,26 +177,41 @@ type authHandler struct {
 	// verifyMu runs one bcrypt verification at a time, like
 	// exporter-toolkit; pending holds a slot per verification running or
 	// waiting for it.
-	verifyMu  sync.Mutex
-	pending   chan struct{}
-	successes *successCache
+	verifyMu sync.Mutex
+	pending  chan struct{}
+	// flights runs a single verification for identical credentials sent
+	// at the same time (several routes or scrapers starting together). The
+	// per-client limit is charged to the first of them only: the others
+	// carry the same valid-or-not credentials, so nothing is bypassed.
+	flights singleflight.Group
+	// usersSeen: basic authentication is required until the next reload,
+	// whatever the file says (fail closed).
+	usersSeen atomic.Bool
 }
 
-func newAuthHandler(listener, webConfig string, rl webRateLimit, next http.Handler, logger *slog.Logger, rec proxy.Recorder) *authHandler {
+func newAuthHandler(o authOptions, next http.Handler, logger *slog.Logger, rec proxy.Recorder) *authHandler {
+	if o.successes == nil {
+		o.successes = newSuccessCache(successCacheSize)
+	}
+	if o.clientLogs == nil {
+		o.clientLogs = newLogGate()
+	}
+	if o.serverLogs == nil {
+		o.serverLogs = newLogGate()
+	}
 	h := &authHandler{
-		listener:       listener,
-		webConfig:      webConfig,
+		authOptions:    o,
 		next:           next,
-		logger:         logger.With("listener", listener),
+		logger:         logger.With("listener", o.listener),
 		rec:            rec,
 		clientLimiters: newClientLimiters(clientVerifyRate, clientVerifyBurst, maxTrackedClients),
 		verifyLimiter:  rate.NewLimiter(verifyRate, verifyBurst),
-		successes:      newSuccessCache(successCacheSize),
 		pending:        make(chan struct{}, maxPendingVerifications),
 	}
-	if rl.interval > 0 {
-		h.limiter = rate.NewLimiter(rate.Every(rl.interval), rl.burst)
+	if o.rateLimit.interval > 0 {
+		h.limiter = rate.NewLimiter(rate.Every(o.rateLimit.interval), o.rateLimit.burst)
 	}
+	h.usersSeen.Store(o.requireUsers)
 	return h
 }
 
@@ -148,6 +221,15 @@ type webRateLimit struct {
 	burst    int
 }
 
+// verifyResult is the outcome of a password verification.
+type verifyResult int
+
+const (
+	verifyOK verifyResult = iota
+	verifyInvalid
+	verifyLimited
+)
+
 func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Before reading the web configuration: refused requests cost nothing.
 	if h.limiter != nil && !h.limiter.Allow() {
@@ -156,10 +238,20 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c, err := webconfig.Load(h.webConfig)
-	h.rec.WebConfigRead(h.listener, err == nil)
+	if err == nil && !h.tls && c.TLSConfig.IsEnabled() {
+		err = errTLSAdded
+	}
+	if err == nil {
+		if len(c.Users) > 0 {
+			h.usersSeen.Store(true)
+		} else if h.usersSeen.Load() {
+			err = errUsersRemoved
+		}
+	}
+	h.rec.WebConfigRead(h.listener, false, err == nil)
 	if err != nil {
-		h.logger.Error("cannot load web configuration", "web_config_file", h.webConfig,
-			"code", StatusWebConfigUnreadable, "err", errfmt.OneLine(err))
+		h.logger.Log(r.Context(), h.serverLogs.level(slog.LevelError), "cannot load web configuration",
+			"web_config_file", h.webConfig, "code", StatusWebConfigUnreadable, "err", errfmt.OneLine(err))
 		http.Error(w, WebConfigUnreadableMessage, StatusWebConfigUnreadable)
 		return
 	}
@@ -189,40 +281,44 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if key := clientKey(r); key != "" && !h.clientLimiters.allow(key) || !h.verifyLimiter.Allow() {
+	switch h.verify(r, key, []byte(hash), known, c.Users, pass) {
+	case verifyOK:
+		h.next.ServeHTTP(w, r)
+	case verifyLimited:
 		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
-		return
-	}
-	select {
-	case h.pending <- struct{}{}:
 	default:
-		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
-		return
-	}
-	h.verifyMu.Lock()
-	if r.Context().Err() != nil {
-		// The client left while waiting: skip the verification, but still
-		// answer (a half-closed client may read) and count the refusal,
-		// never an empty 200.
-		h.verifyMu.Unlock()
-		<-h.pending
-		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
-		return
-	}
-	compared := []byte(hash)
-	if !known {
-		compared = fakeHashFor(c.Users)
-	}
-	err = bcrypt.CompareHashAndPassword(compared, []byte(pass))
-	h.verifyMu.Unlock()
-	<-h.pending
-
-	if !known || err != nil {
 		h.refuse(w, r, proxy.AuthInvalidCredentials, user, http.StatusUnauthorized)
-		return
 	}
-	h.successes.add(key)
-	h.next.ServeHTTP(w, r)
+}
+
+// verify checks a password with bcrypt, within the limits. Requests sent at
+// the same time with the same credentials share one verification and its
+// result, without taking more of the limits.
+func (h *authHandler) verify(r *http.Request, key [sha256.Size]byte, hash []byte, known bool, users map[string]config_util.Secret, pass string) verifyResult {
+	v, _, _ := h.flights.Do(string(key[:]), func() (any, error) {
+		if k := clientKey(r); k != "" && !h.clientLimiters.allow(k) || !h.verifyLimiter.Allow() {
+			return verifyLimited, nil
+		}
+		select {
+		case h.pending <- struct{}{}:
+		default:
+			return verifyLimited, nil
+		}
+		defer func() { <-h.pending }()
+
+		h.verifyMu.Lock()
+		defer h.verifyMu.Unlock()
+		compared := hash
+		if !known {
+			compared = fakeHashFor(users)
+		}
+		if err := bcrypt.CompareHashAndPassword(compared, []byte(pass)); err != nil || !known {
+			return verifyInvalid, nil
+		}
+		h.successes.add(key)
+		return verifyOK, nil
+	})
+	return v.(verifyResult)
 }
 
 // refuse answers a refused request and reports it.
@@ -235,14 +331,15 @@ func (h *authHandler) refuse(w http.ResponseWriter, r *http.Request, reason prox
 		}
 		attrs = append(attrs, "user", user)
 	}
+	level := slog.LevelDebug
 	if reason == proxy.AuthRateLimited {
 		// Under attack every attempt is rate limited: keep these at debug
 		// level and rely on exporter_proxy_auth_failures_total.
-		h.logger.Debug("authentication refused", attrs...)
 		w.Header().Set("Retry-After", "1")
 	} else {
-		h.logger.Warn("authentication refused", attrs...)
+		level = h.clientLogs.level(slog.LevelWarn)
 	}
+	h.logger.Log(r.Context(), level, "authentication refused", attrs...)
 	if code == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Basic realm="exporter_proxy"`)
 	}
@@ -342,26 +439,57 @@ func (c *clientLimiters) evict() {
 	}
 }
 
+// serverTLSUnavailable marks the handshake errors caused by the server's
+// own TLS settings (web configuration, certificate, key or client CA that
+// cannot be loaded), as opposed to a client failing the handshake.
+const serverTLSUnavailable = "server TLS settings unavailable"
+
 // serverErrorLog turns net/http server errors into structured log lines and
-// counts TLS handshake failures (wrong or missing client certificate, TLS
-// version or cipher mismatch, plain HTTP clients, port scanners).
+// counts TLS handshake failures caused by clients (wrong or missing client
+// certificate, TLS version or cipher mismatch, plain HTTP clients, port
+// scanners).
 type serverErrorLog struct {
 	listener string
 	logger   *slog.Logger
 	rec      proxy.Recorder
+	// clientLogs gates client handshake failures and the net/http lines
+	// clients can cause, serverLogs accept errors and panics, which client
+	// noise must not hide.
+	clientLogs, serverLogs *logGate
 }
 
 const tlsHandshakePrefix = "http: TLS handshake error from "
 
 func (l *serverErrorLog) Write(p []byte) (int, error) {
 	msg := strings.TrimSpace(string(p))
+	ctx := context.Background()
 	if rest, ok := strings.CutPrefix(msg, tlsHandshakePrefix); ok {
 		remote, detail, _ := strings.Cut(rest, ": ")
+		// A prefix match: the marker starts the error returned by
+		// GetConfigForClient, while client-chosen text (such as an ALPN
+		// protocol name) can only appear later in other errors.
+		// The remote must be an IP address: a Unix socket client chooses its
+		// own path, and could put the marker in it.
+		if _, ipErr := netip.ParseAddrPort(remote); ipErr == nil && strings.HasPrefix(detail, serverTLSUnavailable+": ") {
+			// Already logged and shown by exporter_proxy_web_config_read_error:
+			// not a client failure.
+			l.logger.Debug("TLS handshake refused, server TLS settings unavailable",
+				"listener", l.listener, "remote", remote, "err", detail)
+			return len(p), nil
+		}
 		l.rec.AuthFailed(l.listener, proxy.AuthTLSHandshake)
-		l.logger.Warn("TLS handshake failed", "listener", l.listener, "reason", string(proxy.AuthTLSHandshake),
-			"remote", remote, "err", detail)
+		l.logger.Log(ctx, l.clientLogs.level(slog.LevelWarn), "TLS handshake failed", "listener", l.listener,
+			"reason", string(proxy.AuthTLSHandshake), "remote", remote, "err", detail)
 		return len(p), nil
 	}
-	l.logger.Warn("HTTP server error", "listener", l.listener, "err", msg)
+	// Most net/http lines can be caused by clients (HTTP/2 GOAWAY, bad
+	// preface, semicolons in queries...): they share the client budget.
+	// Only accept errors and handler panics are the server's own.
+	gate := l.clientLogs
+	if strings.HasPrefix(msg, "http: Accept error") || strings.HasPrefix(msg, "http: panic serving") ||
+		strings.HasPrefix(msg, "http2: panic serving") {
+		gate = l.serverLogs
+	}
+	l.logger.Log(ctx, gate.level(slog.LevelWarn), "HTTP server error", "listener", l.listener, "err", msg)
 	return len(p), nil
 }

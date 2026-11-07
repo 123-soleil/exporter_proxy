@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/content"
 	"github.com/123-soleil/exporter_proxy/internal/source"
@@ -33,17 +35,19 @@ type Recorder interface {
 	SourceRead(listener, route string, size int)
 	// FileModified reports the modification time of a file source.
 	FileModified(listener, route string, modTime time.Time)
-	// ContentParsed is called after parsing, successful or not.
-	ContentParsed(listener, route string, samples int, duration time.Duration)
+	// ContentParsed is called after parsing, successful or not; samples is
+	// only meaningful when valid.
+	ContentParsed(listener, route string, samples int, duration time.Duration, valid bool)
 	// SourceFailed is called for every rejected scrape.
 	SourceFailed(listener, route string, reason source.Reason)
 	// AuthFailed is called for every request or connection refused before
 	// routing (TLS handshake, basic authentication, rate limiting).
 	AuthFailed(listener string, reason AuthReason)
 	// WebConfigRead is called after each read of the web configuration
-	// file of a listener (on every request and every new TLS connection),
-	// with whether it could be read and applied.
-	WebConfigRead(listener string, ok bool)
+	// file of a listener, with whether it could be read and applied: on
+	// every request (tls false), and on every new TLS connection, which also
+	// loads the certificate, key and client CA (tls true).
+	WebConfigRead(listener string, tls, ok bool)
 }
 
 // AuthReason classifies a refused authentication. Values are metric label
@@ -82,6 +86,24 @@ type Handler struct {
 	logger    *slog.Logger
 	rec       Recorder
 	accessLog bool
+	// logs bounds the warn lines a client can trigger on this listener
+	// (rejections, source failures): beyond, they are logged at debug
+	// level. They are all counted in the metrics.
+	logs *rate.Limiter
+}
+
+// Rate of the warn lines of a listener, like its authentication refusals.
+const (
+	logRate  = 1 // per second
+	logBurst = 10
+)
+
+// warnLevel returns slog.LevelWarn within the log rate, debug beyond.
+func (h *Handler) warnLevel() slog.Level {
+	if h.logs.Allow() {
+		return slog.LevelWarn
+	}
+	return slog.LevelDebug
 }
 
 // NewHandler builds the handler of a validated listener configuration.
@@ -105,6 +127,7 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 		logger:    opts.Logger,
 		rec:       opts.Recorder,
 		accessLog: opts.AccessLog,
+		logs:      rate.NewLimiter(logRate, logBurst),
 	}
 	if h.logger == nil {
 		h.logger = slog.New(slog.DiscardHandler)
@@ -169,7 +192,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case h.slots <- struct{}{}:
 	default:
 		h.rec.RequestRejected(h.listener)
-		h.logger.Warn("request rejected, max_concurrent_requests reached",
+		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
 			"route", rt.path, "max_concurrent_requests", cap(h.slots))
 		http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
@@ -208,7 +231,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if hasBudget {
 			attrs = append(attrs, "scrape_budget_ms", budget.Milliseconds())
 		}
-		h.logger.Warn("source rejected", attrs...)
+		h.logger.Log(req.Context(), h.warnLevel(), "source rejected", attrs...)
 		// The client only gets the reason; details (paths, addresses) stay
 		// in the logs.
 		http.Error(rw, "source rejected: "+string(reason), http.StatusBadGateway)
@@ -237,10 +260,17 @@ const scrapeTimeoutHeader = "X-Prometheus-Scrape-Timeout-Seconds"
 // and send the answer.
 const scrapeMargin = 500 * time.Millisecond
 
+// minScrapeBudget is the least time the scraper's timeout header leaves to
+// the source, so that a client cannot make healthy sources fail with
+// "timeout" (counted and alerted on as source failures) by announcing a
+// tiny timeout. Real scrape timeouts are at least a second.
+const minScrapeBudget = time.Second
+
 // scrapeBudget returns the time available to read the source according to
 // the scraper's timeout header: the timeout minus scrapeMargin, or the whole
-// timeout when it is too short for the margin. ok is false when the header
-// is missing or invalid.
+// timeout when it is too short for the margin, and never less than
+// minScrapeBudget (so the budget never decreases when the timeout grows).
+// ok is false when the header is missing or invalid.
 func scrapeBudget(h http.Header) (time.Duration, bool) {
 	v := h.Get(scrapeTimeoutHeader)
 	if v == "" {
@@ -253,10 +283,11 @@ func scrapeBudget(h http.Header) (time.Duration, bool) {
 	// Cap absurd values before converting (a day is far above any route
 	// timeout, which bounds the read anyway).
 	timeout := time.Duration(math.Min(secs, 86400) * float64(time.Second))
+	budget := timeout
 	if timeout > 2*scrapeMargin {
-		return timeout - scrapeMargin, true
+		budget = timeout - scrapeMargin
 	}
-	return timeout, true
+	return max(budget, minScrapeBudget), true
 }
 
 // fetch reads the source and validates its content.
@@ -271,7 +302,7 @@ func (h *Handler) fetch(ctx context.Context, rt route) ([]byte, error) {
 	h.rec.SourceRead(h.listener, rt.path, len(res.Body))
 
 	parsed, err := content.Validate(res.Body, rt.maxSamples)
-	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration)
+	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 	if err != nil {
 		return nil, err
 	}
@@ -314,12 +345,12 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 // NopRecorder is a Recorder that records nothing.
 type NopRecorder struct{}
 
-func (NopRecorder) RequestServed(string, string, int, time.Duration) {}
-func (NopRecorder) InFlight(string, int)                             {}
-func (NopRecorder) RequestRejected(string)                           {}
-func (NopRecorder) SourceRead(string, string, int)                   {}
-func (NopRecorder) FileModified(string, string, time.Time)           {}
-func (NopRecorder) ContentParsed(string, string, int, time.Duration) {}
-func (NopRecorder) AuthFailed(string, AuthReason)                    {}
-func (NopRecorder) SourceFailed(string, string, source.Reason)       {}
-func (NopRecorder) WebConfigRead(string, bool)                       {}
+func (NopRecorder) RequestServed(string, string, int, time.Duration)       {}
+func (NopRecorder) InFlight(string, int)                                   {}
+func (NopRecorder) RequestRejected(string)                                 {}
+func (NopRecorder) SourceRead(string, string, int)                         {}
+func (NopRecorder) FileModified(string, string, time.Time)                 {}
+func (NopRecorder) ContentParsed(string, string, int, time.Duration, bool) {}
+func (NopRecorder) AuthFailed(string, AuthReason)                          {}
+func (NopRecorder) SourceFailed(string, string, source.Reason)             {}
+func (NopRecorder) WebConfigRead(string, bool, bool)                       {}

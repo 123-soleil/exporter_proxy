@@ -36,6 +36,8 @@ func newFileSource(r config.Route) *fileSource {
 // read is done, so a file on a hung network mount can still block.
 func (s *fileSource) Fetch(ctx context.Context) (*Result, error) {
 	start := s.now()
+	// Wall clock, like the context deadline (s.now is for file ages).
+	limit := timeLimit(ctx, time.Now(), s.timeout)
 
 	// O_NONBLOCK: opening a FIFO must not block waiting for a writer. It
 	// has no effect on regular files.
@@ -54,9 +56,15 @@ func (s *fileSource) Fetch(ctx context.Context) (*Result, error) {
 	}
 
 	res := &Result{ModTime: info.ModTime()}
-	if age := start.Sub(info.ModTime()); age > s.maxAge {
+	switch age := start.Sub(info.ModTime()); {
+	case age > s.maxAge:
 		return res, newError(ReasonStale, "%s was modified %s ago, more than max_age (%s)",
 			s.path, age.Truncate(time.Second), s.maxAge)
+	case -age > s.maxAge:
+		// Written by a clock far ahead (or touched into the future): its
+		// age cannot be trusted, and it would stay "fresh" too long.
+		return res, newError(ReasonStale, "%s was modified %s in the future, more than max_age (%s): clock skew?",
+			s.path, (-age).Truncate(time.Second), s.maxAge)
 	}
 	if info.Size() > s.maxBodyBytes {
 		return res, newError(ReasonTooLarge, "%s size %d exceeds max_body_bytes (%d)",
@@ -66,14 +74,14 @@ func (s *fileSource) Fetch(ctx context.Context) (*Result, error) {
 	// The file may grow between Stat and read: the read is bounded too.
 	body, err := readLimited(f, s.maxBodyBytes)
 	if err != nil {
-		return res, classify(ctx, fmt.Errorf("read %s: %w", s.path, err), s.timeout)
+		return res, classify(ctx, fmt.Errorf("read %s: %w", s.path, err), limit)
 	}
 	if elapsed := s.now().Sub(start); elapsed > s.timeout {
 		return res, newError(ReasonTimeout, "reading %s took %s, more than timeout (%s)",
 			s.path, elapsed.Truncate(time.Millisecond), s.timeout)
 	}
 	if err := ctx.Err(); err != nil {
-		return res, classify(ctx, err, s.timeout)
+		return res, classify(ctx, err, limit)
 	}
 
 	res.Body = body

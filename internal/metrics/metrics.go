@@ -8,6 +8,7 @@ package metrics
 
 import (
 	"log/slog"
+	"maps"
 	"net/http"
 	"strconv"
 	"sync"
@@ -62,6 +63,12 @@ type Metrics struct {
 	// events about them (requests still draining) are not recorded, so
 	// that deleted series do not come back.
 	routes map[string]map[string]bool
+
+	// webConfigFailed holds, by listener, whether the last read of its web
+	// configuration failed on a request ([0]) and on a new TLS connection
+	// ([1]); the gauge is 1 when either failed. Protected by wcMu.
+	wcMu            sync.Mutex
+	webConfigFailed map[string][2]bool
 }
 
 // New creates the metrics, registered in a dedicated registry together with
@@ -154,13 +161,7 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 	m.reloadSuccessful.Set(1)
 	m.reloadSuccessTstamp.Set(float64(at.Unix()))
 
-	next := make(map[string]map[string]bool, len(cfg.Listeners))
-	for _, l := range cfg.Listeners {
-		next[l.Name] = make(map[string]bool, len(l.Routes))
-		for _, r := range l.Routes {
-			next[l.Name][r.Path] = r.File != ""
-		}
-	}
+	next := routesOf(cfg)
 	for listener, routes := range m.routes {
 		if _, ok := next[listener]; !ok {
 			m.deleteSeries(prometheus.Labels{"listener": listener})
@@ -185,10 +186,15 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 	for _, reason := range proxy.AuthReasons {
 		m.authFailures.WithLabelValues(config.MetricsListenerName, string(reason))
 	}
-	m.webConfigError.WithLabelValues(config.MetricsListenerName)
+	// A successful load validated every web configuration file: their
+	// read errors start over.
+	m.wcMu.Lock()
+	m.webConfigFailed = map[string][2]bool{}
+	m.wcMu.Unlock()
+	m.webConfigError.WithLabelValues(config.MetricsListenerName).Set(0)
 	for _, l := range cfg.Listeners {
 		m.rejected.WithLabelValues(l.Name)
-		m.webConfigError.WithLabelValues(l.Name)
+		m.webConfigError.WithLabelValues(l.Name).Set(0)
 		for _, reason := range proxy.AuthReasons {
 			m.authFailures.WithLabelValues(l.Name, string(reason))
 		}
@@ -216,9 +222,49 @@ func (m *Metrics) deleteSeries(labels prometheus.Labels) {
 	}
 }
 
-// ConfigLoadFailed records a failed configuration load (reload).
-func (m *Metrics) ConfigLoadFailed() {
+// routesOf returns the listeners and route paths of cfg, with true for file
+// routes.
+func routesOf(cfg *config.Config) map[string]map[string]bool {
+	routes := make(map[string]map[string]bool, len(cfg.Listeners))
+	for _, l := range cfg.Listeners {
+		routes[l.Name] = make(map[string]bool, len(l.Routes))
+		for _, r := range l.Routes {
+			routes[l.Name][r.Path] = r.File != ""
+		}
+	}
+	return routes
+}
+
+// PrepareReload is called before applying next: events of its listeners
+// and routes are recorded from now on, so that none is lost between the
+// moment new listeners serve and ConfigLoaded. Nothing is deleted yet.
+func (m *Metrics) PrepareReload(next *config.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	union := make(map[string]map[string]bool, len(m.routes))
+	for listener, routes := range m.routes {
+		union[listener] = maps.Clone(routes)
+	}
+	for listener, routes := range routesOf(next) {
+		if union[listener] == nil {
+			union[listener] = map[string]bool{}
+		}
+		for route, isFile := range routes {
+			union[listener][route] = union[listener][route] || isFile
+		}
+	}
+	m.routes = union
+	m.inFlight.setListeners(union)
+}
+
+// ReloadFailed records a failed configuration reload: the running
+// configuration is kept, and so are its series.
+func (m *Metrics) ReloadFailed(running *config.Config) {
 	m.reloadSuccessful.Set(0)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.routes = routesOf(running)
+	m.inFlight.setListeners(m.routes)
 }
 
 // Handler serves the registry on Path; other paths get 404.
@@ -307,14 +353,18 @@ func (m *Metrics) FileModified(listener, route string, t time.Time) {
 }
 
 // ContentParsed implements proxy.Recorder.
-func (m *Metrics) ContentParsed(listener, route string, samples int, d time.Duration) {
+// Invalid content is not counted in exporter_proxy_samples: its sample
+// count is meaningless.
+func (m *Metrics) ContentParsed(listener, route string, samples int, d time.Duration, valid bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.known(listener, route) {
 		return
 	}
 	m.parseDuration.WithLabelValues(listener, route).Observe(d.Seconds())
-	m.samples.WithLabelValues(listener, route).Observe(float64(samples))
+	if valid {
+		m.samples.WithLabelValues(listener, route).Observe(float64(samples))
+	}
 }
 
 // AuthFailed implements proxy.Recorder.
@@ -328,14 +378,29 @@ func (m *Metrics) AuthFailed(listener string, reason proxy.AuthReason) {
 }
 
 // WebConfigRead implements proxy.Recorder.
-func (m *Metrics) WebConfigRead(listener string, ok bool) {
+// Request reads and TLS connection reads are tracked apart: a request on an
+// open connection, which reads only the file, must not hide that new TLS
+// connections fail on the certificate.
+func (m *Metrics) WebConfigRead(listener string, tls, ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.known(listener, "") {
 		return
 	}
+	i := 0
+	if tls {
+		i = 1
+	}
+	m.wcMu.Lock()
+	defer m.wcMu.Unlock()
+	if m.webConfigFailed == nil {
+		m.webConfigFailed = map[string][2]bool{}
+	}
+	state := m.webConfigFailed[listener]
+	state[i] = !ok
+	m.webConfigFailed[listener] = state
 	v := 0.0
-	if !ok {
+	if state[0] || state[1] {
 		v = 1
 	}
 	m.webConfigError.WithLabelValues(listener).Set(v)
