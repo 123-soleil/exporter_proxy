@@ -443,8 +443,9 @@ func (s *Server) Reload(cfg *config.Config) error {
 	type swap struct {
 		l         *listener
 		sp        spec
-		basicAuth bool  // the web configuration has users
-		tlsErr    error // TLS settings checked like a new connection
+		basicAuth bool   // the web configuration has users
+		tlsErr    error  // TLS settings checked like a new connection
+		tlsGen    uint64 // TLS health generation before the check
 	}
 	var swaps []swap
 	var started []*listener
@@ -467,10 +468,12 @@ func (s *Server) Reload(cfg *config.Config) error {
 			running.basicAuth = running.basicAuth || next.basicAuth
 			if next == running {
 				var tlsErr error
+				var tlsGen uint64
 				if next.tls {
+					tlsGen = cur.auth.tlsHealth.generation()
 					_, tlsErr = cur.tlsConfigFor(wc)
 				}
-				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr})
+				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr, tlsGen})
 				kept[sp.name] = true
 				continue
 			}
@@ -538,7 +541,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 			if sw.tlsErr != nil {
 				h.markFailing()
 			} else {
-				h.markHealthy()
+				h.markHealthySince(sw.tlsGen)
 			}
 		}
 	}
@@ -743,7 +746,11 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		}
 		_, err = l.tlsConfigFor(c)
 		return err
-	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
+	}, func(ok bool) {
+		if !auth.retired.Load() {
+			s.recorder().WebConfigRead(sp.name, true, ok)
+		}
+	})
 	auth.tlsHealth = health
 	if _, err := l.tlsConfigFor(wc); err != nil {
 		// Logged by prepare (a certificate outside its dates). Reported by
@@ -816,6 +823,7 @@ func (s *Server) serve(l *listener) {
 // upstream connections. Called with s.mu held.
 func (s *Server) drain(l *listener) {
 	name, srv, handler := l.spec.name, l.srv, l.handler
+	l.auth.retired.Store(true)
 	s.draining.Add(1)
 	go func() {
 		defer s.draining.Done()

@@ -1950,3 +1950,33 @@ func TestReloadRechecksKeptListenersTLS(t *testing.T) {
 		t.Error("stale TLS alarm reported after a reload that found the settings fixed")
 	}
 }
+
+// A listener replaced by a reload stops reporting the web configuration
+// state of its name, which its replacement reports now.
+func TestReloadRetiresReplacedListener(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	s.mu.Lock()
+	before := s.listeners["node"]
+	s.mu.Unlock()
+
+	writeWeb(t, dir, "web.yml", "rate_limit:\n  interval: 1ms\n  burst: 100\n")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.mu.Lock()
+	after := s.listeners["node"]
+	s.mu.Unlock()
+	if after == before {
+		t.Fatal("listener not restarted")
+	}
+	if !before.auth.retired.Load() || after.auth.retired.Load() {
+		t.Errorf("retired: replaced %v, serving %v; want true, false",
+			before.auth.retired.Load(), after.auth.retired.Load())
+	}
+}

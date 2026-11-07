@@ -159,12 +159,17 @@ func (t *tlsHealth) markFailing() {
 	t.gen++
 }
 
-// markHealthy records that the TLS settings load, without reporting it
-// (ReportTLSHealth only reports failures; a configuration load resets the
-// metric). Handshakes still running from before do not count.
-func (t *tlsHealth) markHealthy() {
+// markHealthySince records that the TLS settings loaded when checked at
+// generation gen, without reporting it (ReportTLSHealth only reports
+// failures; a configuration load resets the metric). A handshake failing
+// since keeps the failure: the file may have broken after the check.
+// Handshakes still running from before do not count.
+func (t *tlsHealth) markHealthySince(gen uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.gen != gen {
+		return
+	}
 	t.failing = false
 	t.gen++
 }
@@ -293,6 +298,11 @@ type authHandler struct {
 	pending  chan struct{}
 	// tlsHealth is set on TLS listeners.
 	tlsHealth *tlsHealth
+	// retired is set once the listener is replaced or stopped: requests
+	// and handshakes it still finishes no longer report the web
+	// configuration state, which belongs to the listener of the same name
+	// now serving.
+	retired atomic.Bool
 	// flights runs a single verification for identical credentials sent
 	// at the same time (several routes or scrapers starting together). The
 	// per-client limit is charged to the first of them only: the others
@@ -362,7 +372,9 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err = errUsersRemoved
 		}
 	}
-	h.rec.WebConfigRead(h.listener, false, err == nil)
+	if !h.retired.Load() {
+		h.rec.WebConfigRead(h.listener, false, err == nil)
+	}
 	if err == nil && h.tlsHealth != nil {
 		// While new TLS connections fail, check whether the settings load
 		// again and report it now (recover records it), rather than at the

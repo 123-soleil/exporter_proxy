@@ -703,3 +703,37 @@ func TestTLSHealthRecover(t *testing.T) {
 		t.Errorf("%d rechecks within a second, want 0 more", calls-before)
 	}
 }
+
+// A replaced listener finishing requests does not report the state of the
+// web configuration: it belongs to the listener of the same name serving
+// now.
+func TestRetiredListenerDoesNotReport(t *testing.T) {
+	h, _, rec, _, _ := newTestAuth(t, "{}\n", webRateLimit{})
+	h.retired.Store(true)
+	do(h, "", "")
+	if got := rec.reads(); len(got) != 0 {
+		t.Errorf("retired listener reported web configuration reads %v", got)
+	}
+}
+
+// A reload marking a kept listener healthy does not clear a handshake
+// failure that happened after its check: the file may have broken since.
+func TestMarkHealthySinceKeepsLaterFailure(t *testing.T) {
+	h := newTLSHealth(func() error { return nil }, func(bool) {})
+	gen := h.generation()
+	h.failed() // after the reload's check, before its commit
+	h.markHealthySince(gen)
+	h.mu.Lock()
+	failing := h.failing
+	h.mu.Unlock()
+	if !failing {
+		t.Error("failure after the reload's check cleared")
+	}
+	h.markHealthySince(h.generation())
+	h.mu.Lock()
+	failing = h.failing
+	h.mu.Unlock()
+	if failing {
+		t.Error("failure not cleared by a check after it")
+	}
+}

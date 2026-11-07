@@ -94,7 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body `web configuration unreadable` (was a bare `500`), and sets the new
   gauge `exporter_proxy_web_config_read_error{listener}` to 1 until the file
   is read successfully again; TLS connections refused for the same reason
-  set it too.
+  set it too. A listener replaced by a reload no longer updates it for its
+  replacement, and a reload no longer clears a TLS failure seen after its
+  own check.
 - Client certificate settings fail closed too: `client_auth_type`, the
   presence of a client CA and `client_allowed_sans` are fixed while a TLS
   listener runs; a web configuration that differs (a file cut before
