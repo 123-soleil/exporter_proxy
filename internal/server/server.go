@@ -174,6 +174,62 @@ func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
 	return nil
 }
 
+// tlsConfigFor builds the TLS configuration of a new connection from c with
+// exporter-toolkit, then applies exporter_proxy's rules: client certificate
+// settings fixed while the listener runs, a client CA pool with at least
+// one certificate (checked on the pool built from the single read of the
+// file, so a rewrite between two reads cannot slip through),
+// client_allowed_sans also on resumption, and a server certificate within
+// its validity dates (fail reports it, at handshake time).
+func (l *listener) tlsConfigFor(c *web.Config, fail func(error) error) (*tls.Config, error) {
+	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
+		return nil, err
+	}
+	cfg, err := web.ConfigToTLSConfig(&c.TLSConfig)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ClientCAs != nil && cfg.ClientCAs.Equal(x509.NewCertPool()) {
+		return nil, errors.New("the client CA contains no certificate: every client would be refused")
+	}
+	restrictSANsOnResumption(cfg, c.TLSConfig)
+	if getCert := cfg.GetCertificate; getCert != nil {
+		cfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, err := getCert(hello)
+			if err == nil {
+				err = checkCertDates(cert, time.Now())
+			}
+			if err != nil {
+				return nil, fail(err)
+			}
+			return cert, nil
+		}
+	}
+	return cfg, nil
+}
+
+// checkCertDates refuses a server certificate outside its validity dates:
+// clients would reject it, and the failure would look like theirs.
+func checkCertDates(cert *tls.Certificate, now time.Time) error {
+	leaf := cert.Leaf
+	if leaf == nil {
+		if len(cert.Certificate) == 0 {
+			return errors.New("no server certificate")
+		}
+		var err error
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return err
+		}
+	}
+	switch {
+	case now.After(leaf.NotAfter):
+		return fmt.Errorf("server certificate %q expired on %s", leaf.Subject, leaf.NotAfter.UTC().Format(time.RFC3339))
+	case now.Before(leaf.NotBefore):
+		return fmt.Errorf("server certificate %q is not valid before %s", leaf.Subject, leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
 // restrictSANsOnResumption also checks client_allowed_sans when a client
 // resumes a TLS session: exporter-toolkit checks them in
 // VerifyPeerCertificate, which crypto/tls skips on resumption.
@@ -386,7 +442,11 @@ func (s *Server) Reload(cfg *config.Config) error {
 			// Compared with what the listener enforces now, including what
 			// was seen while running (fail closed): a different file
 			// restarts the listener with it, if it does not weaken it.
-			if settingsOf(wc) == cur.running() {
+			// Users in the file are required by requests anyway (usersSeen
+			// is set by the first one): not a reason to restart.
+			running, next := cur.running(), settingsOf(wc)
+			running.basicAuth = running.basicAuth || next.basicAuth
+			if next == running {
 				swaps = append(swaps, swap{cur, sp})
 				kept[sp.name] = true
 				continue
@@ -602,41 +662,46 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
 	tlsCfg.NextProtos = nextProtos
-	health := newTLSHealth(func() error {
-		c, err := webconfig.Load(sp.webConfig)
+	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
+	var health *tlsHealth
+	// fail reports a failure of the server's TLS settings, and returns the
+	// error marked for serverErrorLog: the server, not the client, failed
+	// the handshake.
+	fail := func(err error) error {
+		health.failed()
+		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
+			"web_config_file", webConfig, "err", errfmt.OneLine(err))
+		return fmt.Errorf("%s: %w", serverTLSUnavailable, err)
+	}
+	health = newTLSHealth(func() error {
+		c, err := webconfig.LoadForRequest(webConfig)
 		if err != nil {
 			return err
 		}
-		if err := l.checkClientAuth(&c.TLSConfig); err != nil {
+		cfg, err := l.tlsConfigFor(c, fail)
+		if err != nil {
 			return err
 		}
-		_, err = web.ConfigToTLSConfig(&c.TLSConfig)
+		_, err = cfg.GetCertificate(&tls.ClientHelloInfo{})
 		return err
 	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
 	auth.tlsHealth = health
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
-	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-		c, err := webconfig.Load(webConfig)
-		if err == nil {
-			err = l.checkClientAuth(&c.TLSConfig)
+		// The client CA is checked on the pool built from a single read of
+		// it (tlsConfigFor), not read twice.
+		c, err := webconfig.LoadForRequest(webConfig)
+		if err != nil {
+			return nil, fail(err)
 		}
-		if err == nil {
-			var cfg *tls.Config
-			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
-				restrictSANsOnResumption(cfg, c.TLSConfig)
-				health.succeeded()
-				cfg.NextProtos = nextProtos
-				return cfg, nil
-			}
+		cfg, err := l.tlsConfigFor(c, fail)
+		if err != nil {
+			return nil, fail(err)
 		}
-		health.failed()
-		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
-			"web_config_file", webConfig, "err", errfmt.OneLine(err))
-		// The marker tells serverErrorLog that the server, not the client,
-		// failed the handshake.
-		return nil, fmt.Errorf("%s: %w", serverTLSUnavailable, err)
+		health.succeeded()
+		cfg.NextProtos = nextProtos
+		return cfg, nil
 	}
 	srv.TLSConfig = tlsCfg
 	return l, nil

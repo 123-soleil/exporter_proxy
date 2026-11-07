@@ -224,7 +224,7 @@ net/http errors clients can cause, never hides them.
 
 | `reason` | When | Response | Log |
 |----------|------|----------|-----|
-| `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
+| `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA, or a server certificate outside its validity dates) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
@@ -520,7 +520,8 @@ listeners:
   `warn` log line.
 - Listeners using `systemd:` and listeners binding `host:port` can be mixed.
 - The service unit must declare the socket units (`Sockets=` or
-  `Requires=`/`After=`); ready-to-use files will be provided in `deploy/`.
+  `Requires=`/`After=`); `deploy/` does not ship socket units, and its
+  service unit binds addresses itself.
 - See
   [systemd.socket(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html)
   for `FileDescriptorName=`.

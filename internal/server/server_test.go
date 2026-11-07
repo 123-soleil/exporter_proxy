@@ -1618,3 +1618,77 @@ type halfCloser struct {
 }
 
 func (h *halfCloser) CloseWrite() error { h.closed = true; return nil }
+
+// writeExpiredServerCert overwrites cert and key with a self-signed
+// certificate that expired an hour ago.
+func writeExpiredServerCert(t *testing.T, cert, key string) {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "expired"},
+		DNSNames:  []string{"localhost"},
+		NotBefore: time.Now().Add(-48 * time.Hour), NotAfter: time.Now().Add(-time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWeb(t, filepath.Dir(cert), filepath.Base(cert), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
+	writeWeb(t, filepath.Dir(key), filepath.Base(key), string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})))
+}
+
+// An expired server certificate is refused as a server-side failure: not
+// counted as client tls_handshake failures, shown by web_config_read_error.
+func TestExpiredServerCertificateIsServerSide(t *testing.T) {
+	m := newMTLSTest(t, "")
+	if err := tlsGet(m.client(t, false, false), m.url()); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeExpiredServerCert(t, m.cert, m.key)
+	before := len(m.rec.got())
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Fatal("served with an expired server certificate")
+	}
+	if got := m.rec.got(); len(got) != before {
+		t.Errorf("expired server certificate counted as client failures: %v", got)
+	}
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("expired server certificate not reported (ok=%v, any=%v)", ok, any)
+	}
+}
+
+// Users added to the file, even before any request saw them, do not make
+// a reload restart the listener (requests enforce them anyway).
+func TestReloadAfterUsersAddedKeepsListener(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	s.mu.Lock()
+	before := s.listeners["node"]
+	s.mu.Unlock()
+
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.mu.Lock()
+	after := s.listeners["node"]
+	s.mu.Unlock()
+	if after != before {
+		t.Error("listener restarted by a reload that only found new users")
+	}
+	if code, _ := get(t, "http://"+l.Listen+"/metrics", "", ""); code != http.StatusUnauthorized {
+		t.Errorf("users not enforced: code %d, want 401", code)
+	}
+}

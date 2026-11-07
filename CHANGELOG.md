@@ -125,6 +125,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; lowering authentication on purpose takes a restart. A web
   configuration caught half-written by a reload can no longer open a
   listener.
+- A server certificate outside its validity dates is refused at handshake
+  time as a server-side failure (`web_config_read_error`), instead of
+  being sent and counted as client `tls_handshake` failures. The client CA
+  pool is checked as read once per connection (no second read a rewrite
+  could slip between). A reload that only finds new users in a web
+  configuration keeps the listener instead of restarting it.
 - Sockets passed by systemd are closed and reported even when no listener
   uses `systemd:`; Unix socket connections keep net/http's graceful
   half-close.
