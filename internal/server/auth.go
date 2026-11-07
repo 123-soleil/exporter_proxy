@@ -13,6 +13,7 @@ import (
 	"time"
 
 	config_util "github.com/prometheus/common/config"
+	"github.com/prometheus/exporter-toolkit/web"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
@@ -80,8 +81,11 @@ const (
 // purpose takes a reload.
 var errTLSAdded = errors.New("tls_server_config is set, while this listener serves plain HTTP: reload to enable TLS")
 
+// removeAuthHint completes errUsersRemoved.
+const removeAuthHint = "fix the file, or restart the service to remove authentication"
+
 var errUsersRemoved = errors.New("basic_auth_users is missing or empty, while this listener requires basic authentication: " +
-	"fix the file, or reload to remove authentication")
+	removeAuthHint)
 
 // fakeHash is compared against when the user does not exist and no
 // configured hash gives a cost: bcrypt hash of "fakepassword" at cost 10,
@@ -114,6 +118,15 @@ func fakeHashFor(users map[string]config_util.Secret) []byte {
 	}
 	v, _ := fakeHashes.LoadOrStore(cost, h)
 	return v.([]byte)
+}
+
+// tlsHealth tracks whether new TLS connections of a listener fail on its
+// TLS settings.
+type tlsHealth struct {
+	failing atomic.Bool
+	// recheck loads the TLS settings of a web configuration like a new
+	// connection would.
+	recheck func(*web.Config) error
 }
 
 // logGate lowers log lines to debug level beyond logRate per listener.
@@ -179,6 +192,8 @@ type authHandler struct {
 	// waiting for it.
 	verifyMu sync.Mutex
 	pending  chan struct{}
+	// tlsHealth is set on TLS listeners.
+	tlsHealth *tlsHealth
 	// flights runs a single verification for identical credentials sent
 	// at the same time (several routes or scrapers starting together). The
 	// per-client limit is charged to the first of them only: the others
@@ -249,6 +264,13 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.rec.WebConfigRead(h.listener, false, err == nil)
+	if err == nil && h.tlsHealth != nil && h.tlsHealth.failing.Load() && h.tlsHealth.recheck(c) == nil {
+		// New TLS connections failed, and the settings load again: report
+		// it now rather than at the next handshake, which a scraper keeping
+		// its connection open may not make for a long time.
+		h.tlsHealth.failing.Store(false)
+		h.rec.WebConfigRead(h.listener, true, true)
+	}
 	if err != nil {
 		h.logger.Log(r.Context(), h.serverLogs.level(slog.LevelError), "cannot load web configuration",
 			"web_config_file", h.webConfig, "code", StatusWebConfigUnreadable, "err", errfmt.OneLine(err))
@@ -452,6 +474,9 @@ type serverErrorLog struct {
 	listener string
 	logger   *slog.Logger
 	rec      proxy.Recorder
+	// trustMarker: the listener is TCP, so the remote address before the
+	// error text is an IP address the client cannot shape.
+	trustMarker bool
 	// clientLogs gates client handshake failures and the net/http lines
 	// clients can cause, serverLogs accept errors and panics, which client
 	// noise must not hide.
@@ -468,9 +493,9 @@ func (l *serverErrorLog) Write(p []byte) (int, error) {
 		// A prefix match: the marker starts the error returned by
 		// GetConfigForClient, while client-chosen text (such as an ALPN
 		// protocol name) can only appear later in other errors.
-		// The remote must be an IP address: a Unix socket client chooses its
-		// own path, and could put the marker in it.
-		if _, ipErr := netip.ParseAddrPort(remote); ipErr == nil && strings.HasPrefix(detail, serverTLSUnavailable+": ") {
+		// Only on TCP listeners: a Unix socket client chooses its own path,
+		// shown as the remote address, and could put the marker in it.
+		if l.trustMarker && strings.HasPrefix(detail, serverTLSUnavailable+": ") {
 			// Already logged and shown by exporter_proxy_web_config_read_error:
 			// not a client failure.
 			l.logger.Debug("TLS handshake refused, server TLS settings unavailable",

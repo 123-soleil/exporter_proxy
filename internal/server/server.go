@@ -153,7 +153,8 @@ func settingsOf(wc *web.Config) listenerSettings {
 // listener started with: a file half-written or changed while running
 // never lets a client in under other rules. Changing them takes a reload.
 var errClientAuthChanged = errors.New("client certificate settings (client_auth_type, client CA, client_allowed_sans) " +
-	"differ from those the listener started with: fix the file, or reload to apply them")
+	"differ from those the listener started with: fix the file, or reload to apply them " +
+	"(restart the service if they are weaker)")
 
 // checkClientAuth refuses a web configuration whose client certificate
 // settings differ from those of the listener.
@@ -363,8 +364,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 	var swaps []swap
 	var started []*listener
-	type authLoss struct{ listener, what string }
-	var authRemoved []authLoss // listeners whose protection is weakened
+	var weakened []string // listeners whose protection the reload would lower
 	kept := map[string]bool{}
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
@@ -375,8 +375,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 				return fmt.Errorf("listener %q: %w", sp.name, err)
 			}
 			// Compared with what the listener enforces now, including what
-			// was seen while running (fail closed): a weaker file restarts
-			// the listener with it, instead of keeping the refusals.
+			// was seen while running (fail closed): a different file
+			// restarts the listener with it, if it does not weaken it.
 			if settingsOf(wc) == cur.running() {
 				swaps = append(swaps, swap{cur, sp})
 				kept[sp.name] = true
@@ -417,10 +417,18 @@ func (s *Server) Reload(cfg *config.Config) error {
 		}
 		if prev != nil {
 			if lost := prev.weakens(l.settings); len(lost) > 0 {
-				authRemoved = append(authRemoved, authLoss{sp.name, strings.Join(lost, " and ")})
+				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
 		}
 		started = append(started, l)
+	}
+	if len(weakened) > 0 {
+		// A web configuration caught empty or half-written must not lower
+		// authentication: a reload never does. Lowering it on purpose takes
+		// a restart.
+		s.abortReload(started)
+		return fmt.Errorf("the reload would weaken authentication (%s): fix the web configuration, "+
+			"or restart the service to apply it", strings.Join(weakened, "; "))
 	}
 
 	// Commit: nothing below can fail.
@@ -445,12 +453,6 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 	s.listeners = next
 	s.pruneSuccesses()
-	for _, a := range authRemoved {
-		// On purpose, or a web configuration file caught empty or
-		// half-written by this reload: say it loudly.
-		s.logger.Warn("authentication weakened by this reload: "+a.what+" removed or lowered",
-			"listener", a.listener)
-	}
 	return nil
 }
 
@@ -508,7 +510,13 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 
 	var problems []string
 	for _, sp := range specs {
-		if err := web.Validate(sp.webConfig); err != nil {
+		err := web.Validate(sp.webConfig)
+		if err == nil {
+			// exporter_proxy's own rules, checked for every file now so that
+			// all problems are reported at once.
+			_, err = webconfig.Load(sp.webConfig)
+		}
+		if err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
 				sp.name, sp.webConfig, errfmt.OneLine(err)))
 		}
@@ -565,7 +573,10 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		MaxHeaderBytes: maxHeaderBytes,
 		// TLS handshake failures are counted and logged as such.
 		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder(),
-			clientLogs: clientLogs, serverLogs: serverLogs}, "", 0),
+			clientLogs: clientLogs, serverLogs: serverLogs,
+			// Over a Unix socket, the client chooses its own address and
+			// could imitate the server-side marker.
+			trustMarker: ln.Addr().Network() == "tcp"}, "", 0),
 	}
 
 	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh}
@@ -585,6 +596,17 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
 	tlsCfg.NextProtos = nextProtos
+	// While new TLS connections fail, requests on connections already open
+	// check whether the TLS settings load again, so that the failure is not
+	// reported until the next handshake only.
+	health := &tlsHealth{recheck: func(c *web.Config) error {
+		if err := l.checkClientAuth(&c.TLSConfig); err != nil {
+			return err
+		}
+		_, err := web.ConfigToTLSConfig(&c.TLSConfig)
+		return err
+	}}
+	auth.tlsHealth = health
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
 	name, webConfig, logger, rec := sp.name, sp.webConfig, s.logger.With("listener", sp.name), s.recorder()
@@ -597,11 +619,13 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 			var cfg *tls.Config
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
 				restrictSANsOnResumption(cfg, c.TLSConfig)
+				health.failing.Store(false)
 				rec.WebConfigRead(name, true, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
+		health.failing.Store(true)
 		rec.WebConfigRead(name, true, false)
 		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
 			"web_config_file", webConfig, "err", errfmt.OneLine(err))

@@ -27,6 +27,7 @@ type authRecorder struct {
 	mu             sync.Mutex
 	reasons        []proxy.AuthReason
 	webConfigReads []bool
+	tlsReads       []bool
 }
 
 func (r *authRecorder) AuthFailed(_ string, reason proxy.AuthReason) {
@@ -35,10 +36,22 @@ func (r *authRecorder) AuthFailed(_ string, reason proxy.AuthReason) {
 	r.reasons = append(r.reasons, reason)
 }
 
-func (r *authRecorder) WebConfigRead(_ string, _, ok bool) {
+func (r *authRecorder) WebConfigRead(_ string, tls, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.webConfigReads = append(r.webConfigReads, ok)
+	if tls {
+		r.tlsReads = append(r.tlsReads, ok)
+	}
+}
+
+func (r *authRecorder) lastTLSRead() (ok, any bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.tlsReads) == 0 {
+		return false, false
+	}
+	return r.tlsReads[len(r.tlsReads)-1], true
 }
 
 func (r *authRecorder) reads() []bool {
@@ -455,7 +468,7 @@ func TestAuthHandlerFailsClosedWhenUsersDisappear(t *testing.T) {
 	if got := rec.reads(); slices.Contains(got, true) {
 		t.Errorf("reads recorded as successful: %v", got)
 	}
-	if !strings.Contains(logs.String(), "reload to remove authentication") {
+	if !strings.Contains(logs.String(), "restart the service to remove authentication") {
 		t.Errorf("cause not logged: %s", logs.String())
 	}
 }
@@ -509,7 +522,7 @@ func TestAuthHandlerLogsAreRateLimited(t *testing.T) {
 func TestServerErrorLogServerSideTLS(t *testing.T) {
 	rec := &authRecorder{}
 	logs := &syncBuffer{}
-	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
+	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(), trustMarker: true,
 		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 
 	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 192.0.2.1:5000: %s: open /etc/cert.pem: permission denied\n", serverTLSUnavailable)
@@ -608,7 +621,8 @@ func TestServerErrorLogMarkerAfterUnixPath(t *testing.T) {
 	rec := &authRecorder{}
 	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
 		logger: slog.New(slog.DiscardHandler)}
-	_, _ = fmt.Fprintf(l, "http: TLS handshake error from /tmp/x: %s: z: tls: bad certificate\n", serverTLSUnavailable)
+	// The client bound its socket to a path imitating "IP:port: marker".
+	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 1.2.3.4:5: %s: x: tls: bad certificate\n", serverTLSUnavailable)
 	if got := rec.got(); len(got) != 1 {
 		t.Errorf("handshake failure from a Unix socket path hidden: %v", got)
 	}

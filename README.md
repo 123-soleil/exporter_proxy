@@ -62,7 +62,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. |
-| Web configuration file of the listener unreadable or invalid, or without `basic_auth_users` while the listener started with basic authentication | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
+| Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
 `OPTIONS *` goes through authentication like any request (no automatic
@@ -342,8 +342,11 @@ Besides the standard `go_*`, `process_*` and
   could not read the file (answered `518`), or the last new TLS connection
   could not load the file, certificate, key or client CA (refused). Both
   are tracked apart, so requests on connections already open do not hide
-  a TLS failure. Back to 0 when both succeed again, and after a successful
-  reload; `listener="metrics"` for the metrics endpoint.
+  a TLS failure. Back to 0 when both succeed again: after a TLS failure,
+  requests on connections already open also check whether the TLS
+  settings load again, so the gauge does not wait for the next handshake.
+  Reset by a successful reload; `listener="metrics"` for the metrics
+  endpoint.
 
 Labels only take values from the configuration (listener names and route
 paths), from a fixed set (`reason`) or from HTTP status codes, never client
@@ -711,9 +714,14 @@ otherwise; warnings do not fail the check:
 - each web configuration file (listeners and `metrics`, checked once when
   shared) is valid for exporter-toolkit: strict YAML, valid bcrypt hashes,
   certificate and key readable and matching, client CA readable;
-- the certificates are within their validity dates: an expired or
-  not-yet-valid certificate is a problem, one expiring within 30 days is a
-  warning; the client CA file must contain at least one certificate;
+- the certificates (files or inline) are within their validity dates: an
+  expired or not-yet-valid server certificate is a problem, one expiring
+  within 30 days is a warning. A client CA bundle is judged as TLS uses it:
+  expired, not-yet-valid or unparseable certificates in it are warnings
+  (normal while rotating CAs), and it is a problem only if none is
+  currently valid;
+- the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
+  reload" and "Refused authentications") are checked too, like at startup;
 - basic authentication without TLS is a warning;
 - each `file` route: the file exists, is a regular file, is readable and is
   not older than `max_age` nor more than `max_age` in the future;
@@ -799,12 +807,14 @@ fails closed, never open:
 
 - a listener started with `basic_auth_users`, or whose file gained users
   while running, answers `518` if the file loses all its users (emptied or
-  truncated while being rewritten);
+  truncated while being rewritten), until the file is fixed or a restart
+  removes authentication;
 - the client certificate settings of a TLS listener (`client_auth_type`,
   whether a client CA is configured, `client_allowed_sans`) are fixed while
   it runs: if its file differs, tighter or looser (for example a file cut
-  before `client_auth_type`), new connections are refused until a reload
-  (counted in `exporter_proxy_web_config_read_error`, not as client
+  before `client_auth_type`), new connections are refused until the file
+  is fixed, or until a reload applies tighter settings or a restart looser
+  ones (counted in `exporter_proxy_web_config_read_error`, not as client
   failures). Only the content of the client CA, like the server
   certificate and key, can change without reload, for rotation.
 
@@ -831,18 +841,24 @@ without a certificate is refused.
 
 A reload applies changed client certificate settings or client CA content
 by restarting the listener on its socket, which closes the connections
-accepted under the previous ones. A reload that weakens a protection
-(basic authentication removed, a certificate no longer required or no
-longer verified, client CA or `client_allowed_sans` removed, TLS lost)
-logs a warning (`msg="authentication weakened by this reload: ..."`),
-also for the previous listener of a port when listeners are renamed or
-swap addresses. Check it, since a reload catching a half-written file
-would do the same.
-After changing these settings on purpose, reload (the listener is then restarted on its socket, even if its
-`web_config_file` path is the same) or restart. Until then, the listener
-keeps its previous settings; in particular, removing `tls_server_config`
-from a running TLS listener's file makes new TLS handshakes fail until the
-reload, and adding it to the file of a plain HTTP listener makes its
+accepted under the previous ones.
+
+**A reload never weakens authentication.** A reload that would remove or
+lower a protection (basic authentication removed, a client certificate no
+longer required or no longer verified, client CA or `client_allowed_sans`
+removed, TLS lost), including for the previous listener of a port when
+listeners are renamed or swap addresses, is refused as a whole: the error
+names the listeners, the running configuration is kept and
+`exporter_proxy_config_last_reload_successful` is set to 0. A web
+configuration caught empty or half-written therefore never lowers
+authentication. To lower it on purpose, restart the service (`systemctl
+restart exporter_proxy`); with systemd socket activation, the sockets stay
+open during the restart.
+
+After changing these settings to strengthen them, reload (the listener is
+then restarted on its socket, even if its `web_config_file` path is the
+same) or restart. Until then, the listener keeps its previous settings;
+adding `tls_server_config` to the file of a plain HTTP listener makes its
 requests get `518` until the reload, instead of serving in clear text. Replace these files atomically
 (write a temporary file, then rename it) so that a half-written file is
 never read.

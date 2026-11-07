@@ -99,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presence of a client CA and `client_allowed_sans` are fixed while a TLS
   listener runs; a web configuration that differs (a file cut before
   `client_auth_type` let clients in without a certificate) refuses new
-  connections until a reload. The client CA content can still be rotated
+  connections until a reload (tighter settings) or a restart (looser). The client CA content can still be rotated
   without reload. A reload that changes these settings or the client CA
   content restarts the listener, closing connections opened under the
   previous settings.
@@ -115,22 +115,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plain HTTP listener whose web configuration enables TLS answers `518`
   until a reload, instead of serving in clear text.
 - `OPTIONS *` goes through authentication instead of net/http's automatic
-  empty `200`; HTTP/2 handler panics use the server log budget; a Unix
-  socket client cannot hide its handshake failures behind the server-side
-  marker.
+  empty `200`; HTTP/2 handler panics use the server log budget; the
+  server-side handshake marker is only trusted on TCP listeners, where a
+  client cannot shape the remote address (on a Unix socket, it chooses its
+  own path).
+- A reload never weakens authentication: one that would remove basic
+  authentication, lower client certificate requirements or lose TLS (also
+  through renamed or swapped listeners) is refused, keeping the running
+  configuration; lowering authentication on purpose takes a restart. A web
+  configuration caught half-written by a reload can no longer open a
+  listener.
+- `web_config_read_error` returns to 0 when TLS settings load again, also
+  through requests on connections already open, without waiting for a new
+  handshake.
+- `--check` judges client CA bundles like TLS does (expired or unparseable
+  certificates are warnings while one is valid, normal while rotating CAs)
+  and checks the dates of inline certificates; startup and reload report
+  every web configuration breaking exporter_proxy's rules at once.
+- The client CA check of `Load` is cached until the file changes, instead
+  of parsing the bundle on every request.
 - `client_allowed_sans` requires a verifying `client_auth_type` (with an
   unverified certificate, names could be forged) and cannot be empty; it is
   also checked on TLS session resumption, and a client without a
   certificate is refused (exporter-toolkit panicked).
-- The reload warning covers basic authentication, client certificate
-  requirements and TLS, and compares with the previous listener of the
-  same address (renamed or swapped listeners).
 - Basic authentication fails closed: a listener started with
   `basic_auth_users`, or whose file gained users while running, answers
   `518` if its web configuration loses its users
   (emptied or truncated file) instead of serving without authentication;
-  removing authentication takes a reload, which restarts the listener and
-  logs a warning.
+  removing authentication takes a restart (a reload that would remove it
+  is refused).
 - Malformed bcrypt hashes in a web configuration changed while running make
   it invalid (`518`), like at startup.
 - Handshakes refused because of the server's own TLS settings are no longer

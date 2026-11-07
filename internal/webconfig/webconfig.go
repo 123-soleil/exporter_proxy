@@ -7,6 +7,7 @@
 package webconfig
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
+	"time"
 
 	"github.com/prometheus/exporter-toolkit/web"
 	"go.yaml.in/yaml/v2"
@@ -99,7 +102,10 @@ type Summary struct {
 	CertFile     string
 	KeyFile      string
 	ClientCAFile string
-	HasUsers     bool
+	// CertPEM and ClientCAPEM are the inline certificates (cert, client_ca).
+	CertPEM     string
+	ClientCAPEM string
+	HasUsers    bool
 }
 
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
@@ -116,6 +122,8 @@ func Read(path string) (Summary, error) {
 		CertFile:     c.TLSConfig.TLSCertPath,
 		KeyFile:      c.TLSConfig.TLSKeyPath,
 		ClientCAFile: c.TLSConfig.ClientCAs,
+		CertPEM:      c.TLSConfig.TLSCert,
+		ClientCAPEM:  c.TLSConfig.ClientCAsText,
 		HasUsers:     len(c.Users) > 0,
 	}, nil
 }
@@ -175,18 +183,67 @@ func validateClientCA(tc *web.TLSConfig) error {
 	case !hasCA:
 		return nil
 	}
-	pemData := []byte(tc.ClientCAsText)
+	return checkClientCAContent(tc)
+}
+
+// caCheckKey identifies a client CA content whose check is cached: a file
+// by path, size and modification time, or an inline text by its hash.
+type caCheckKey struct {
+	path    string
+	size    int64
+	modTime time.Time
+	inline  [sha256.Size]byte
+}
+
+// caChecks caches client CA checks: Load runs on every request, and
+// parsing a large bundle each time would cost milliseconds. The CA itself
+// is still loaded on every new TLS connection.
+var caChecks = struct {
+	sync.Mutex
+	m map[caCheckKey]error
+}{m: map[caCheckKey]error{}}
+
+// maxCACheckEntries bounds the cache (a few CA files per process).
+const maxCACheckEntries = 64
+
+// checkClientCAContent rejects a client CA without any certificate, which
+// would refuse every client.
+func checkClientCAContent(tc *web.TLSConfig) error {
+	var key caCheckKey
 	if tc.ClientCAs != "" {
-		data, err := os.ReadFile(tc.ClientCAs)
+		info, err := os.Stat(tc.ClientCAs)
 		if err != nil {
 			return fmt.Errorf("client_ca_file: %w", err)
+		}
+		key = caCheckKey{path: tc.ClientCAs, size: info.Size(), modTime: info.ModTime()}
+	} else {
+		key = caCheckKey{inline: sha256.Sum256([]byte(tc.ClientCAsText))}
+	}
+	caChecks.Lock()
+	err, ok := caChecks.m[key]
+	caChecks.Unlock()
+	if ok {
+		return err
+	}
+
+	pemData := []byte(tc.ClientCAsText)
+	if tc.ClientCAs != "" {
+		data, readErr := os.ReadFile(tc.ClientCAs)
+		if readErr != nil {
+			return fmt.Errorf("client_ca_file: %w", readErr) // not cached: may be transient
 		}
 		pemData = data
 	}
 	if !x509.NewCertPool().AppendCertsFromPEM(pemData) {
-		return errors.New("the client CA contains no certificate: every client would be refused")
+		err = errors.New("the client CA contains no certificate: every client would be refused")
 	}
-	return nil
+	caChecks.Lock()
+	if len(caChecks.m) >= maxCACheckEntries {
+		clear(caChecks.m)
+	}
+	caChecks.m[key] = err
+	caChecks.Unlock()
+	return err
 }
 
 // http2RequiredCiphers are the cipher suites net/http requires for HTTP/2

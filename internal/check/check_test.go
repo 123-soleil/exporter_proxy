@@ -128,6 +128,24 @@ func TestWebConfigs(t *testing.T) {
 	soonCert, soonKey := writeCert(t, dir, "soon", now.Add(-day), now.Add(10*day))
 	futureCert, futureKey := writeCert(t, dir, "future", now.Add(day), now.Add(365*day))
 	goodCA, _ := writeCert(t, dir, "ca", now.Add(-day), now.Add(365*day))
+	// A rotation bundle: the old, expired CA and the new one.
+	rotating := filepath.Join(dir, "rotating-ca.crt")
+	expiredPEM, err := os.ReadFile(expiredCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodCAPEM, err := os.ReadFile(goodCA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, rotating, string(expiredPEM)+string(goodCAPEM))
+	// An expired certificate written inline.
+	expiredKeyPEM, err := os.ReadFile(expiredKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inlineExpired := filepath.Join(dir, "inline-expired.yml")
+	writeFile(t, inlineExpired, "tls_server_config:\n  cert: |\n"+indent(string(expiredPEM))+"  key: |\n"+indent(string(expiredKeyPEM)))
 	emptyCA := filepath.Join(dir, "empty-ca.crt")
 	writeFile(t, emptyCA, "not a certificate\n")
 	basicOnly := filepath.Join(dir, "basic.yml")
@@ -148,7 +166,11 @@ func TestWebConfigs(t *testing.T) {
 		{"certificate not valid yet", tlsWebConfig(t, dir, futureCert, futureKey, ""),
 			[]want{{Problem, "is not valid before"}}},
 		{"expired client CA", tlsWebConfig(t, dir, goodCert, goodKey, expiredCert),
-			[]want{{Problem, "client_ca_file"}}},
+			[]want{{Warning, "expired on"}, {Problem, "no currently valid certificate"}}},
+		{"client CA bundle rotating", tlsWebConfig(t, dir, goodCert, goodKey, rotating),
+			[]want{{Warning, "expired on"}}},
+		{"expired inline certificate", inlineExpired,
+			[]want{{Problem, "cert (inline)"}}},
 		{"client CA without certificate", tlsWebConfig(t, dir, goodCert, goodKey, emptyCA),
 			[]want{{Problem, "contains no certificate"}}},
 		{"key does not match certificate", tlsWebConfig(t, dir, goodCert, expiredKey, ""),
@@ -290,5 +312,17 @@ func TestCertificatesLeafOnly(t *testing.T) {
 	// A bundle reports every certificate.
 	c = &checker{now: now}
 	c.certificates("here", "client_ca_file", brokenLeaf, true)
-	expect(t, c.findings, want{Problem, "certificate 1"}, want{Problem, "expired on"})
+	expect(t, c.findings, want{Warning, "certificate 1"}, want{Warning, "expired on"},
+		want{Problem, "no currently valid certificate"})
+}
+
+// indent indents every line of s for a YAML block scalar.
+func indent(s string) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(s, "\n") {
+		if line != "" {
+			b.WriteString("    " + line)
+		}
+	}
+	return b.String()
 }

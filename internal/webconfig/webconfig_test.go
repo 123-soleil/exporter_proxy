@@ -27,7 +27,7 @@ func TestRead(t *testing.T) {
 			Summary{TLSEnabled: true, CertFile: "DIR/tls/c.crt", KeyFile: "/etc/k.key", HasUsers: true},
 			false,
 		},
-		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{TLSEnabled: true, HasUsers: true}, false},
+		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{TLSEnabled: true, CertPEM: "x", HasUsers: true}, false},
 		{
 			"mTLS only",
 			"tls_server_config:\n  client_ca_file: ca.crt\n  client_auth_type: RequireAndVerifyClientCert\n",
@@ -253,5 +253,27 @@ func TestLoadRejectsHTTP2WithoutRequiredCipher(t *testing.T) {
 				t.Errorf("Load error = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The client CA check is cached until the file changes.
+func TestClientCACheckCachedUntilChange(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	writeTestCA(t, ca)
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: ca.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid CA: %v", err)
+	}
+	// A changed file (other size or modification time) is checked again.
+	if err := os.WriteFile(ca, []byte("no certificate any more\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "contains no certificate") {
+		t.Errorf("changed CA file not checked again: %v", err)
 	}
 }

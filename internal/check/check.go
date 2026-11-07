@@ -96,30 +96,50 @@ func (c *checker) webConfig(where, path string) {
 	if wc.BasicAuthWithoutTLS() {
 		c.add(Warning, where, "basic authentication without TLS: credentials travel in clear text")
 	}
-	if wc.CertFile != "" {
+	switch {
+	case wc.CertFile != "":
 		c.certificates(where, "cert_file", wc.CertFile, false)
+	case wc.CertPEM != "":
+		c.certificatesPEM(where, "cert (inline)", []byte(wc.CertPEM), false)
 	}
-	if wc.ClientCAFile != "" {
+	switch {
+	case wc.ClientCAFile != "":
 		c.certificates(where, "client_ca_file", wc.ClientCAFile, true)
+	case wc.ClientCAPEM != "":
+		c.certificatesPEM(where, "client_ca (inline)", []byte(wc.ClientCAPEM), true)
 	}
 }
 
 // certificates checks the validity dates of the certificates in a PEM file.
-// For a client CA bundle, the file must contain at least one certificate.
 func (c *checker) certificates(where, key, path string, bundle bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		c.add(Problem, where, "%s: %v", key, err)
 		return
 	}
-	count := 0
+	c.certificatesPEM(where, key+" "+path, data, bundle)
+}
+
+// certificatesPEM checks the validity dates of PEM certificates.
+//
+// For a server certificate, only the first one (the leaf) matters, and any
+// problem with it is a problem. A client CA bundle is judged like crypto/tls
+// uses it: certificates it cannot use (unparseable, expired, not valid yet)
+// are only warnings, normal while rotating CAs, as long as one certificate
+// is currently valid.
+func (c *checker) certificatesPEM(where, label string, data []byte, bundle bool) {
+	issue := Problem
+	if bundle {
+		issue = Warning
+	}
+	count, valid := 0, 0
 	for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			c.add(Problem, where, "%s %s: certificate %d: %v", key, path, count+1, err)
+			c.add(issue, where, "%s: certificate %d: %v", label, count+1, err)
 			if !bundle {
 				return // the leaf certificate is unusable: the next ones are not leaves
 			}
@@ -129,18 +149,21 @@ func (c *checker) certificates(where, key, path string, bundle bool) {
 		subject := cert.Subject.String()
 		switch {
 		case c.now.After(cert.NotAfter):
-			c.add(Problem, where, "%s %s: certificate %q expired on %s", key, path, subject, cert.NotAfter.UTC().Format(time.RFC3339))
+			c.add(issue, where, "%s: certificate %q expired on %s", label, subject, cert.NotAfter.UTC().Format(time.RFC3339))
 		case c.now.Before(cert.NotBefore):
-			c.add(Problem, where, "%s %s: certificate %q is not valid before %s", key, path, subject, cert.NotBefore.UTC().Format(time.RFC3339))
-		case cert.NotAfter.Sub(c.now) < expiryWarning:
-			c.add(Warning, where, "%s %s: certificate %q expires on %s", key, path, subject, cert.NotAfter.UTC().Format(time.RFC3339))
+			c.add(issue, where, "%s: certificate %q is not valid before %s", label, subject, cert.NotBefore.UTC().Format(time.RFC3339))
+		default:
+			valid++
+			if cert.NotAfter.Sub(c.now) < expiryWarning {
+				c.add(Warning, where, "%s: certificate %q expires on %s", label, subject, cert.NotAfter.UTC().Format(time.RFC3339))
+			}
 		}
 		if !bundle {
 			return // only the leaf certificate matters for cert_file
 		}
 	}
-	if bundle && count == 0 {
-		c.add(Problem, where, "%s %s: no certificate found", key, path)
+	if bundle && valid == 0 {
+		c.add(Problem, where, "%s: no currently valid certificate", label)
 	}
 }
 
