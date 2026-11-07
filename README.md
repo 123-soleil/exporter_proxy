@@ -549,7 +549,8 @@ basic_auth_users:
 ```
 
 Web configuration files contain private key paths and password hashes: keep
-them owned by the service user with mode `0600`.
+them owned by `root`, group `exporter_proxy`, with mode `0640`, so that the
+service can read but not modify them (like the files in `deploy/config/`).
 
 ## Installation
 
@@ -727,7 +728,9 @@ otherwise; warnings do not fail the check:
   within 30 days is a warning. A client CA bundle is judged as TLS uses it:
   expired, not-yet-valid or unparseable certificates in it are warnings
   (normal while rotating CAs), and it is a problem only if none is
-  currently valid;
+  currently valid. This date check is stricter than startup, reload and
+  runtime, which accept a bundle of only expired CAs (every client would
+  then be refused): run `--check` after changing certificates;
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
 - basic authentication without TLS is a warning;
@@ -888,7 +891,7 @@ scrape_configs:
     # Optional. exporter_proxy reads this timeout from the request header
     # and answers before it expires; keep the route timeout (default 10s)
     # at or above it so that the scraper's timeout is the one that applies.
-    scrape_timeout: 15s
+    scrape_timeout: 10s
     tls_config:
       ca_file: /etc/prometheus/tls/exporter_proxy-ca.crt
       cert_file: /etc/prometheus/tls/scraper.crt

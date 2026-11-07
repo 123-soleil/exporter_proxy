@@ -715,6 +715,15 @@ type unixClientConn struct{ net.Conn }
 
 func (unixClientConn) RemoteAddr() net.Addr { return unixRemote{} }
 
+// CloseWrite keeps net/http's graceful half-close before closing a
+// connection, which the wrapper would otherwise hide.
+func (c unixClientConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 type unixRemote struct{}
 
 func (unixRemote) Network() string { return "unix" }
@@ -807,12 +816,14 @@ func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Liste
 			wanted[name] = sp.name
 		}
 	}
-	if len(wanted) == 0 {
-		return nil, nil
-	}
-
+	// Called even when no listener uses systemd: sockets passed anyway are
+	// closed and reported below.
 	passed, err := systemdListeners()
 	if err != nil {
+		if len(wanted) == 0 {
+			logger.Warn("cannot read the sockets passed by systemd", "err", err)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("systemd socket activation: %w", err)
 	}
 	sockets := make(map[string]net.Listener, len(wanted))
@@ -847,7 +858,8 @@ func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Liste
 	}
 	for name, listener := range wanted {
 		if _, ok := passed[name]; !ok {
-			problems = append(problems, fmt.Sprintf("listener %q: no systemd socket named %q (FileDescriptorName=)", listener, name))
+			problems = append(problems, fmt.Sprintf("listener %q: no systemd socket named %q (FileDescriptorName=; "+
+				"a UDP socket, ListenDatagram=, is not passed as a listener)", listener, name))
 		}
 	}
 	if len(problems) > 0 {

@@ -1582,3 +1582,39 @@ func TestQuotedSANsUnambiguous(t *testing.T) {
 		t.Error("unset list not empty")
 	}
 }
+
+// Sockets passed by systemd are closed and reported even when no listener
+// uses systemd.
+func TestUnusedSystemdSocketsClosedWithoutSystemdListeners(t *testing.T) {
+	ln := tcpListener(t)
+	fakeSystemd(t, map[string][]net.Listener{"leftover": {ln}})
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	logs := &syncBuffer{}
+	startServer(t, &config.Config{Listeners: []config.Listener{withAddr(t, listenerConfig("node", web, "http://127.0.0.1:1"))}}, logs)
+	if !isClosed(ln) {
+		t.Error("unused systemd socket left open")
+	}
+	if !strings.Contains(logs.String(), "systemd socket not used by any listener") {
+		t.Errorf("unused systemd socket not reported: %s", logs.String())
+	}
+}
+
+// The Unix client connection wrapper keeps the graceful half-close.
+func TestUnixClientConnCloseWrite(t *testing.T) {
+	var c net.Conn = unixClientConn{&halfCloser{}}
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("CloseWrite hidden by the wrapper")
+	}
+	_ = cw.CloseWrite()
+	if !c.(unixClientConn).Conn.(*halfCloser).closed {
+		t.Error("CloseWrite not forwarded")
+	}
+}
+
+type halfCloser struct {
+	net.Conn
+	closed bool
+}
+
+func (h *halfCloser) CloseWrite() error { h.closed = true; return nil }
