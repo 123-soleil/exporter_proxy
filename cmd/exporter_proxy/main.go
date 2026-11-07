@@ -132,6 +132,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		logger.Error("cannot start listeners", "err", err)
 		return exitError
 	}
+	// After the metrics were initialized: listeners whose TLS settings
+	// fail from the start show it at once.
+	srv.ReportTLSHealth()
 
 	code := exitOK
 loop:
@@ -177,6 +180,7 @@ func reload(path string, running *config.Config, srv *server.Server, m *metrics.
 		return nil
 	}
 	m.ConfigLoaded(cfg, time.Now())
+	srv.ReportTLSHealth() // after the metrics reset
 	logger.Info("configuration reloaded", "path", path, "hash", cfg.HashString(),
 		"changed", cfg.Hash != running.Hash, "listeners", len(cfg.Listeners))
 	return cfg

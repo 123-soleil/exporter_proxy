@@ -548,6 +548,19 @@ func (s *Server) Reload(cfg *config.Config) error {
 	return nil
 }
 
+// ReportTLSHealth reports again the TLS listeners whose settings fail, after
+// the metrics were reset by a configuration load (startup or reload), so
+// that the failure shows from the start instead of at the next handshake.
+func (s *Server) ReportTLSHealth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.listeners {
+		if l.auth.tlsHealth != nil {
+			l.auth.tlsHealth.reportFailing()
+		}
+	}
+}
+
 // abortReload closes the listeners started by a failed reload and forgets
 // what it prepared for them. Called with s.mu held.
 func (s *Server) abortReload(started []*listener) {
@@ -719,9 +732,11 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
 	auth.tlsHealth = health
 	if _, err := l.tlsConfigFor(wc); err != nil {
-		// Logged by prepare (a certificate outside its dates): reported
-		// from the start, not only at the first handshake.
-		health.failed()
+		// Logged by prepare (a certificate outside its dates). Reported by
+		// ReportTLSHealth once the start or reload is applied, not now: an
+		// aborted reload must not raise an alarm for a listener that keeps
+		// running.
+		health.markFailing()
 	}
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.

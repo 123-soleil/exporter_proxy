@@ -149,6 +149,25 @@ func (t *tlsHealth) failed() {
 	t.report(false)
 }
 
+// markFailing records a failure without reporting it: the listener is not
+// serving yet (its start or reload may still be aborted). ReportTLSHealth
+// reports it once applied.
+func (t *tlsHealth) markFailing() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = true
+	t.gen++
+}
+
+// reportFailing reports the failure again, if any.
+func (t *tlsHealth) reportFailing() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failing {
+		t.report(false)
+	}
+}
+
 // generation returns the count of failed handshakes, to pass to
 // succeededSince.
 func (t *tlsHealth) generation() uint64 {

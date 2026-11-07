@@ -131,9 +131,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included, the certificate being checked and pinned per connection) as a
   server-side failure (`web_config_read_error`), instead of being sent and
   counted as client `tls_handshake` failures; found at startup or reload,
-  it is logged, reported in `web_config_read_error` from the start and
-  again after a reload resetting the metrics, and only stops that
-  listener's TLS connections. `min_version` above `max_version` is
+  it is logged, reported in `web_config_read_error` once the startup or
+  reload is applied (an aborted reload raises no alarm), and only stops
+  that listener's TLS connections. `min_version` above `max_version` is
   invalid. A file whose ciphers cannot carry the HTTP/2
   the listener offers is refused at runtime too. Users found by a reload that
   keeps a listener are required from then on (fail closed). The client CA

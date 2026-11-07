@@ -1867,3 +1867,43 @@ func TestTLSFailureReportedAgainAfterReload(t *testing.T) {
 		t.Error("TLS failure not reported again after the reset")
 	}
 }
+
+// An aborted reload raises no TLS alarm for a listener that keeps running;
+// a successful one reports its failing listeners through ReportTLSHealth.
+func TestTLSFailureReportedOnlyOnceApplied(t *testing.T) {
+	m := newMTLSTest(t, "")
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	writeExpiredServerCert(t, cert, key)
+	expired := writeWeb(t, dir, "expired.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+
+	// A second listener with basic authentication.
+	auth := filepath.Join(dir, "auth.yml")
+	basicAuthWebConfig(t, auth, "prometheus", "s3cret-test")
+	other := withAddr(t, listenerConfig("other", auth, "http://127.0.0.1:1"))
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{m.l, other}}); err != nil {
+		t.Fatalf("adding a listener: %v", err)
+	}
+	other.Listen = m.s.Addr("other").String()
+
+	// Aborted after the listeners are prepared: "other" would lose its
+	// authentication, while "node" moves to the expired certificate.
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+	moved := m.l
+	moved.WebConfigFile = expired
+	weakened := other
+	weakened.WebConfigFile = plain
+	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{moved, weakened}}), "basic authentication")
+	if ok, any := m.rec.lastTLSRead(); any && !ok {
+		t.Error("aborted reload raised a TLS alarm for the running listener")
+	}
+
+	// Applied: the listener restarts on the expired certificate.
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{moved, other}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	m.s.ReportTLSHealth()
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("failing listener not reported after the reload (ok=%v, any=%v)", ok, any)
+	}
+}
