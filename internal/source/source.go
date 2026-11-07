@@ -92,6 +92,16 @@ func New(r config.Route) (Source, error) {
 	}
 }
 
+// timeLimit describes the limit that applies to a read started at start
+// (wall clock, as context deadlines): the route timeout, or the time left
+// by the scraper's timeout when the caller's context ends earlier.
+func timeLimit(parent context.Context, start time.Time, timeout time.Duration) string {
+	if d, ok := parent.Deadline(); ok && d.Before(start.Add(timeout)) {
+		return fmt.Sprintf("%s (left by the scraper's timeout, route timeout %s)", d.Sub(start).Round(time.Millisecond), timeout)
+	}
+	return fmt.Sprintf("%s (route timeout)", timeout)
+}
+
 // readLimited reads at most limit bytes from r and fails with
 // ReasonTooLarge if there is more, without reading the rest.
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
@@ -111,13 +121,14 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 
 // classify converts a deadline error to ReasonTimeout, other errors to
 // ReasonUnavailable, and keeps *Error values unchanged.
-func classify(ctx context.Context, err error, timeout time.Duration) error {
+// limit describes the time limit (see timeLimit) for timeout messages.
+func classify(ctx context.Context, err error, limit string) error {
 	var se *Error
 	if errors.As(err, &se) {
 		return err
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return newError(ReasonTimeout, "no complete answer within %s: %w", timeout, err)
+		return newError(ReasonTimeout, "no complete answer within %s: %w", limit, err)
 	}
 	return &Error{Reason: ReasonUnavailable, Err: err}
 }

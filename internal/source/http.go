@@ -66,8 +66,9 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 // CloseIdleConnections closes the idle connections to the upstream.
 func (s *httpSource) CloseIdleConnections() { s.client.CloseIdleConnections() }
 
-func (s *httpSource) Fetch(ctx context.Context) (*Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
+	limit := timeLimit(parent, time.Now(), s.timeout)
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
@@ -81,7 +82,7 @@ func (s *httpSource) Fetch(ctx context.Context) (*Result, error) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, classify(ctx, err, s.timeout)
+		return nil, classify(ctx, err, limit)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -97,7 +98,7 @@ func (s *httpSource) Fetch(ctx context.Context) (*Result, error) {
 
 	body, err := readLimited(resp.Body, s.maxBodyBytes)
 	if err != nil {
-		return nil, classify(ctx, fmt.Errorf("read upstream body: %w", err), s.timeout)
+		return nil, classify(ctx, fmt.Errorf("read upstream body: %w", err), limit)
 	}
 	return &Result{Body: body}, nil
 }

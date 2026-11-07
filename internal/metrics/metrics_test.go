@@ -51,7 +51,7 @@ func TestConfigLoaded(t *testing.T) {
 		t.Errorf("requests_in_flight series = %d, want 1", got)
 	}
 
-	m.ConfigLoadFailed()
+	m.ReloadFailed(testConfig())
 	if got := testutil.ToFloat64(m.reloadSuccessful); got != 0 {
 		t.Errorf("after failure, config_last_reload_successful = %v, want 0", got)
 	}
@@ -72,7 +72,8 @@ func TestRecorder(t *testing.T) {
 	m.SourceRead("node", "/metrics", 4096)
 	modTime := time.Unix(1_800_000_000, 500_000_000)
 	m.FileModified("node", "/batch", modTime)
-	m.ContentParsed("node", "/metrics", 1200, 5*time.Millisecond)
+	m.ContentParsed("node", "/metrics", 1200, 5*time.Millisecond, true)
+	m.ContentParsed("node", "/metrics", 0, time.Millisecond, false) // invalid: no samples observation
 	m.SourceFailed("node", "/metrics", source.ReasonTimeout)
 
 	checks := []struct {
@@ -265,17 +266,92 @@ func TestWebConfigReadError(t *testing.T) {
 		t.Errorf("web_config_read_error series = %d, want 2", n)
 	}
 
-	m.WebConfigRead("node", false)
-	if got := testutil.ToFloat64(m.webConfigError.WithLabelValues("node")); got != 1 {
+	gauge := func() float64 { return testutil.ToFloat64(m.webConfigError.WithLabelValues("node")) }
+	m.WebConfigRead("node", false, false)
+	if got := gauge(); got != 1 {
 		t.Errorf("after a failed read = %v, want 1", got)
 	}
-	m.WebConfigRead("node", true)
-	if got := testutil.ToFloat64(m.webConfigError.WithLabelValues("node")); got != 0 {
+	m.WebConfigRead("node", false, true)
+	if got := gauge(); got != 0 {
 		t.Errorf("after a successful read = %v, want 0", got)
 	}
 
-	m.WebConfigRead("unknown", false) // not configured: not recorded
+	// A TLS failure is not hidden by requests on open connections.
+	m.WebConfigRead("node", true, false)
+	m.WebConfigRead("node", false, true)
+	if got := gauge(); got != 1 {
+		t.Errorf("TLS failure hidden by a request read: %v, want 1", got)
+	}
+	m.WebConfigRead("node", true, true)
+	if got := gauge(); got != 0 {
+		t.Errorf("after a TLS connection succeeded = %v, want 0", got)
+	}
+
+	// A successful reload starts over.
+	m.WebConfigRead("node", true, false)
+	m.ConfigLoaded(testConfig(), time.Now())
+	if got := gauge(); got != 0 {
+		t.Errorf("after a reload = %v, want 0", got)
+	}
+
+	m.WebConfigRead("unknown", false, false) // not configured: not recorded
 	if n := testutil.CollectAndCount(m.webConfigError); n != 2 {
 		t.Errorf("series for an unconfigured listener created (%d series)", n)
+	}
+}
+
+// Events of a listener added by a reload are recorded as soon as it serves,
+// before ConfigLoaded; a failed reload goes back to the running set.
+func TestPrepareReload(t *testing.T) {
+	m := New()
+	running := testConfig()
+	m.ConfigLoaded(running, time.Now())
+	next := testConfig()
+	next.Listeners = append(next.Listeners, config.Listener{Name: "new", Routes: []config.Route{{Path: "/m"}}})
+
+	m.PrepareReload(next)
+	m.RequestServed("new", "/m", 200, time.Millisecond) // new listener already serving
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("new", "/m", "200")); got != 1 {
+		t.Errorf("event of the new listener lost: %v", got)
+	}
+	m.ConfigLoaded(next, time.Now())
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("new", "/m", "200")); got != 1 {
+		t.Errorf("series reset by ConfigLoaded: %v", got)
+	}
+
+	// Failed reload: the listener that was about to be added is unknown again.
+	failing := testConfig()
+	failing.Listeners = append(failing.Listeners, config.Listener{Name: "other", Routes: []config.Route{{Path: "/m"}}})
+	m.PrepareReload(failing)
+	m.ReloadFailed(next)
+	m.RequestServed("other", "/m", 200, time.Millisecond)
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		for _, metric := range f.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "listener" && lp.GetValue() == "other" {
+					t.Errorf("%s: series of a listener from a failed reload", f.GetName())
+				}
+			}
+		}
+	}
+	if got := testutil.ToFloat64(m.reloadSuccessful); got != 0 {
+		t.Errorf("config_last_reload_successful = %v after a failed reload", got)
+	}
+}
+
+// Invalid content does not count as a scrape with 0 samples.
+func TestInvalidContentNotInSamples(t *testing.T) {
+	m := New()
+	m.ConfigLoaded(testConfig(), time.Now())
+	m.ContentParsed("node", "/metrics", 0, time.Millisecond, false)
+	if n, err := testutil.GatherAndCount(m.registry, "exporter_proxy_samples"); err != nil || n != 0 {
+		t.Errorf("exporter_proxy_samples series = %d (%v) after invalid content, want 0", n, err)
+	}
+	if n, err := testutil.GatherAndCount(m.registry, "exporter_proxy_parse_duration_seconds"); err != nil || n != 1 {
+		t.Errorf("parse duration not observed for invalid content (%d series, %v)", n, err)
 	}
 }

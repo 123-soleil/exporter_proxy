@@ -162,8 +162,12 @@ func (c *checker) metricsFile(where, path string, maxAge time.Duration) {
 		c.add(Problem, where, "file %s is not a regular file (%s)", path, info.Mode().Type())
 		return
 	}
-	if age := c.now.Sub(info.ModTime()); age > maxAge {
+	switch age := c.now.Sub(info.ModTime()); {
+	case age > maxAge:
 		c.add(Problem, where, "file %s was modified %s ago, more than max_age (%s)", path, age.Truncate(time.Second), maxAge)
+	case -age > maxAge:
+		c.add(Problem, where, "file %s was modified %s in the future, more than max_age (%s): clock skew?",
+			path, (-age).Truncate(time.Second), maxAge)
 	}
 }
 

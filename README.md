@@ -62,8 +62,11 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. |
-| Web configuration file of the listener unreadable or invalid | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
+| Web configuration file of the listener unreadable or invalid, or without `basic_auth_users` while the listener started with basic authentication | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
+
+`OPTIONS *` goes through authentication like any request (no automatic
+answer from net/http), then gets `404`.
 
 `404` and `405` are answered before taking a concurrency slot: only real
 source reads count against `max_concurrent_requests`. A request whose client
@@ -88,7 +91,8 @@ Each route has exactly one source:
   the configuration never depends on the working directory and the target is
   exactly what is written.
 - A `file` route requires `max_age` (no default): if the file's modification
-  time is older than `max_age`, the scrape is rejected
+  time is older than `max_age`, or more than `max_age` in the future (writer
+  with a clock far ahead), the scrape is rejected
   (`reason="stale"`), so a writer that stopped running cannot go unnoticed
   behind old values. Choose it as a few times the writer's period (for
   example `max_age: 15m` for a file written every 5 minutes).
@@ -144,9 +148,12 @@ page) from being exposed through the proxy.
   and vmagent send it in the `X-Prometheus-Scrape-Timeout-Seconds` header,
   and exporter_proxy gives the source that time minus 500 ms (kept to
   validate and answer; for a scrape timeout of 1 s or less, the whole
-  timeout). The proxy then answers `502` with reason `timeout` before the
-  scraper gives up, instead of the scraper reporting a bare timeout. The
-  header can never extend `timeout`; an invalid value is ignored. The log
+  timeout), and never less than 1 s, so that a client announcing a tiny
+  timeout cannot make sources answering within a second fail with
+  `timeout`. The proxy then
+  answers `502` with reason `timeout` before the scraper gives up, instead
+  of the scraper reporting a bare timeout. The header can never extend
+  `timeout`; an invalid value is ignored. The log
   line of such a failure carries `scrape_budget_ms`.
 - The validated body is returned unchanged with
   `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
@@ -204,12 +211,20 @@ credentials travel in clear text"`), so that it shows up in log alerts.
 
 ### Refused authentications
 
-Every refusal is logged and counted in
-`exporter_proxy_auth_failures_total{listener,reason}`:
+Every refusal is counted in
+`exporter_proxy_auth_failures_total{listener,reason}` and logged. Refusals
+cost an attacker nothing, so each listener logs at most 10 of them at once,
+then 1 per second, at their normal level (`warn`); the others are logged at
+`debug` level. The same limit applies to the `warn` lines of rejected
+requests (`503`) and rejected sources (`502`), which clients can trigger
+too. Its server-side errors (`518`, TLS settings that cannot be
+loaded, `error` level; accept errors and handler panics) have the same
+limit, counted apart: client noise, including the HTTP/2 and other
+net/http errors clients can cause, never hides them.
 
 | `reason` | When | Response | Log |
 |----------|------|----------|-----|
-| `tls_handshake` | TLS or mTLS handshake failed: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks) | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
+| `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
@@ -234,7 +249,10 @@ at a time, by three limits:
   never queue behind slow hashes.
 
 Beyond any of these limits, the request gets `429` without any bcrypt
-computation. A check whose client leaves while waiting is skipped.
+computation. Requests sent at the same time with the same credentials (an
+HA pair of scrapers, several routes scraped together after a restart)
+share a single check and its result, so they do not use up the limits.
+Verified credentials are kept when a reload restarts the listener.
 
 As a result, a brute force attack costs at most a few bcrypt checks per
 second and never slows down a scraper whose credentials are already
@@ -288,11 +306,12 @@ Besides the standard `go_*`, `process_*` and
 - `exporter_proxy_response_size_bytes{listener,route}` (histogram): size of
   the content read from the source.
 - `exporter_proxy_samples{listener,route}` (histogram): number of samples in
-  the content read from the source.
+  the content read from the source, for valid content only.
 - `exporter_proxy_source_errors_total{listener,route,reason}`: rejected
   scrapes, with `reason` in a fixed set: `unavailable` (connection, file or
   HTTP status error), `timeout`, `too_large`, `too_many_samples`, `invalid`
-  (parse error), `stale` (file older than `max_age`).
+  (parse error), `stale` (file older than `max_age`, or modified more than
+  `max_age` in the future).
 - `exporter_proxy_file_modified_timestamp_seconds{listener,route}` (gauge):
   modification time of the file of each `file` route, updated on every scrape.
 - `exporter_proxy_build_info{version,revision,branch,goversion,goos,goarch,tags}`
@@ -319,10 +338,12 @@ Besides the standard `go_*`, `process_*` and
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
 - `exporter_proxy_web_config_read_error{listener}` (gauge, 0 or 1): 1 while
-  the last read of the listener's web configuration file failed (requests
-  answered `518`, new TLS connections refused), 0 once it is read again
-  successfully. Updated on every request and every new TLS connection;
-  `listener="metrics"` for the metrics endpoint.
+  the listener's web configuration cannot be applied: the last request
+  could not read the file (answered `518`), or the last new TLS connection
+  could not load the file, certificate, key or client CA (refused). Both
+  are tracked apart, so requests on connections already open do not hide
+  a TLS failure. Back to 0 when both succeed again, and after a successful
+  reload; `listener="metrics"` for the metrics endpoint.
 
 Labels only take values from the configuration (listener names and route
 paths), from a fixed set (`reason`) or from HTTP status codes, never client
@@ -695,7 +716,7 @@ otherwise; warnings do not fail the check:
   warning; the client CA file must contain at least one certificate;
 - basic authentication without TLS is a warning;
 - each `file` route: the file exists, is a regular file, is readable and is
-  not older than `max_age`;
+  not older than `max_age` nor more than `max_age` in the future;
 - each `unix_socket` route: the path exists, is a socket and is writable by
   the current user (required by `connect()`).
 
@@ -723,7 +744,8 @@ answer `502`.
 ### Configuration reload (`SIGHUP`)
 
 On `SIGHUP` (`systemctl reload exporter_proxy`), the configuration file is
-read, validated, its web configuration files are validated and every new
+read (a `SIGHUP` received while starting is applied once serving, it never
+stops the process), validated, its web configuration files are validated and every new
 address is bound **before** anything changes. A reload is all or nothing:
 
 - if any step fails (invalid configuration, invalid web configuration, port
@@ -740,8 +762,8 @@ the `listen` value as written):
 
 | Change | Effect |
 |--------|--------|
-| Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2 and `rate_limit` settings in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
-| Same `listen`, other `web_config_file` or TLS, HTTP/2 or `rate_limit` changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully. |
+| Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2, `rate_limit`, presence of `basic_auth_users` and client certificate settings (`client_auth_type`, client CA content, `client_allowed_sans`) in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
+| Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. |
 | New `listen` address | Bound at reload. |
 | New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
 | Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. |
@@ -762,18 +784,66 @@ while running, like exporter-toolkit does:
 
 - `basic_auth_users` and `http_server_config.headers` on every request: a
   user added, removed or with a new password takes effect immediately;
-  headers are checked against exporter-toolkit's list (a forbidden header
-  or value makes the file invalid, so requests get `518`), like at startup;
-- TLS settings (certificate, key, client CA) on every new connection, so a
-  renewed certificate is picked up without restart.
+  hashes and headers are checked like at startup (a malformed hash, or a
+  header or value outside exporter-toolkit's list, makes the file invalid,
+  so requests get `518`);
+- TLS settings (certificate, key, client CA content) on every new
+  connection, so a renewed certificate or CA is picked up without restart.
+  Connections already open are not checked again: to cut off clients after
+  replacing a client CA, reload (the listener restarts and closes them).
 
-Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`)
-and `rate_limit` are read when the listener starts: after changing them,
-reload (the listener is then restarted on its socket, even if its
+Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`),
+`rate_limit`, whether it requires basic authentication and its client
+certificate settings are read when the listener starts. Authentication
+fails closed, never open:
+
+- a listener started with `basic_auth_users`, or whose file gained users
+  while running, answers `518` if the file loses all its users (emptied or
+  truncated while being rewritten);
+- the client certificate settings of a TLS listener (`client_auth_type`,
+  whether a client CA is configured, `client_allowed_sans`) are fixed while
+  it runs: if its file differs, tighter or looser (for example a file cut
+  before `client_auth_type`), new connections are refused until a reload
+  (counted in `exporter_proxy_web_config_read_error`, not as client
+  failures). Only the content of the client CA, like the server
+  certificate and key, can change without reload, for rotation.
+
+A `client_auth_type` that verifies client certificates
+(`RequireAndVerifyClientCert`, `VerifyClientCertIfGiven`) requires a client
+CA (`client_ca_file` or `client_ca`): without one, crypto/tls would verify
+them against the system roots and accept any client certificate from a CA
+the machine trusts, so the file is invalid (exporter-toolkit accepts it).
+Conversely, a client CA with a `client_auth_type` that does not verify
+certificates (`RequestClientCert`, `RequireAnyClientCert` or its old name
+`RequireClientCert`) would be ignored, any self-signed certificate being
+accepted: the file is invalid too, as is a client CA containing no
+certificate. With HTTP/2 enabled (the default) and `min_version` below
+`TLS13`, a `cipher_suites` list must include
+`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` or
+`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, which net/http requires for
+HTTP/2: otherwise the listener would stop right after starting.
+`client_allowed_sans` requires a `client_auth_type` that verifies client
+certificates (`RequireAndVerifyClientCert` or `VerifyClientCertIfGiven`):
+otherwise any client could present a self-signed certificate carrying an
+allowed name, so the file is invalid; an empty list is invalid too. The
+names are also checked when a client resumes a TLS session, and a client
+without a certificate is refused.
+
+A reload applies changed client certificate settings or client CA content
+by restarting the listener on its socket, which closes the connections
+accepted under the previous ones. A reload that weakens a protection
+(basic authentication removed, a certificate no longer required or no
+longer verified, client CA or `client_allowed_sans` removed, TLS lost)
+logs a warning (`msg="authentication weakened by this reload: ..."`),
+also for the previous listener of a port when listeners are renamed or
+swap addresses. Check it, since a reload catching a half-written file
+would do the same.
+After changing these settings on purpose, reload (the listener is then restarted on its socket, even if its
 `web_config_file` path is the same) or restart. Until then, the listener
 keeps its previous settings; in particular, removing `tls_server_config`
 from a running TLS listener's file makes new TLS handshakes fail until the
-reload. Replace these files atomically
+reload, and adding it to the file of a plain HTTP listener makes its
+requests get `518` until the reload, instead of serving in clear text. Replace these files atomically
 (write a temporary file, then rename it) so that a half-written file is
 never read.
 

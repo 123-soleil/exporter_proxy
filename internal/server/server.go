@@ -4,7 +4,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,6 +66,10 @@ type Server struct {
 
 	mu        sync.Mutex
 	listeners map[string]*listener // by name
+	// successes keeps the verified credentials of each listener name
+	// across its restarts on reload. Keys cover the stored hash, so a
+	// changed web configuration never reuses a stale success.
+	successes map[string]*successCache
 
 	serving  sync.WaitGroup // web.Serve goroutines
 	draining sync.WaitGroup // listeners stopped by a reload
@@ -70,6 +77,7 @@ type Server struct {
 
 type listener struct {
 	settings listenerSettings
+	auth     *authHandler
 	spec     spec
 	ln       net.Listener
 	srv      *http.Server
@@ -83,15 +91,131 @@ type listenerSettings struct {
 	tls       bool
 	http2     bool // only meaningful with TLS
 	rateLimit webRateLimit
+	// basicAuth: started with basic_auth_users, which must then stay set
+	// (fail closed) until a reload.
+	basicAuth bool
+	// mtls holds the client certificate settings, fixed while the listener
+	// runs: a file that differs refuses new connections until a reload,
+	// which restarts the listener and so closes the connections accepted
+	// under the previous settings.
+	mtls mtlsSettings
+	// clientCA is the SHA-256 of the client CA content. Its content may
+	// change while running (CA rotation); a reload with a new content
+	// restarts the listener.
+	clientCA [sha256.Size]byte
+}
+
+// mtlsSettings are the client certificate settings of a web configuration.
+type mtlsSettings struct {
+	clientAuth  string // normalized client_auth_type
+	clientCA    bool   // a client CA is configured (file or inline)
+	allowedSANs string // sorted client_allowed_sans, newline-separated
+}
+
+func mtlsOf(tc *web.TLSConfig) mtlsSettings {
+	if !tc.IsEnabled() {
+		return mtlsSettings{}
+	}
+	return mtlsSettings{
+		clientAuth:  webconfig.NormalizeClientAuth(tc.ClientAuth),
+		clientCA:    tc.ClientCAs != "" || tc.ClientCAsText != "",
+		allowedSANs: strings.Join(slices.Sorted(slices.Values(tc.ClientAllowedSans)), "\n"),
+	}
 }
 
 func settingsOf(wc *web.Config) listenerSettings {
-	tlsEnabled := wc.TLSConfig.IsEnabled()
-	return listenerSettings{
+	tc := wc.TLSConfig
+	tlsEnabled := tc.IsEnabled()
+	s := listenerSettings{
 		tls:       tlsEnabled,
 		http2:     tlsEnabled && wc.HTTPConfig.HTTP2,
 		rateLimit: webRateLimit{interval: wc.RateLimiterConfig.Interval, burst: wc.RateLimiterConfig.Burst},
+		basicAuth: len(wc.Users) > 0,
+		mtls:      mtlsOf(&tc),
 	}
+	if !tlsEnabled {
+		return s
+	}
+	ca := []byte(tc.ClientCAsText)
+	if tc.ClientCAs != "" {
+		if data, err := os.ReadFile(tc.ClientCAs); err == nil {
+			ca = data
+		} else {
+			ca = []byte("unreadable: " + err.Error())
+		}
+	}
+	s.clientCA = sha256.Sum256(ca)
+	return s
+}
+
+// errClientAuthChanged refuses new TLS connections while the client
+// certificate settings of the web configuration differ from those the
+// listener started with: a file half-written or changed while running
+// never lets a client in under other rules. Changing them takes a reload.
+var errClientAuthChanged = errors.New("client certificate settings (client_auth_type, client CA, client_allowed_sans) " +
+	"differ from those the listener started with: fix the file, or reload to apply them")
+
+// checkClientAuth refuses a web configuration whose client certificate
+// settings differ from those of the listener.
+func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
+	if mtlsOf(tc) != l.settings.mtls {
+		return errClientAuthChanged
+	}
+	return nil
+}
+
+// restrictSANsOnResumption also checks client_allowed_sans when a client
+// resumes a TLS session: exporter-toolkit checks them in
+// VerifyPeerCertificate, which crypto/tls skips on resumption.
+// VerifyConnection runs on every handshake.
+//
+// It also refuses a client without a certificate when client_allowed_sans
+// is set: exporter-toolkit's check would panic on it (certificate optional,
+// as with VerifyClientCertIfGiven).
+func restrictSANsOnResumption(cfg *tls.Config, tc web.TLSConfig) {
+	if tc.ClientAllowedSans == nil {
+		return
+	}
+	cfg.VerifyPeerCertificate = func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("client_allowed_sans requires a client certificate")
+		}
+		return tc.VerifyPeerCertificate(rawCerts, chains)
+	}
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("client_allowed_sans requires a client certificate")
+		}
+		return tc.VerifyPeerCertificate([][]byte{cs.PeerCertificates[0].Raw}, nil)
+	}
+}
+
+// running returns the settings l enforces now: the start-time settings,
+// with basic authentication required once users were seen while running
+// (fail closed).
+func (l *listener) running() listenerSettings {
+	s := l.settings
+	s.basicAuth = l.auth.usersSeen.Load()
+	return s
+}
+
+// weakens reports what next removes of the protection l enforces now.
+func (l *listener) weakens(next listenerSettings) []string {
+	var lost []string
+	if l.auth.usersSeen.Load() && !next.basicAuth {
+		lost = append(lost, "basic authentication")
+	}
+	cur, nxt := l.settings.mtls, next.mtls
+	curRequired, curVerified := webconfig.ClientCertPolicy(cur.clientAuth)
+	required, verified := webconfig.ClientCertPolicy(nxt.clientAuth)
+	if (curRequired && !required) || (curVerified && !verified) ||
+		(cur.clientCA && !nxt.clientCA) || (cur.allowedSANs != "" && nxt.allowedSANs == "") {
+		lost = append(lost, "client certificate requirements")
+	}
+	if l.settings.tls && !next.tls {
+		lost = append(lost, "TLS")
+	}
+	return lost
 }
 
 // spec describes one server: a configured listener or the metrics endpoint.
@@ -165,6 +289,7 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		opts:      opts,
 		errc:      make(chan error, 16),
 		listeners: map[string]*listener{},
+		successes: map[string]*successCache{},
 	}
 
 	specs, err := s.prepare(cfg)
@@ -238,22 +363,28 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 	var swaps []swap
 	var started []*listener
+	type authLoss struct{ listener, what string }
+	var authRemoved []authLoss // listeners whose protection is weakened
 	kept := map[string]bool{}
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
 		if cur != nil && cur.spec.listen == sp.listen && cur.spec.webConfig == sp.webConfig {
 			wc, err := webconfig.Load(sp.webConfig)
 			if err != nil {
-				closeListeners(started)
+				s.abortReload(started)
 				return fmt.Errorf("listener %q: %w", sp.name, err)
 			}
-			if settingsOf(wc) == cur.settings {
+			// Compared with what the listener enforces now, including what
+			// was seen while running (fail closed): a weaker file restarts
+			// the listener with it, instead of keeping the refusals.
+			if settingsOf(wc) == cur.running() {
 				swaps = append(swaps, swap{cur, sp})
 				kept[sp.name] = true
 				continue
 			}
-			// TLS, HTTP/2 or rate_limit changed in the same file: restart
-			// the listener on its socket, below.
+			// TLS, HTTP/2, rate_limit or the presence of basic_auth_users
+			// changed in the same file: restart the listener on its
+			// socket, below.
 		}
 
 		var ln net.Listener
@@ -268,14 +399,26 @@ func (s *Server) Reload(cfg *config.Config) error {
 			ln, err = net.Listen("tcp", sp.listen)
 		}
 		if err != nil {
-			closeListeners(started)
+			s.abortReload(started)
 			return fmt.Errorf("listener %q: %w", sp.name, err)
 		}
 		l, err := s.newListener(sp, ln)
 		if err != nil {
 			_ = ln.Close()
-			closeListeners(started)
+			s.abortReload(started)
 			return err
+		}
+		// The previous server on this address, whatever its name (renamed
+		// or swapped listeners): clients of that port lose its protection.
+		// Else the previous server of this name, moved to a new address.
+		prev := byListen[sp.listen]
+		if prev == nil {
+			prev = cur
+		}
+		if prev != nil {
+			if lost := prev.weakens(l.settings); len(lost) > 0 {
+				authRemoved = append(authRemoved, authLoss{sp.name, strings.Join(lost, " and ")})
+			}
 		}
 		started = append(started, l)
 	}
@@ -301,7 +444,31 @@ func (s *Server) Reload(cfg *config.Config) error {
 		}
 	}
 	s.listeners = next
+	s.pruneSuccesses()
+	for _, a := range authRemoved {
+		// On purpose, or a web configuration file caught empty or
+		// half-written by this reload: say it loudly.
+		s.logger.Warn("authentication weakened by this reload: "+a.what+" removed or lowered",
+			"listener", a.listener)
+	}
 	return nil
+}
+
+// abortReload closes the listeners started by a failed reload and forgets
+// what it prepared for them. Called with s.mu held.
+func (s *Server) abortReload(started []*listener) {
+	closeListeners(started)
+	s.pruneSuccesses()
+}
+
+// pruneSuccesses forgets the verified credentials of listeners that are not
+// running. Called with s.mu held.
+func (s *Server) pruneSuccesses() {
+	for name := range s.successes {
+		if _, ok := s.listeners[name]; !ok {
+			delete(s.successes, name)
+		}
+	}
 }
 
 // prepare builds the handlers of cfg and validates the web configuration
@@ -368,21 +535,40 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	}
 
 	settings := settingsOf(wc)
+	successes := s.successes[sp.name]
+	if successes == nil {
+		successes = newSuccessCache(successCacheSize)
+		s.successes[sp.name] = successes
+	}
+	clientLogs, serverLogs := newLogGate(), newLogGate()
 	sh := newSwapHandler(sp)
-	auth := newAuthHandler(sp.name, sp.webConfig, settings.rateLimit, sh, s.logger, s.recorder())
+	auth := newAuthHandler(authOptions{
+		listener:     sp.name,
+		webConfig:    sp.webConfig,
+		rateLimit:    settings.rateLimit,
+		requireUsers: settings.basicAuth,
+		tls:          settings.tls,
+		successes:    successes,
+		clientLogs:   clientLogs,
+		serverLogs:   serverLogs,
+	}, sh, s.logger, s.recorder())
 	srv := &http.Server{
-		Handler:           auth,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readHeaderTimeout,
+		Handler: auth,
+		// "OPTIONS *" goes through authentication too, instead of an
+		// automatic empty 200.
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            readHeaderTimeout,
+		ReadTimeout:                  readHeaderTimeout,
 		// Baseline until the handler sets the per-request deadline.
 		WriteTimeout:   writeMargin,
 		IdleTimeout:    idleTimeout,
 		MaxHeaderBytes: maxHeaderBytes,
 		// TLS handshake failures are counted and logged as such.
-		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder()}, "", 0),
+		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder(),
+			clientLogs: clientLogs, serverLogs: serverLogs}, "", 0),
 	}
 
-	l := &listener{settings: settings, spec: sp, ln: ln, srv: srv, handler: sh}
+	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh}
 	if !settings.tls {
 		return l, nil
 	}
@@ -405,16 +591,23 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		c, err := webconfig.Load(webConfig)
 		if err == nil {
+			err = l.checkClientAuth(&c.TLSConfig)
+		}
+		if err == nil {
 			var cfg *tls.Config
 			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
-				rec.WebConfigRead(name, true)
+				restrictSANsOnResumption(cfg, c.TLSConfig)
+				rec.WebConfigRead(name, true, true)
 				cfg.NextProtos = nextProtos
 				return cfg, nil
 			}
 		}
-		rec.WebConfigRead(name, false)
-		logger.Error("cannot load TLS settings for a new connection", "web_config_file", webConfig, "err", errfmt.OneLine(err))
-		return nil, err
+		rec.WebConfigRead(name, true, false)
+		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
+			"web_config_file", webConfig, "err", errfmt.OneLine(err))
+		// The marker tells serverErrorLog that the server, not the client,
+		// failed the handshake.
+		return nil, fmt.Errorf("%s: %w", serverTLSUnavailable, err)
 	}
 	srv.TLSConfig = tlsCfg
 	return l, nil
@@ -443,6 +636,9 @@ func (s *Server) serve(l *listener) {
 			err = srv.Serve(ln)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Serve may fail before taking ownership of ln (HTTP/2 setup):
+			// release the socket.
+			_ = ln.Close()
 			select {
 			case s.errc <- fmt.Errorf("listener %q: %w", name, err):
 			default: // an error is already pending

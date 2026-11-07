@@ -95,6 +95,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gauge `exporter_proxy_web_config_read_error{listener}` to 1 until the file
   is read successfully again; TLS connections refused for the same reason
   set it too.
+- Client certificate settings fail closed too: `client_auth_type`, the
+  presence of a client CA and `client_allowed_sans` are fixed while a TLS
+  listener runs; a web configuration that differs (a file cut before
+  `client_auth_type` let clients in without a certificate) refuses new
+  connections until a reload. The client CA content can still be rotated
+  without reload. A reload that changes these settings or the client CA
+  content restarts the listener, closing connections opened under the
+  previous settings.
+- A verifying `client_auth_type` without a client CA is invalid: client
+  certificates would be verified against the system roots. A client CA
+  with a non-verifying `client_auth_type` (ignored CA) or without any
+  certificate is invalid too, at startup, reload, `--check` and while
+  running.
+- A `cipher_suites` list without the cipher HTTP/2 requires (with HTTP/2
+  on and `min_version` below TLS 1.3) is invalid: the listener stopped
+  right after starting or after a reload, stopping the process; a listener
+  failing that way also releases its socket.
+- A plain HTTP listener whose web configuration enables TLS answers `518`
+  until a reload, instead of serving in clear text.
+- `OPTIONS *` goes through authentication instead of net/http's automatic
+  empty `200`; HTTP/2 handler panics use the server log budget; a Unix
+  socket client cannot hide its handshake failures behind the server-side
+  marker.
+- `client_allowed_sans` requires a verifying `client_auth_type` (with an
+  unverified certificate, names could be forged) and cannot be empty; it is
+  also checked on TLS session resumption, and a client without a
+  certificate is refused (exporter-toolkit panicked).
+- The reload warning covers basic authentication, client certificate
+  requirements and TLS, and compares with the previous listener of the
+  same address (renamed or swapped listeners).
+- Basic authentication fails closed: a listener started with
+  `basic_auth_users`, or whose file gained users while running, answers
+  `518` if its web configuration loses its users
+  (emptied or truncated file) instead of serving without authentication;
+  removing authentication takes a reload, which restarts the listener and
+  logs a warning.
+- Malformed bcrypt hashes in a web configuration changed while running make
+  it invalid (`518`), like at startup.
+- Handshakes refused because of the server's own TLS settings are no longer
+  counted as client `tls_handshake` failures; `web_config_read_error`
+  tracks request and TLS reads apart, so open connections do not hide a TLS
+  failure, and is reset by a successful reload.
+- A `SIGHUP` received while starting no longer stops the process.
+- File routes and `--check` reject a modification time more than
+  `max_age` in the future.
+- Refusal and server-side error logs are rate limited per listener, with
+  separate budgets so client noise (including HTTP/2 and other net/http
+  errors clients can cause) never hides server errors (burst 10,
+  then 1 per second; the rest at debug level).
+- The time a scraper's timeout header leaves to the source is at least
+  1 s, so that a client announcing a tiny timeout cannot make sources
+  answering within a second fail with `timeout`; the `warn` lines of
+  rejected requests and sources are rate limited like refusals.
+- Identical credentials sent at the same time share one bcrypt check, and
+  verified credentials survive a listener restart on reload, so that
+  scrapers starting together no longer get `429`.
+- Invalid content is no longer counted in `exporter_proxy_samples`; events
+  of listeners added by a reload are recorded as soon as they serve; timeout
+  messages name the limit that fired (route or scraper's timeout).
 - Headers of a web configuration file changed while running are checked
   against exporter-toolkit's allowed list, like at startup (a forbidden
   header was sent on every response); such a file answers `518`.

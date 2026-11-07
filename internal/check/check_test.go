@@ -150,7 +150,7 @@ func TestWebConfigs(t *testing.T) {
 		{"expired client CA", tlsWebConfig(t, dir, goodCert, goodKey, expiredCert),
 			[]want{{Problem, "client_ca_file"}}},
 		{"client CA without certificate", tlsWebConfig(t, dir, goodCert, goodKey, emptyCA),
-			[]want{{Problem, "no certificate found"}}},
+			[]want{{Problem, "contains no certificate"}}},
 		{"key does not match certificate", tlsWebConfig(t, dir, goodCert, expiredKey, ""),
 			[]want{{Problem, "X509KeyPair"}}},
 		{"basic auth without TLS", basicOnly,
@@ -176,7 +176,9 @@ func TestRoutes(t *testing.T) {
 	writeFile(t, fresh, "up 1\n")
 	stale := filepath.Join(dir, "stale.prom")
 	writeFile(t, stale, "up 1\n")
-	for path, age := range map[string]time.Duration{fresh: time.Minute, stale: 2 * time.Hour} {
+	future := filepath.Join(dir, "future.prom")
+	writeFile(t, future, "up 1\n")
+	for path, age := range map[string]time.Duration{fresh: time.Minute, stale: 2 * time.Hour, future: -2 * time.Hour} {
 		if err := os.Chtimes(path, now.Add(-age), now.Add(-age)); err != nil {
 			t.Fatal(err)
 		}
@@ -222,6 +224,7 @@ func TestRoutes(t *testing.T) {
 	}{
 		{name: "fresh file", route: fileRoute(fresh)},
 		{name: "stale file", route: fileRoute(stale), want: []want{{Problem, "more than max_age (1h0m0s)"}}},
+		{name: "file modified in the future", route: fileRoute(future), want: []want{{Problem, "in the future"}}},
 		{name: "missing file", route: fileRoute(filepath.Join(dir, "missing.prom")), want: []want{{Problem, "no such file"}}},
 		{name: "directory", route: fileRoute(dir), want: []want{{Problem, "is not a regular file"}}},
 		{name: "fifo", route: fileRoute(fifo), want: []want{{Problem, "is not a regular file"}}},

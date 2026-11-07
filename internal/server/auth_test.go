@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
+	"github.com/123-soleil/exporter_proxy/internal/webconfig"
 )
 
 // authRecorder captures AuthFailed events.
@@ -34,7 +35,7 @@ func (r *authRecorder) AuthFailed(_ string, reason proxy.AuthReason) {
 	r.reasons = append(r.reasons, reason)
 }
 
-func (r *authRecorder) WebConfigRead(_ string, ok bool) {
+func (r *authRecorder) WebConfigRead(_ string, _, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.webConfigReads = append(r.webConfigReads, ok)
@@ -78,7 +79,14 @@ func newTestAuth(t *testing.T, webContent string, rl webRateLimit) (*authHandler
 	rec := &authRecorder{}
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return newAuthHandler("node", path, rl, next, logger, rec), next, rec, logs, path
+	// Like newListener: basic authentication required if the file has users.
+	wc, err := webconfig.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newAuthHandler(authOptions{listener: "node", webConfig: path, rateLimit: rl, requireUsers: len(wc.Users) > 0},
+		next, logger, rec)
+	return h, next, rec, logs, path
 }
 
 func usersYAML(t *testing.T, users map[string]string) string {
@@ -412,13 +420,206 @@ func TestAuthHandlerClientLeftWhileWaiting(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusTooManyRequests || next.count() != 0 {
-		t.Errorf("code %d, next %d, want 429 and 0", w.Code, next.count())
+	// The verification is bounded by the pending slots and still answered:
+	// never an empty 200.
+	if w.Code != http.StatusUnauthorized || next.count() != 0 {
+		t.Errorf("code %d, next %d, want 401 and 0", w.Code, next.count())
 	}
-	if got := rec.got(); !slices.Equal(got, []proxy.AuthReason{proxy.AuthRateLimited}) {
-		t.Errorf("recorded %v, want [rate_limited]", got)
+	if got := rec.got(); !slices.Equal(got, []proxy.AuthReason{proxy.AuthInvalidCredentials}) {
+		t.Errorf("recorded %v, want [invalid_credentials]", got)
 	}
 	if len(h.pending) != 0 {
 		t.Errorf("%d verification slots still taken", len(h.pending))
+	}
+}
+
+// A listener started with basic authentication fails closed when the file
+// loses its users (emptied or truncated while being rewritten).
+func TestAuthHandlerFailsClosedWhenUsersDisappear(t *testing.T) {
+	h, next, rec, logs, path := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{})
+	for name, content := range map[string]string{
+		"empty file":   "",
+		"comment only": "# rewritten\n",
+		"truncated":    "http_server_config:\n  http2: true\n",
+		"no users key": "{}\n",
+	} {
+		mustWriteFile(t, path, content)
+		w := do(h, "", "")
+		if w.Code != StatusWebConfigUnreadable {
+			t.Errorf("%s: code %d, want 518", name, w.Code)
+		}
+	}
+	if next.count() != 0 {
+		t.Errorf("served %d requests without authentication", next.count())
+	}
+	if got := rec.reads(); slices.Contains(got, true) {
+		t.Errorf("reads recorded as successful: %v", got)
+	}
+	if !strings.Contains(logs.String(), "reload to remove authentication") {
+		t.Errorf("cause not logged: %s", logs.String())
+	}
+}
+
+// Identical credentials sent together share one verification.
+func TestAuthHandlerSharesConcurrentVerifications(t *testing.T) {
+	h, next, rec, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{})
+	h.verifyMu.Lock() // hold verifications until every request is waiting
+	const n = 3 * maxPendingVerifications
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = do(h, "prometheus", "good-pass").Code
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	h.verifyMu.Unlock()
+	wg.Wait()
+
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("request %d: code %d, want 200", i, c)
+		}
+	}
+	if next.count() != n || len(rec.got()) != 0 {
+		t.Errorf("next %d, refusals %v; want %d and none", next.count(), rec.got(), n)
+	}
+}
+
+// Requests and handshake failures beyond the log rate go to debug level.
+func TestAuthHandlerLogsAreRateLimited(t *testing.T) {
+	h, _, rec, logs, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "p"}), webRateLimit{})
+	const n = logBurst + 20
+	for range n {
+		do(h, "", "") // missing credentials: no bcrypt, unlimited for an attacker
+	}
+	if got := len(rec.got()); got != n {
+		t.Errorf("counted %d refusals, want %d (all)", got, n)
+	}
+	warns := strings.Count(logs.String(), "level=WARN")
+	if warns < logBurst || warns > logBurst+2 {
+		t.Errorf("%d warn lines for %d refusals, want about %d", warns, n, logBurst)
+	}
+}
+
+// Handshakes refused because of the server's own TLS settings are not
+// client authentication failures.
+func TestServerErrorLogServerSideTLS(t *testing.T) {
+	rec := &authRecorder{}
+	logs := &syncBuffer{}
+	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
+		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+
+	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 192.0.2.1:5000: %s: open /etc/cert.pem: permission denied\n", serverTLSUnavailable)
+	if got := rec.got(); len(got) != 0 {
+		t.Errorf("server-side failure counted as %v", got)
+	}
+	_, _ = fmt.Fprint(l, "http: TLS handshake error from 192.0.2.1:5001: tls: client didn't provide a certificate\n")
+	if got := rec.got(); !slices.Equal(got, []proxy.AuthReason{proxy.AuthTLSHandshake}) {
+		t.Errorf("client failure recorded %v, want [tls_handshake]", got)
+	}
+
+	// A client cannot hide its failure by putting the marker in text it
+	// controls, such as an ALPN protocol name.
+	_, _ = fmt.Fprintf(l, "http: TLS handshake error from 192.0.2.1:5002: tls: client requested unsupported application protocols ([%q])\n", serverTLSUnavailable)
+	if got := rec.got(); len(got) != 2 {
+		t.Errorf("handshake failure with the marker in client text not counted: %v", got)
+	}
+}
+
+// Users seen while running are required until a reload, even if the
+// listener started without them.
+func TestAuthHandlerUsersSeenStayRequired(t *testing.T) {
+	h, next, _, _, path := newTestAuth(t, "{}\n", webRateLimit{})
+	if w := do(h, "", ""); w.Code != http.StatusOK {
+		t.Fatalf("without users: code %d", w.Code)
+	}
+	mustWriteFile(t, path, usersYAML(t, map[string]string{"prometheus": "p"}))
+	if w := do(h, "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("users added: code %d, want 401", w.Code)
+	}
+	mustWriteFile(t, path, "")
+	if w := do(h, "", ""); w.Code != StatusWebConfigUnreadable || next.count() != 1 {
+		t.Errorf("users removed again: code %d, next %d, want 518 and 1", w.Code, next.count())
+	}
+}
+
+// Client refusals cannot silence the error line of a broken web
+// configuration.
+func TestAuthHandlerClientNoiseKeepsServerErrors(t *testing.T) {
+	h, _, _, logs, path := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "p"}), webRateLimit{})
+	for range 3 * logBurst {
+		do(h, "", "") // refusals use up the client log budget
+	}
+	mustWriteFile(t, path, "not: [valid\n")
+	do(h, "", "")
+	if !strings.Contains(logs.String(), "level=ERROR msg=\"cannot load web configuration\"") {
+		t.Error("web configuration error not logged at error level after client noise")
+	}
+}
+
+// Server errors that are not handshakes are not hidden by handshake noise.
+func TestServerErrorLogKeepsServerErrors(t *testing.T) {
+	logs := &syncBuffer{}
+	l := &serverErrorLog{listener: "node", rec: &authRecorder{}, clientLogs: newLogGate(), serverLogs: newLogGate(),
+		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	for range 3 * logBurst {
+		_, _ = fmt.Fprint(l, "http: TLS handshake error from 192.0.2.1:5000: EOF\n")
+	}
+	_, _ = fmt.Fprint(l, "http: Accept error: accept tcp: too many open files; retrying in 5ms\n")
+	if !strings.Contains(logs.String(), `level=WARN msg="HTTP server error"`) {
+		t.Error("accept error not logged at warn after handshake noise")
+	}
+}
+
+// net/http lines clients can cause (HTTP/2 errors, ...) cannot hide the
+// server's own errors.
+func TestServerErrorLogClientCausedLines(t *testing.T) {
+	logs := &syncBuffer{}
+	l := &serverErrorLog{listener: "node", rec: &authRecorder{}, clientLogs: newLogGate(), serverLogs: newLogGate(),
+		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	for range 3 * logBurst {
+		_, _ = fmt.Fprint(l, "http2: received GOAWAY [FrameHeader GOAWAY len=8], starting graceful shutdown\n")
+	}
+	if l.serverLogs.l.Tokens() < logBurst-1 {
+		t.Errorf("client-caused lines used the server log budget (%.1f tokens left)", l.serverLogs.l.Tokens())
+	}
+	_, _ = fmt.Fprint(l, "http: panic serving 192.0.2.1:5000: boom\n")
+	if !strings.Contains(logs.String(), "level=WARN msg=\"HTTP server error\" listener=node err=\"http: panic serving") {
+		t.Error("panic not logged at warn after client noise")
+	}
+}
+
+// A plain HTTP listener whose file enables TLS fails closed until a reload,
+// instead of serving in clear text what the file wants protected.
+func TestAuthHandlerTLSAddedToPlainListener(t *testing.T) {
+	h, next, _, _, path := newTestAuth(t, "{}\n", webRateLimit{})
+	mustWriteFile(t, path, "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n")
+	if w := do(h, "", ""); w.Code != StatusWebConfigUnreadable || next.count() != 0 {
+		t.Errorf("code %d, next %d, want 518 and 0", w.Code, next.count())
+	}
+}
+
+// The server-side marker is only trusted after an IP address: a Unix
+// socket client chooses its own path and could put the marker in it.
+func TestServerErrorLogMarkerAfterUnixPath(t *testing.T) {
+	rec := &authRecorder{}
+	l := &serverErrorLog{listener: "node", rec: rec, clientLogs: newLogGate(), serverLogs: newLogGate(),
+		logger: slog.New(slog.DiscardHandler)}
+	_, _ = fmt.Fprintf(l, "http: TLS handshake error from /tmp/x: %s: z: tls: bad certificate\n", serverTLSUnavailable)
+	if got := rec.got(); len(got) != 1 {
+		t.Errorf("handshake failure from a Unix socket path hidden: %v", got)
+	}
+}
+
+// HTTP/2 handler panics use the server log budget.
+func TestServerErrorLogHTTP2Panic(t *testing.T) {
+	l := &serverErrorLog{listener: "node", rec: &authRecorder{}, clientLogs: newLogGate(), serverLogs: newLogGate(),
+		logger: slog.New(slog.DiscardHandler)}
+	_, _ = fmt.Fprint(l, "http2: panic serving 192.0.2.1:5000: boom\n")
+	if got := l.serverLogs.l.Tokens(); got > logBurst-0.5 {
+		t.Errorf("HTTP/2 panic not counted in the server log budget (%.1f tokens left)", got)
 	}
 }

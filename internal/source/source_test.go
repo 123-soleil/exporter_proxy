@@ -418,3 +418,45 @@ func TestReadLimitedHugeLimit(t *testing.T) {
 		t.Errorf("readLimited = %q, %v; want the whole body", body, err)
 	}
 }
+
+// A file modified far in the future cannot be trusted as fresh.
+func TestFileSourceFutureModTime(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "m.prom")
+	if err := os.WriteFile(p, []byte("up 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Hour)
+	if err := os.Chtimes(p, future, future); err != nil {
+		t.Fatal(err)
+	}
+	src, err := New(config.Route{File: p, MaxAge: time.Hour, Limits: config.Limits{Timeout: time.Second, MaxBodyBytes: 1 << 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = src.Fetch(context.Background())
+	if ReasonOf(err) != ReasonStale || !strings.Contains(err.Error(), "in the future") {
+		t.Errorf("err = %v, want stale, modified in the future", err)
+	}
+
+	// Within max_age in the future (small clock skew): accepted.
+	soon := time.Now().Add(time.Minute)
+	if err := os.Chtimes(p, soon, soon); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Fetch(context.Background()); err != nil {
+		t.Errorf("small skew rejected: %v", err)
+	}
+}
+
+// The timeout message names the limit that fired.
+func TestTimeLimit(t *testing.T) {
+	start := time.Now()
+	if got := timeLimit(context.Background(), start, 10*time.Second); got != "10s (route timeout)" {
+		t.Errorf("without deadline: %q", got)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), start.Add(4500*time.Millisecond))
+	defer cancel()
+	if got := timeLimit(ctx, start, 10*time.Second); got != "4.5s (left by the scraper's timeout, route timeout 10s)" {
+		t.Errorf("with an earlier deadline: %q", got)
+	}
+}
