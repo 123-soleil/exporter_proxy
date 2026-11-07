@@ -96,6 +96,12 @@ func (c *checker) webConfig(where, path string) {
 	if wc.BasicAuthWithoutTLS() {
 		c.add(Warning, where, "basic authentication without TLS: credentials travel in clear text")
 	}
+	if wc.MinBcryptCost != wc.MaxBcryptCost {
+		// Unknown users are checked at the highest cost: a known user with
+		// a lower one answers faster, which tells the users apart.
+		c.add(Warning, where, "basic_auth_users hashes have different bcrypt costs (%d to %d): "+
+			"response times reveal which users exist; use the same cost for all", wc.MinBcryptCost, wc.MaxBcryptCost)
+	}
 	switch {
 	case wc.CertFile != "":
 		c.certificates(where, "cert_file", wc.CertFile, false)

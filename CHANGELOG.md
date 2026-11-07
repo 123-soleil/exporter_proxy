@@ -215,6 +215,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable from the code).
 - `--check` stops at the first certificate of `cert_file` even when it
   cannot be parsed, instead of checking the next one as the leaf.
+- `--check` warns when `basic_auth_users` hashes have different bcrypt
+  costs (response times would tell users apart), and numbers unparseable
+  certificates of a bundle by their position.
+- Passwords longer than 72 bytes are remembered by their first 72 bytes,
+  the only ones bcrypt uses: suffixes added to a valid long password no
+  longer fill the cache of verified credentials.
 - Idle upstream connections are closed when a handler is replaced or
   stopped; a second `SIGTERM` or `SIGINT` stops the process without waiting
   for the graceful shutdown.

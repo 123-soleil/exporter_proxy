@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -735,5 +736,26 @@ func TestMarkHealthySinceKeepsLaterFailure(t *testing.T) {
 	h.mu.Unlock()
 	if failing {
 		t.Error("failure not cleared by a check after it")
+	}
+}
+
+// bcrypt ignores what follows the first 72 bytes of a password: suffixes
+// added to a long valid password share its success cache entry.
+func TestLongPasswordSuffixesShareCacheEntry(t *testing.T) {
+	pass := strings.Repeat("p", 72)
+	h, next, _, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"u": pass}), webRateLimit{})
+	for i := range 3 {
+		if w := do(h, "u", pass+strconv.Itoa(i)); w.Code != http.StatusOK {
+			t.Fatalf("suffix %d: code %d", i, w.Code)
+		}
+	}
+	if next.count() != 3 {
+		t.Errorf("served %d requests, want 3", next.count())
+	}
+	h.successes.mu.Lock()
+	n := len(h.successes.keys)
+	h.successes.mu.Unlock()
+	if n != 1 {
+		t.Errorf("success cache has %d entries, want 1", n)
 	}
 }

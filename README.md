@@ -270,7 +270,9 @@ check.
 
 Unknown users are checked against a hash with the highest cost of the
 configured hashes, so that they take the same time as known ones (no user
-enumeration by timing, as long as all hashes have the same cost). Changing
+enumeration by timing, as long as all hashes have the same cost:
+`--check` warns when they do not). bcrypt only uses the first 72 bytes of
+a password, so longer passwords are remembered by those 72 bytes. Changing
 a password in the web configuration invalidates the remembered credentials
 of that user.
 

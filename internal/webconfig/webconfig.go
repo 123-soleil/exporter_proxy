@@ -120,6 +120,9 @@ type Summary struct {
 	CertPEM     string
 	ClientCAPEM string
 	HasUsers    bool
+	// MinBcryptCost and MaxBcryptCost are the lowest and highest costs of
+	// the basic_auth_users hashes (0 without users).
+	MinBcryptCost, MaxBcryptCost int
 }
 
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
@@ -131,14 +134,27 @@ func Read(path string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	minCost, maxCost := 0, 0
+	for _, h := range c.Users {
+		cost, err := bcrypt.Cost([]byte(h)) // checked by Load
+		if err != nil {
+			continue
+		}
+		if minCost == 0 || cost < minCost {
+			minCost = cost
+		}
+		maxCost = max(maxCost, cost)
+	}
 	return Summary{
-		TLSEnabled:   c.TLSConfig.IsEnabled(),
-		CertFile:     c.TLSConfig.TLSCertPath,
-		KeyFile:      c.TLSConfig.TLSKeyPath,
-		ClientCAFile: c.TLSConfig.ClientCAs,
-		CertPEM:      c.TLSConfig.TLSCert,
-		ClientCAPEM:  c.TLSConfig.ClientCAsText,
-		HasUsers:     len(c.Users) > 0,
+		MinBcryptCost: minCost,
+		MaxBcryptCost: maxCost,
+		TLSEnabled:    c.TLSConfig.IsEnabled(),
+		CertFile:      c.TLSConfig.TLSCertPath,
+		KeyFile:       c.TLSConfig.TLSKeyPath,
+		ClientCAFile:  c.TLSConfig.ClientCAs,
+		CertPEM:       c.TLSConfig.TLSCert,
+		ClientCAPEM:   c.TLSConfig.ClientCAsText,
+		HasUsers:      len(c.Users) > 0,
 	}, nil
 }
 

@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/123-soleil/exporter_proxy/internal/config"
 )
 
@@ -150,6 +152,12 @@ func TestWebConfigs(t *testing.T) {
 	writeFile(t, emptyCA, "not a certificate\n")
 	basicOnly := filepath.Join(dir, "basic.yml")
 	writeFile(t, basicOnly, "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n")
+	mixedCosts := filepath.Join(dir, "mixed-costs.yml")
+	low, err := bcrypt.GenerateFromPassword([]byte("p"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, mixedCosts, "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n  v: "+string(low)+"\n")
 	invalid := filepath.Join(dir, "invalid.yml")
 	writeFile(t, invalid, "tls_server_config:\n  cert_fil: x\n")
 
@@ -177,6 +185,8 @@ func TestWebConfigs(t *testing.T) {
 			[]want{{Problem, "X509KeyPair"}}},
 		{"basic auth without TLS", basicOnly,
 			[]want{{Warning, "credentials travel in clear text"}}},
+		{"bcrypt costs differ", mixedCosts,
+			[]want{{Warning, "credentials travel in clear text"}, {Warning, "different bcrypt costs (4 to 10)"}}},
 		{"unknown key", invalid, []want{{Problem, "cert_fil"}}},
 		{"missing file", filepath.Join(dir, "missing.yml"), []want{{Problem, "no such file"}}},
 	}

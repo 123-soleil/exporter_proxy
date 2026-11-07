@@ -95,6 +95,9 @@ const fakeHash = "$2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi"
 // user does not exist.
 var fakeHashes sync.Map // int -> []byte
 
+// bcryptMaxPassword is the length bcrypt cuts passwords to.
+const bcryptMaxPassword = 72
+
 // fakeHashFor returns a hash with the highest cost of the configured
 // hashes, so that an unknown user takes as long as a known one with a wrong
 // password (no user enumeration by timing). It is generated once per cost.
@@ -407,6 +410,12 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, known := c.Users[user]
 
+	// bcrypt only uses the first 72 bytes of a password: longer ones are
+	// cut the same way here, so that suffixes added to a valid password do
+	// not each fill an entry of the success cache.
+	if len(pass) > bcryptMaxPassword {
+		pass = pass[:bcryptMaxPassword]
+	}
 	// The key covers the stored hash: a password change in the web
 	// configuration invalidates the cached success. The password itself is
 	// never kept in memory.
