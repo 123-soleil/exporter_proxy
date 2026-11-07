@@ -326,3 +326,23 @@ func indent(s string) string {
 	}
 	return b.String()
 }
+
+// Every certificate of cert_file (leaf and intermediates) is date-checked.
+func TestCertFileIntermediateDates(t *testing.T) {
+	dir := t.TempDir()
+	goodCert, _ := writeCert(t, dir, "leaf", now.Add(-time.Hour), now.Add(365*24*time.Hour))
+	expiredCert, _ := writeCert(t, dir, "intermediate", now.Add(-48*time.Hour), now.Add(-time.Hour))
+	leafPEM, err := os.ReadFile(goodCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intPEM, err := os.ReadFile(expiredCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := filepath.Join(dir, "chain.crt")
+	writeFile(t, chain, string(leafPEM)+string(intPEM))
+	c := &checker{now: now}
+	c.certificates("here", "cert_file", chain, false)
+	expect(t, c.findings, want{Problem, `"CN=intermediate" expired on`})
+}

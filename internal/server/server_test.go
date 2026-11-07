@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1723,17 +1724,57 @@ func TestExpiredServerCertificateEveryHandshake(t *testing.T) {
 	}
 }
 
-// Startup refuses an expired server certificate instead of refusing every
-// handshake later.
-func TestStartRefusesExpiredServerCertificate(t *testing.T) {
+// An expired server certificate on one listener is logged at startup, and
+// only that listener's TLS connections are refused (as a server-side
+// failure): the service and its other listeners start.
+func TestStartWithExpiredServerCertificate(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := testTLSFiles(t, dir)
 	writeExpiredServerCert(t, cert, key)
 	web := writeWeb(t, dir, "web.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
-	_, err := Start(&config.Config{Listeners: []config.Listener{withAddr(t, listenerConfig("node", web, "http://127.0.0.1:1"))}},
-		Options{Logger: slog.New(slog.DiscardHandler)})
-	if err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Errorf("Start error = %v, want the expired server certificate", err)
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	logs := &syncBuffer{}
+	rec := &authRecorder{}
+	s, err := Start(&config.Config{Listeners: []config.Listener{
+		withAddr(t, listenerConfig("tls", web, up.URL)),
+		withAddr(t, listenerConfig("plain", plain, up.URL)),
+	}}, Options{Logger: slog.New(slog.NewTextHandler(logs, nil)), Recorder: rec})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+	if !strings.Contains(logs.String(), "server certificate outside its validity dates") {
+		t.Errorf("expired certificate not logged at startup: %s", logs.String())
+	}
+	if code, _ := get(t, "http://"+s.Addr("plain").String()+"/metrics", "", ""); code != http.StatusOK {
+		t.Errorf("other listener: code %d, want 200", code)
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // test
+	if _, err := client.Get("https://" + s.Addr("tls").String() + "/metrics"); err == nil {
+		t.Error("TLS listener served with an expired certificate")
+	}
+	if got := rec.got(); len(got) != 0 {
+		t.Errorf("refusal counted as client failures: %v", got)
+	}
+}
+
+// A file switched at runtime to ciphers that cannot carry HTTP/2, on a
+// listener that offers HTTP/2 since it started, is refused (as a
+// server-side failure) instead of breaking HTTP/2 clients.
+func TestHTTP2CiphersCheckedAgainstListener(t *testing.T) {
+	m := newMTLSTest(t, "")
+	m.writeWebRaw(t, "  max_version: TLS12\n  cipher_suites:\n    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\nhttp_server_config:\n  http2: false\n")
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Error("connection accepted with ciphers the listener's HTTP/2 cannot use")
+	}
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("not reported as a server-side failure (ok=%v)", ok)
 	}
 }
 
@@ -1755,5 +1796,44 @@ func TestUsersFoundByReloadStayRequired(t *testing.T) {
 	writeWeb(t, dir, "web.yml", "") // truncated before any request
 	if code, _ := get(t, "http://"+l.Listen+"/metrics", "", ""); code != StatusWebConfigUnreadable {
 		t.Errorf("code %d, want 518", code)
+	}
+}
+
+// A successful handshake that started before another one failed does not
+// report the settings as healthy.
+func TestTLSHealthSucceededSince(t *testing.T) {
+	var reports []bool
+	h := newTLSHealth(func() error { return nil }, func(ok bool) { reports = append(reports, ok) })
+	gen := h.generation()
+	h.failed()            // another handshake fails meanwhile
+	h.succeededSince(gen) // the first one ends well
+	if !slices.Equal(reports, []bool{false}) {
+		t.Errorf("reports = %v, want [false]", reports)
+	}
+	h.succeededSince(h.generation())
+	if !slices.Equal(reports, []bool{false, true}) {
+		t.Errorf("reports = %v, want [false true]", reports)
+	}
+}
+
+func TestCheckCertDatesWholeChain(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	good, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expCert, expKey := filepath.Join(dir, "e.pem"), filepath.Join(dir, "e.key")
+	writeExpiredServerCert(t, expCert, expKey)
+	expired, err := tls.LoadX509KeyPair(expCert, expKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := tls.Certificate{Certificate: [][]byte{good.Certificate[0], expired.Certificate[0]}}
+	if err := checkCertDates(&chain, time.Now()); !errors.Is(err, errCertDates) {
+		t.Errorf("expired intermediate: err = %v, want errCertDates", err)
+	}
+	if err := checkCertDates(&good, time.Now()); err != nil {
+		t.Errorf("valid certificate: %v", err)
 	}
 }

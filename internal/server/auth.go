@@ -149,9 +149,23 @@ func (t *tlsHealth) failed() {
 	t.report(false)
 }
 
-func (t *tlsHealth) succeeded() {
+// generation returns the count of failed handshakes, to pass to
+// succeededSince.
+func (t *tlsHealth) generation() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.gen
+}
+
+// succeededSince records a successful handshake that started at generation
+// gen, unless another handshake failed meanwhile: the file may have broken
+// after this one read it.
+func (t *tlsHealth) succeededSince(gen uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gen != gen {
+		return
+	}
 	t.failing = false
 	t.report(true)
 }

@@ -64,7 +64,7 @@ func load(path string, checkCA bool) (*web.Config, error) {
 		if err := validateClientCA(&c.TLSConfig, checkCA); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		if err := validateHTTP2Ciphers(c); err != nil {
+		if err := ValidateHTTP2Ciphers(c); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 	}
@@ -241,10 +241,10 @@ var http2RequiredCiphers = []web.Cipher{
 	web.Cipher(tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 }
 
-// validateHTTP2Ciphers rejects a cipher_suites list net/http refuses to
+// ValidateHTTP2Ciphers rejects a cipher_suites list net/http refuses to
 // serve HTTP/2 with: the listener would stop right after starting,
 // stopping the whole process.
-func validateHTTP2Ciphers(c *web.Config) error {
+func ValidateHTTP2Ciphers(c *web.Config) error {
 	tc := c.TLSConfig
 	if !c.HTTPConfig.HTTP2 || len(tc.CipherSuites) == 0 || tc.MinVersion >= web.TLSVersion(tls.VersionTLS13) {
 		return nil

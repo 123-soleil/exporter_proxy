@@ -844,9 +844,11 @@ certificate. With HTTP/2 enabled (the default) and `min_version` below
 `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` or
 `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, which net/http requires for
 HTTP/2: otherwise the listener would stop right after starting. A server
-certificate outside its validity dates is refused at startup and reload,
-and makes new TLS connections fail as a server-side error
-(`web_config_read_error`) if it expires while running.
+certificate chain (leaf or intermediate) outside its validity dates makes
+that listener's new TLS connections fail as a server-side error
+(`web_config_read_error`), whether it is found at startup or reload (also
+logged at `error` level; the other listeners keep running) or expires
+while running.
 `client_allowed_sans` requires a `client_auth_type` that verifies client
 certificates (`RequireAndVerifyClientCert` or `VerifyClientCertIfGiven`):
 otherwise any client could present a self-signed certificate carrying an

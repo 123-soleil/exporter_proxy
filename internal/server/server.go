@@ -181,6 +181,13 @@ func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
 	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
 		return nil, err
 	}
+	// The listener offers HTTP/2 as set when it started, whatever the file
+	// says now: its ciphers must carry it.
+	withListenerHTTP2 := *c
+	withListenerHTTP2.HTTPConfig.HTTP2 = l.settings.http2
+	if err := webconfig.ValidateHTTP2Ciphers(&withListenerHTTP2); err != nil {
+		return nil, err
+	}
 	return serverTLSConfig(c)
 }
 
@@ -214,24 +221,28 @@ func serverTLSConfig(c *web.Config) (*tls.Config, error) {
 	return cfg, nil
 }
 
-// checkCertDates refuses a server certificate outside its validity dates:
-// clients would reject it, and the failure would look like theirs.
+// errCertDates marks a server certificate chain outside its validity
+// dates.
+var errCertDates = errors.New("server certificate outside its validity dates")
+
+// checkCertDates refuses a server certificate chain (leaf and the
+// intermediates sent with it) outside its validity dates: clients would
+// reject it, and the failure would look like theirs.
 func checkCertDates(cert *tls.Certificate, now time.Time) error {
-	leaf := cert.Leaf
-	if leaf == nil {
-		if len(cert.Certificate) == 0 {
-			return errors.New("no server certificate")
-		}
-		var err error
-		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
-			return err
-		}
+	if len(cert.Certificate) == 0 {
+		return errors.New("no server certificate")
 	}
-	switch {
-	case now.After(leaf.NotAfter):
-		return fmt.Errorf("server certificate %q expired on %s", leaf.Subject, leaf.NotAfter.UTC().Format(time.RFC3339))
-	case now.Before(leaf.NotBefore):
-		return fmt.Errorf("server certificate %q is not valid before %s", leaf.Subject, leaf.NotBefore.UTC().Format(time.RFC3339))
+	for i, der := range cert.Certificate {
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("server certificate %d: %w", i+1, err)
+		}
+		switch {
+		case now.After(c.NotAfter):
+			return fmt.Errorf("%w: %q expired on %s", errCertDates, c.Subject, c.NotAfter.UTC().Format(time.RFC3339))
+		case now.Before(c.NotBefore):
+			return fmt.Errorf("%w: %q is not valid before %s", errCertDates, c.Subject, c.NotBefore.UTC().Format(time.RFC3339))
+		}
 	}
 	return nil
 }
@@ -599,9 +610,16 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			wc, err = webconfig.Load(sp.webConfig)
 		}
 		if err == nil && wc.TLSConfig.IsEnabled() {
-			// What every new connection would check, server certificate
-			// dates included: refused now rather than on every handshake.
+			// What every new connection would check. A certificate outside
+			// its dates only stops that listener's TLS connections (as a
+			// server-side failure): logged, not refused, so that the other
+			// listeners and the metrics endpoint keep running.
 			_, err = serverTLSConfig(wc)
+			if errors.Is(err, errCertDates) {
+				s.logger.Error("server certificate outside its validity dates: new TLS connections will be refused",
+					"listener", sp.name, "web_config_file", sp.webConfig, "err", errfmt.OneLine(err))
+				err = nil
+			}
 		}
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
@@ -703,6 +721,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		gen := health.generation()
 		// The client CA is checked on the pool built from a single read of
 		// it (tlsConfigFor), not read twice.
 		c, err := webconfig.LoadForRequest(webConfig)
@@ -713,7 +732,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		if err != nil {
 			return nil, fail(err)
 		}
-		health.succeeded()
+		health.succeededSince(gen)
 		cfg.NextProtos = nextProtos
 		return cfg, nil
 	}

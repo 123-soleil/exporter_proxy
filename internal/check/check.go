@@ -122,8 +122,9 @@ func (c *checker) certificates(where, key, path string, bundle bool) {
 
 // certificatesPEM checks the validity dates of PEM certificates.
 //
-// For a server certificate, only the first one (the leaf) matters, and any
-// problem with it is a problem. A client CA bundle is judged like crypto/tls
+// For a server certificate, every certificate of the chain sent to clients
+// (leaf and intermediates) must be within its dates: any problem is a
+// problem, and an unparseable leaf stops the check. A client CA bundle is judged like crypto/tls
 // uses it: certificates it cannot use (unparseable, expired, not valid yet)
 // are only warnings, normal while rotating CAs, as long as one certificate
 // is currently valid.
@@ -157,9 +158,6 @@ func (c *checker) certificatesPEM(where, label string, data []byte, bundle bool)
 			if cert.NotAfter.Sub(c.now) < expiryWarning {
 				c.add(Warning, where, "%s: certificate %q expires on %s", label, subject, cert.NotAfter.UTC().Format(time.RFC3339))
 			}
-		}
-		if !bundle {
-			return // only the leaf certificate matters for cert_file
 		}
 	}
 	if bundle && valid == 0 {
