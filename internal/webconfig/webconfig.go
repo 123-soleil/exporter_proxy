@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/prometheus/exporter-toolkit/web"
 	"go.yaml.in/yaml/v2"
@@ -53,6 +52,10 @@ func load(path string, checkCA bool) (*web.Config, error) {
 	}
 	if err := validateAllowedSANs(&c.TLSConfig); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	// A rate_limit interval with no burst would refuse every request.
+	if rl := c.RateLimiterConfig; rl.Interval > 0 && rl.Burst < 1 {
+		return nil, fmt.Errorf("parse %s: rate_limit: burst must be at least 1 when interval is set", path)
 	}
 	// Paths are relative to the file, like exporter-toolkit: resolved
 	// before the checks that read them.
@@ -189,53 +192,35 @@ func validateClientCA(tc *web.TLSConfig, checkContent bool) error {
 	return checkClientCAContent(tc)
 }
 
-// caCheckKey identifies a client CA content whose check is cached: a file
-// by path, size and modification time, or an inline text by its hash.
-type caCheckKey struct {
-	path    string
-	size    int64
-	modTime time.Time
-	inline  [sha256.Size]byte
-}
-
-// caChecks caches client CA checks: Load runs on every request, and
-// parsing a large bundle each time would cost milliseconds. The CA itself
-// is still loaded on every new TLS connection.
+// caChecks caches the result of client CA checks by content hash: parsing
+// a large bundle on every new TLS connection would cost milliseconds.
+// Keyed by content, not file metadata, so that a file rewritten keeping its
+// size and modification time (cp -p, rsync -t) is checked again.
 var caChecks = struct {
 	sync.Mutex
-	m map[caCheckKey]error
-}{m: map[caCheckKey]error{}}
+	m map[[sha256.Size]byte]error
+}{m: map[[sha256.Size]byte]error{}}
 
-// maxCACheckEntries bounds the cache (a few CA files per process).
+// maxCACheckEntries bounds the cache (a few CA contents per process).
 const maxCACheckEntries = 64
 
 // checkClientCAContent rejects a client CA without any certificate, which
 // would refuse every client.
 func checkClientCAContent(tc *web.TLSConfig) error {
-	var key caCheckKey
+	pemData := []byte(tc.ClientCAsText)
 	if tc.ClientCAs != "" {
-		info, err := os.Stat(tc.ClientCAs)
+		data, err := os.ReadFile(tc.ClientCAs)
 		if err != nil {
 			return fmt.Errorf("client_ca_file: %w", err)
 		}
-		key = caCheckKey{path: tc.ClientCAs, size: info.Size(), modTime: info.ModTime()}
-	} else {
-		key = caCheckKey{inline: sha256.Sum256([]byte(tc.ClientCAsText))}
+		pemData = data
 	}
+	key := sha256.Sum256(pemData)
 	caChecks.Lock()
 	err, ok := caChecks.m[key]
 	caChecks.Unlock()
 	if ok {
 		return err
-	}
-
-	pemData := []byte(tc.ClientCAsText)
-	if tc.ClientCAs != "" {
-		data, readErr := os.ReadFile(tc.ClientCAs)
-		if readErr != nil {
-			return fmt.Errorf("client_ca_file: %w", readErr) // not cached: may be transient
-		}
-		pemData = data
 	}
 	if !x509.NewCertPool().AppendCertsFromPEM(pemData) {
 		err = errors.New("the client CA contains no certificate: every client would be refused")

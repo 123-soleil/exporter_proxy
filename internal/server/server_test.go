@@ -1570,3 +1570,15 @@ func TestSystemdNonStreamSocketsRefused(t *testing.T) {
 		})
 	}
 }
+
+func TestQuotedSANsUnambiguous(t *testing.T) {
+	if quotedSANs([]string{"a\nb"}) == quotedSANs([]string{"a", "b"}) {
+		t.Error(`["a\nb"] and ["a","b"] share an encoding`)
+	}
+	if quotedSANs([]string{"b", "a"}) != quotedSANs([]string{"a", "b"}) {
+		t.Error("order changes the encoding")
+	}
+	if quotedSANs(nil) != "" {
+		t.Error("unset list not empty")
+	}
+}

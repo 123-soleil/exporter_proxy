@@ -294,3 +294,43 @@ func TestLoadForRequestSkipsClientCA(t *testing.T) {
 		t.Error("Load accepted a missing client CA file")
 	}
 }
+
+// A CA file rewritten keeping its size and modification time is checked
+// again (the cache is keyed by content).
+func TestClientCACheckSeesSameSizeRewrite(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	writeTestCA(t, ca)
+	info, err := os.Stat(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: ca.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid CA: %v", err)
+	}
+	junk := []byte(strings.Repeat("x", int(info.Size())))
+	if err := os.WriteFile(ca, junk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(ca, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "contains no certificate") {
+		t.Errorf("same-size rewrite not checked again: %v", err)
+	}
+}
+
+func TestLoadRejectsRateLimitWithoutBurst(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(p, []byte("rate_limit:\n  interval: 1s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "burst must be at least 1") {
+		t.Errorf("Load error = %v, want burst must be at least 1", err)
+	}
+}

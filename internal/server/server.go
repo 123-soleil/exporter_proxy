@@ -109,7 +109,7 @@ type listenerSettings struct {
 type mtlsSettings struct {
 	clientAuth  string // normalized client_auth_type
 	clientCA    bool   // a client CA is configured (file or inline)
-	allowedSANs string // sorted client_allowed_sans, newline-separated
+	allowedSANs string // sorted client_allowed_sans, quoted: unambiguous
 }
 
 func mtlsOf(tc *web.TLSConfig) mtlsSettings {
@@ -119,8 +119,17 @@ func mtlsOf(tc *web.TLSConfig) mtlsSettings {
 	return mtlsSettings{
 		clientAuth:  webconfig.NormalizeClientAuth(tc.ClientAuth),
 		clientCA:    tc.ClientCAs != "" || tc.ClientCAsText != "",
-		allowedSANs: strings.Join(slices.Sorted(slices.Values(tc.ClientAllowedSans)), "\n"),
+		allowedSANs: quotedSANs(tc.ClientAllowedSans),
 	}
+}
+
+// quotedSANs encodes a client_allowed_sans list for comparison: sorted and
+// quoted, so that no two lists share an encoding; empty when unset.
+func quotedSANs(sans []string) string {
+	if len(sans) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%q", slices.Sorted(slices.Values(sans)))
 }
 
 func settingsOf(wc *web.Config) listenerSettings {

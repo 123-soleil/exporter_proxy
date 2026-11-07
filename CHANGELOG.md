@@ -136,8 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificates are warnings while one is valid, normal while rotating CAs)
   and checks the dates of inline certificates; startup and reload report
   every web configuration breaking exporter_proxy's rules at once.
-- The client CA check of `Load` is cached until the file changes, instead
-  of parsing the bundle on every request.
+- The client CA check is cached by content hash (a rewrite keeping size
+  and modification time is checked again), instead of parsing the bundle
+  every time.
+- A `rate_limit` with an `interval` but no `burst` is invalid: it refused
+  every request.
 - `client_allowed_sans` requires a verifying `client_auth_type` (with an
   unverified certificate, names could be forged) and cannot be empty; it is
   also checked on TLS session resumption, and a client without a

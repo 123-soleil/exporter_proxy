@@ -66,7 +66,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
 `OPTIONS *` goes through authentication like any request (no automatic
-answer from net/http), then gets `404`.
+answer from net/http), then gets `404` (`400` on the metrics endpoint).
 
 `404` and `405` are answered before taking a concurrency slot: only real
 source reads count against `max_concurrent_requests`. A request whose client
