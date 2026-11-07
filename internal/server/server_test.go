@@ -1907,3 +1907,46 @@ func TestTLSFailureReportedOnlyOnceApplied(t *testing.T) {
 		t.Errorf("failing listener not reported after the reload (ok=%v, any=%v)", ok, any)
 	}
 }
+
+// A reload re-checks the TLS settings of the listeners it keeps: a
+// certificate expired without any new connection since is reported, and a
+// failure fixed before the reload is no longer reported.
+func TestReloadRechecksKeptListenersTLS(t *testing.T) {
+	m := newMTLSTest(t, "")
+	certPEM, err := os.ReadFile(m.cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(m.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadAndReport := func() {
+		t.Helper()
+		m.s.mu.Lock()
+		before := m.s.listeners["node"]
+		m.s.mu.Unlock()
+		m.reload(t)
+		m.s.mu.Lock()
+		kept := m.s.listeners["node"] == before
+		m.s.mu.Unlock()
+		if !kept {
+			t.Fatal("listener restarted: this test is about kept listeners")
+		}
+		m.rec.WebConfigRead("node", true, true) // the metrics reset by ConfigLoaded
+		m.s.ReportTLSHealth()
+	}
+
+	writeExpiredServerCert(t, m.cert, m.key) // expired, no handshake since
+	reloadAndReport()
+	if ok, _ := m.rec.lastTLSRead(); ok {
+		t.Error("expired certificate of a kept listener not reported after the reload")
+	}
+
+	writeWeb(t, filepath.Dir(m.cert), filepath.Base(m.cert), string(certPEM)) // fixed
+	writeWeb(t, filepath.Dir(m.key), filepath.Base(m.key), string(keyPEM))
+	reloadAndReport()
+	if ok, _ := m.rec.lastTLSRead(); !ok {
+		t.Error("stale TLS alarm reported after a reload that found the settings fixed")
+	}
+}

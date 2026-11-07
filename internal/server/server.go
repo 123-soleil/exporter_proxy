@@ -443,7 +443,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 	type swap struct {
 		l         *listener
 		sp        spec
-		basicAuth bool // the web configuration has users
+		basicAuth bool  // the web configuration has users
+		tlsErr    error // TLS settings checked like a new connection
 	}
 	var swaps []swap
 	var started []*listener
@@ -465,7 +466,11 @@ func (s *Server) Reload(cfg *config.Config) error {
 			running, next := cur.running(), settingsOf(wc)
 			running.basicAuth = running.basicAuth || next.basicAuth
 			if next == running {
-				swaps = append(swaps, swap{cur, sp, next.basicAuth})
+				var tlsErr error
+				if next.tls {
+					_, tlsErr = cur.tlsConfigFor(wc)
+				}
+				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr})
 				kept[sp.name] = true
 				continue
 			}
@@ -526,6 +531,15 @@ func (s *Server) Reload(cfg *config.Config) error {
 			// Users found by the reload are required from now on, like
 			// users seen by a request (fail closed).
 			sw.l.auth.usersSeen.Store(true)
+		}
+		// The TLS state checked by this reload replaces the previous one,
+		// reported by ReportTLSHealth once the metrics are reset.
+		if h := sw.l.auth.tlsHealth; h != nil {
+			if sw.tlsErr != nil {
+				h.markFailing()
+			} else {
+				h.markHealthy()
+			}
 		}
 	}
 	next := make(map[string]*listener, len(specs))

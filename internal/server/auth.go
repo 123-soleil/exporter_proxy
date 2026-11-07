@@ -159,6 +159,16 @@ func (t *tlsHealth) markFailing() {
 	t.gen++
 }
 
+// markHealthy records that the TLS settings load, without reporting it
+// (ReportTLSHealth only reports failures; a configuration load resets the
+// metric). Handshakes still running from before do not count.
+func (t *tlsHealth) markHealthy() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = false
+	t.gen++
+}
+
 // reportFailing reports the failure again, if any.
 func (t *tlsHealth) reportFailing() {
 	t.mu.Lock()
