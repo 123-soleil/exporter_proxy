@@ -162,8 +162,10 @@ func (t *tlsHealth) markFailing() {
 // markHealthySince records that the TLS settings loaded when checked at
 // generation gen, without reporting it (ReportTLSHealth only reports
 // failures; a configuration load resets the metric). A handshake failing
-// since keeps the failure: the file may have broken after the check.
-// Handshakes still running from before do not count.
+// since keeps the failure: the file may have broken after the check. A
+// failure from a handshake that read the file before the check keeps it
+// too, until the next request rechecks it (recover) or the next handshake
+// succeeds.
 func (t *tlsHealth) markHealthySince(gen uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

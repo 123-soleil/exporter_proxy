@@ -454,6 +454,12 @@ func (s *Server) Reload(cfg *config.Config) error {
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
 		if cur != nil && cur.spec.listen == sp.listen && cur.spec.webConfig == sp.webConfig {
+			// Read before the file: a handshake failing on a file changed
+			// after this read is not cleared by the check below.
+			var tlsGen uint64
+			if h := cur.auth.tlsHealth; h != nil {
+				tlsGen = h.generation()
+			}
 			wc, err := webconfig.Load(sp.webConfig)
 			if err != nil {
 				s.abortReload(started)
@@ -468,9 +474,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 			running.basicAuth = running.basicAuth || next.basicAuth
 			if next == running {
 				var tlsErr error
-				var tlsGen uint64
 				if next.tls {
-					tlsGen = cur.auth.tlsHealth.generation()
 					_, tlsErr = cur.tlsConfigFor(wc)
 				}
 				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr, tlsGen})

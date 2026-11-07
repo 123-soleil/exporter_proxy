@@ -316,6 +316,15 @@ func TestCertificatesLeafOnly(t *testing.T) {
 		want{Problem, "no currently valid certificate"})
 }
 
+// Unparseable certificates of a bundle are numbered by their position.
+func TestCertificateNumbering(t *testing.T) {
+	garbage := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("garbage")}))
+	c := &checker{now: time.Now()}
+	c.certificatesPEM("here", "client_ca", []byte(garbage+garbage), true)
+	expect(t, c.findings, want{Warning, "certificate 1:"}, want{Warning, "certificate 2:"},
+		want{Problem, "no currently valid certificate"})
+}
+
 // indent indents every line of s for a YAML block scalar.
 func indent(s string) string {
 	var b strings.Builder

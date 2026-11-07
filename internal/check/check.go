@@ -134,25 +134,25 @@ func (c *checker) certificatesPEM(where, label string, data []byte, bundle bool)
 	if bundle {
 		issue = Warning
 	}
-	count, valid := 0, 0
+	n, valid := 0, 0 // n: certificates seen, parsed or not
 	for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
-		if !bundle && count == 1 {
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		n++
+		if !bundle && n == 2 {
 			// Intermediates: an expired one (an old cross-signature) is
 			// skipped by clients building another path, so only a warning.
 			issue = Warning
 		}
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			c.add(issue, where, "%s: certificate %d: %v", label, count+1, err)
+			c.add(issue, where, "%s: certificate %d: %v", label, n, err)
 			if !bundle {
 				return // the leaf certificate is unusable: the next ones are not leaves
 			}
 			continue
 		}
-		count++
 		subject := cert.Subject.String()
 		switch {
 		case c.now.After(cert.NotAfter):
