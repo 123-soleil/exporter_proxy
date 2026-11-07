@@ -1692,3 +1692,68 @@ func TestReloadAfterUsersAddedKeepsListener(t *testing.T) {
 		t.Errorf("users not enforced: code %d, want 401", code)
 	}
 }
+
+// With an expired server certificate, no handshake reports the TLS settings
+// as healthy: neither one stopping early (an old TLS version) nor a TLS 1.3
+// session resumption, which is refused too.
+func TestExpiredServerCertificateEveryHandshake(t *testing.T) {
+	m := newMTLSTest(t, "")
+	resuming := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{ //nolint:gosec // test certificate
+			InsecureSkipVerify: true, ClientSessionCache: tls.NewLRUClientSessionCache(4),
+		},
+		DisableKeepAlives: true,
+	}}
+	for range 2 { // get a session ticket
+		if err := tlsGet(resuming, m.url()); err != nil {
+			t.Fatalf("before: %v", err)
+		}
+	}
+
+	writeExpiredServerCert(t, m.cert, m.key)
+	if err := tlsGet(resuming, m.url()); err == nil {
+		t.Error("TLS 1.3 session resumed with an expired server certificate")
+	}
+	old := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{ //nolint:gosec // test
+		InsecureSkipVerify: true, MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS10,
+	}}}
+	_ = tlsGet(old, m.url())
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("TLS settings reported healthy with an expired certificate (ok=%v)", ok)
+	}
+}
+
+// Startup refuses an expired server certificate instead of refusing every
+// handshake later.
+func TestStartRefusesExpiredServerCertificate(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	writeExpiredServerCert(t, cert, key)
+	web := writeWeb(t, dir, "web.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+	_, err := Start(&config.Config{Listeners: []config.Listener{withAddr(t, listenerConfig("node", web, "http://127.0.0.1:1"))}},
+		Options{Logger: slog.New(slog.DiscardHandler)})
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Errorf("Start error = %v, want the expired server certificate", err)
+	}
+}
+
+// Users found by a reload that keeps the listener are required from then
+// on: a file losing them afterwards answers 518.
+func TestUsersFoundByReloadStayRequired(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	writeWeb(t, dir, "web.yml", "") // truncated before any request
+	if code, _ := get(t, "http://"+l.Listen+"/metrics", "", ""); code != StatusWebConfigUnreadable {
+		t.Errorf("code %d, want 518", code)
+	}
+}

@@ -174,17 +174,24 @@ func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
 	return nil
 }
 
-// tlsConfigFor builds the TLS configuration of a new connection from c with
-// exporter-toolkit, then applies exporter_proxy's rules: client certificate
-// settings fixed while the listener runs, a client CA pool with at least
-// one certificate (checked on the pool built from the single read of the
-// file, so a rewrite between two reads cannot slip through),
-// client_allowed_sans also on resumption, and a server certificate within
-// its validity dates (fail reports it, at handshake time).
-func (l *listener) tlsConfigFor(c *web.Config, fail func(error) error) (*tls.Config, error) {
+// tlsConfigFor builds the TLS configuration of a new connection: the
+// client certificate settings must be those the listener started with, then
+// serverTLSConfig applies.
+func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
 	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
 		return nil, err
 	}
+	return serverTLSConfig(c)
+}
+
+// serverTLSConfig builds a TLS configuration from c with exporter-toolkit,
+// then applies exporter_proxy's rules: a client CA pool with at least one
+// certificate (checked on the pool built from the single read of the file),
+// a server certificate within its validity dates, loaded once and pinned in
+// the configuration (so that every handshake of the connection, TLS 1.3
+// session resumption included, goes through this check), and
+// client_allowed_sans also on resumption.
+func serverTLSConfig(c *web.Config) (*tls.Config, error) {
 	cfg, err := web.ConfigToTLSConfig(&c.TLSConfig)
 	if err != nil {
 		return nil, err
@@ -192,19 +199,18 @@ func (l *listener) tlsConfigFor(c *web.Config, fail func(error) error) (*tls.Con
 	if cfg.ClientCAs != nil && cfg.ClientCAs.Equal(x509.NewCertPool()) {
 		return nil, errors.New("the client CA contains no certificate: every client would be refused")
 	}
-	restrictSANsOnResumption(cfg, c.TLSConfig)
-	if getCert := cfg.GetCertificate; getCert != nil {
-		cfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			cert, err := getCert(hello)
-			if err == nil {
-				err = checkCertDates(cert, time.Now())
-			}
-			if err != nil {
-				return nil, fail(err)
-			}
-			return cert, nil
+	if cfg.GetCertificate != nil {
+		cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil {
+			return nil, err
 		}
+		if err := checkCertDates(cert, time.Now()); err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []tls.Certificate{*cert}
+		cfg.GetCertificate = nil
 	}
+	restrictSANsOnResumption(cfg, c.TLSConfig)
 	return cfg, nil
 }
 
@@ -424,8 +430,9 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 
 	type swap struct {
-		l  *listener
-		sp spec
+		l         *listener
+		sp        spec
+		basicAuth bool // the web configuration has users
 	}
 	var swaps []swap
 	var started []*listener
@@ -447,7 +454,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 			running, next := cur.running(), settingsOf(wc)
 			running.basicAuth = running.basicAuth || next.basicAuth
 			if next == running {
-				swaps = append(swaps, swap{cur, sp})
+				swaps = append(swaps, swap{cur, sp, next.basicAuth})
 				kept[sp.name] = true
 				continue
 			}
@@ -504,6 +511,11 @@ func (s *Server) Reload(cfg *config.Config) error {
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
 		retire(sw.l.handler.store(sw.sp))
+		if sw.basicAuth {
+			// Users found by the reload are required from now on, like
+			// users seen by a request (fail closed).
+			sw.l.auth.usersSeen.Store(true)
+		}
 	}
 	next := make(map[string]*listener, len(specs))
 	for name := range kept {
@@ -580,10 +592,16 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	var problems []string
 	for _, sp := range specs {
 		err := web.Validate(sp.webConfig)
+		var wc *web.Config
 		if err == nil {
 			// exporter_proxy's own rules, checked for every file now so that
 			// all problems are reported at once.
-			_, err = webconfig.Load(sp.webConfig)
+			wc, err = webconfig.Load(sp.webConfig)
+		}
+		if err == nil && wc.TLSConfig.IsEnabled() {
+			// What every new connection would check, server certificate
+			// dates included: refused now rather than on every handshake.
+			_, err = serverTLSConfig(wc)
 		}
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
@@ -678,11 +696,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		if err != nil {
 			return err
 		}
-		cfg, err := l.tlsConfigFor(c, fail)
-		if err != nil {
-			return err
-		}
-		_, err = cfg.GetCertificate(&tls.ClientHelloInfo{})
+		_, err = l.tlsConfigFor(c)
 		return err
 	}, func(ok bool) { s.recorder().WebConfigRead(sp.name, true, ok) })
 	auth.tlsHealth = health
@@ -695,7 +709,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		if err != nil {
 			return nil, fail(err)
 		}
-		cfg, err := l.tlsConfigFor(c, fail)
+		cfg, err := l.tlsConfigFor(c)
 		if err != nil {
 			return nil, fail(err)
 		}
