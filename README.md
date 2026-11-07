@@ -1,7 +1,7 @@
 # exporter_proxy
 
-> **Status: under development.** Nothing is implemented yet; this document
-> describes the intended design and may change before the first release.
+> **Status: pre-release.** Implemented and tested; the configuration and
+> metrics may still change before the first release.
 
 A small reverse proxy that puts **TLS, mutual TLS (mTLS) and/or HTTP basic
 authentication** in front of Prometheus exporters that do not support them
@@ -350,8 +350,10 @@ Besides the standard `go_*`, `process_*` and
   for the next handshake. Requests do not read the client CA, checked on
   every new connection: a CA file briefly missing while being rotated does
   not fail requests on connections already open.
-  Reset by a successful reload; `listener="metrics"` for the metrics
-  endpoint.
+  Reset by a successful reload, except for TLS failures still current
+  (server certificate outside its dates, or a handshake failing on the
+  server's settings after the reload checked them), shown again right
+  after; `listener="metrics"` for the metrics endpoint.
 
 Labels only take values from the configuration (listener names and route
 paths), from a fixed set (`reason`) or from HTTP status codes, never client
@@ -686,7 +688,8 @@ The process runs in the foreground and logs to stderr. At startup it:
 On `SIGTERM` (`systemctl stop`) or `SIGINT`, it stops accepting connections,
 waits up to 15 seconds for in-flight requests to complete, closes the
 remaining connections and exits with code `0` (`1` if connections had to be
-closed or if a listener failed while running).
+closed or if a listener failed while running; `2` for a command-line usage
+error).
 
 HTTP server limits: 10 s to receive the request (headers included), write
 deadline of the longest route `timeout` plus 10 s, 60 s keep-alive idle
@@ -737,7 +740,9 @@ otherwise; warnings do not fail the check:
   then be refused): run `--check` after changing certificates;
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
-- basic authentication without TLS is a warning;
+- basic authentication without TLS is a warning, and so are
+  `basic_auth_users` hashes with different bcrypt costs (response times
+  would tell users apart);
 - each `file` route: the file exists, is a regular file, is readable and is
   not older than `max_age` nor more than `max_age` in the future;
 - each `unix_socket` route: the path exists, is a socket and is writable by
@@ -785,7 +790,7 @@ the `listen` value as written):
 
 | Change | Effect |
 |--------|--------|
-| Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2, `rate_limit`, presence of `basic_auth_users` and client certificate settings (`client_auth_type`, client CA content, `client_allowed_sans`) in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
+| Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2, `rate_limit` and client certificate settings (`client_auth_type`, client CA content, `client_allowed_sans`) in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
 | Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. |
 | New `listen` address | Bound at reload. |
 | New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
@@ -817,7 +822,9 @@ while running, like exporter-toolkit does:
 
 Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`),
 `rate_limit`, whether it requires basic authentication and its client
-certificate settings are read when the listener starts. Authentication
+certificate settings are read when the listener starts. Users added to
+`basic_auth_users` apply at once, without restarting the listener;
+removing them all makes a reload fail (see below). Authentication
 fails closed, never open:
 
 - a listener started with `basic_auth_users`, or whose file gained users
