@@ -2,12 +2,14 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -169,6 +171,85 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 
 	v.checkLimits(where, r.fileLimits)
 	v.checkAuthorize(where, r.Authorize)
+	v.checkForwardParams(where, r)
+	v.checkCacheTTL(where, r)
+}
+
+// checkCacheTTL allows a cache on upstream routes only, without
+// forward_params (unbounded keys; probes must be live), bounded by
+// MaxCacheTTL.
+func (v *validator) checkCacheTTL(where string, r fileRoute) {
+	if r.CacheTTL == nil {
+		return
+	}
+	switch {
+	case *r.CacheTTL <= 0:
+		v.addf(where, "cache_ttl must be greater than 0")
+	case *r.CacheTTL > MaxCacheTTL:
+		v.addf(where, "cache_ttl must be at most %s", MaxCacheTTL)
+	case r.Upstream == "":
+		v.addf(where, "cache_ttl requires an upstream (files are read without cost)")
+	case r.ForwardParams != nil:
+		v.addf(where, "cache_ttl and forward_params are mutually exclusive (probes must be live)")
+	}
+}
+
+// paramNamePattern restricts forwarded query parameter names.
+var paramNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// checkForwardParams checks forward_params: HTTP upstreams only, each
+// parameter restricted to listed values or patterns, never one the
+// upstream URL already sets.
+func (v *validator) checkForwardParams(where string, r fileRoute) {
+	if r.ForwardParams == nil {
+		return
+	}
+	if len(r.ForwardParams) == 0 {
+		v.addf(where, "forward_params is empty: remove it or list the parameters")
+		return
+	}
+	if r.Upstream == "" {
+		v.addf(where, "forward_params requires an upstream (not a file route)")
+		return
+	}
+	var fixed url.Values
+	if u, err := url.Parse(r.Upstream); err == nil {
+		// Forwarded parameters are appended to this query as written:
+		// every parameter in it must be seen to be protected.
+		if fixed, err = url.ParseQuery(u.RawQuery); err != nil {
+			v.addf(where, "forward_params: the upstream URL query cannot be parsed (%v): write it as name=value pairs joined by '&'", err)
+			return
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(r.ForwardParams)) {
+		p := r.ForwardParams[name]
+		pw := fmt.Sprintf("forward_params %q", name)
+		switch {
+		case !paramNamePattern.MatchString(name):
+			v.addf(where, "%s: name must only contain letters, digits, '_', '.' and '-'", pw)
+		case fixed.Has(name):
+			v.addf(where, "%s: already set in the upstream URL", pw)
+		}
+		if len(p.Values) == 0 && len(p.Patterns) == 0 {
+			v.addf(where, "%s: list the allowed values or patterns (any value would be forwarded)", pw)
+		}
+		for _, val := range p.Values {
+			if val == "" || len(val) > MaxParamValueLength {
+				v.addf(where, "%s: values must be non-empty and at most %d bytes", pw, MaxParamValueLength)
+				break
+			}
+		}
+		for _, pat := range p.Patterns {
+			// The pattern must be valid on its own: one closing the
+			// anchoring group early ("a)|(.*") would match anything once
+			// wrapped.
+			if _, err := regexp.Compile(pat); err != nil {
+				v.addf(where, "%s: invalid pattern %q: %v", pw, pat, err)
+			} else if _, err := regexp.Compile(AnchorPattern(pat)); err != nil {
+				v.addf(where, "%s: invalid pattern %q: %v", pw, pat, err)
+			}
+		}
+	}
 }
 
 // checkAuthorize rejects an authorize block that would refuse every

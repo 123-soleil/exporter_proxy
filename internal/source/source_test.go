@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -500,5 +502,55 @@ func TestHTTPSourceProtobuf(t *testing.T) {
 				t.Errorf("Protobuf = %v, want %v", res.Protobuf, tt.wantProto)
 			}
 		})
+	}
+}
+
+// The upstream gets the time the read may take, never the client's value.
+func TestHTTPSourceSendsScrapeTimeout(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(ScrapeTimeoutHeader)
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer srv.Close()
+	s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics", Limits: limits(4*time.Second, 1<<20)})
+	if _, err := s.Fetch(context.Background(), Request{}); err != nil {
+		t.Fatal(err)
+	}
+	secs, err := strconv.ParseFloat(got, 64)
+	if err != nil || secs <= 3.5 || secs > 4 {
+		t.Errorf("%s = %q, want about 4 (the route timeout)", ScrapeTimeoutHeader, got)
+	}
+	// A shorter deadline from the caller is what is left.
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	if _, err := s.Fetch(ctx, Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if secs, _ := strconv.ParseFloat(got, 64); secs <= 1 || secs > 1.5 {
+		t.Errorf("with a 1.5s deadline: %s = %q", ScrapeTimeoutHeader, got)
+	}
+}
+
+// Forwarded parameters are appended to the upstream URL's query, which is
+// kept as written.
+func TestHTTPSourceAppendsQuery(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.RawQuery
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer srv.Close()
+	for upstream, want := range map[string]string{
+		"/probe?module=a&flag": "module=a&flag&target=t%3A1",
+		"/probe":               "target=t%3A1",
+	} {
+		s := mustNew(t, config.Route{Upstream: srv.URL + upstream, Limits: limits(2*time.Second, 1<<20)})
+		if _, err := s.Fetch(context.Background(), Request{Query: url.Values{"target": {"t:1"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s: upstream query %q, want %q", upstream, got, want)
+		}
 	}
 }

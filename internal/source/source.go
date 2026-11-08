@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
@@ -83,6 +84,11 @@ type Request struct {
 	// (needed for native histograms), with the text format as fallback.
 	// Files are always read as text.
 	Protobuf bool
+
+	// Query holds the query parameters forwarded to an HTTP upstream,
+	// already checked against the route's forward_params; added to those
+	// of the upstream URL.
+	Query url.Values
 }
 
 // Source reads the metrics of one route.

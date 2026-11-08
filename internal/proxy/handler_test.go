@@ -49,16 +49,23 @@ func (b *blockingSource) Fetch(ctx context.Context, _ source.Request) (*source.R
 
 // recorder captures Recorder events.
 type recorder struct {
-	mu       sync.Mutex
-	served   []string // "route code"
-	rejected int
-	inFlight int
-	maxIn    int
-	reads    []int
-	modTimes []time.Time
-	parsed   []int
-	failed   []source.Reason
-	shared   int
+	mu        sync.Mutex
+	served    []string // "route code"
+	rejected  int
+	inFlight  int
+	maxIn     int
+	reads     []int
+	modTimes  []time.Time
+	parsed    []int
+	failed    []source.Reason
+	shared    int
+	cacheHits int
+}
+
+func (r *recorder) CacheHit(string, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheHits++
 }
 
 func (r *recorder) RequestShared(string, string) {

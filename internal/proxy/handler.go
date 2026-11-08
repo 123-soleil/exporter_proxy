@@ -11,8 +11,11 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 
@@ -49,6 +52,9 @@ type Recorder interface {
 	// ContentParsed is called after parsing, successful or not; samples is
 	// only meaningful when valid.
 	ContentParsed(listener, route string, samples int, duration time.Duration, valid bool)
+	// CacheHit is called for a request answered from the cache of a
+	// route with cache_ttl.
+	CacheHit(listener, route string)
 	// RequestShared is called for a request answered with the result of a
 	// read started by a concurrent request of the same route.
 	RequestShared(listener, route string)
@@ -93,7 +99,9 @@ type route struct {
 	path       string
 	src        source.Source
 	maxSamples int
-	authz      *authorization // nil: every authenticated client
+	authz      *authorization                 // nil: every authenticated client
+	params     map[string]config.ForwardParam // nil: the query string is ignored
+	cacheTTL   time.Duration                  // 0: no cache
 }
 
 // Handler serves the routes of one listener.
@@ -104,9 +112,11 @@ type Handler struct {
 	logger    *slog.Logger
 	rec       Recorder
 	accessLog bool
-	// mu protects reads: the source reads running, by route.
+	// mu protects reads, the source reads running, and cache, the results
+	// kept for routes with cache_ttl, by route and format.
 	mu    sync.Mutex
 	reads map[string]*sharedRead
+	cache map[string]*sharedRead
 	// logs bounds the warn lines a client can trigger on this listener
 	// (rejections, source failures): beyond, they are logged at debug
 	// level. They are all counted in the metrics.
@@ -136,7 +146,7 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
-			authz: newAuthorization(r.Authorize)})
+			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -151,6 +161,7 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 		accessLog: opts.AccessLog,
 		logs:      rate.NewLimiter(logRate, logBurst),
 		reads:     map[string]*sharedRead{},
+		cache:     map[string]*sharedRead{},
 	}
 	if h.logger == nil {
 		h.logger = slog.New(slog.DiscardHandler)
@@ -194,9 +205,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		d := time.Since(start)
 		h.rec.RequestServed(h.listener, routeLabel, rw.status(), d)
 		if h.accessLog {
-			h.logger.Info("request", "route", routeLabel, "method", req.Method,
-				"path", req.URL.Path, "code", rw.status(), "size", rw.size,
-				"duration_ms", d.Milliseconds(), "remote", req.RemoteAddr)
+			// Client-supplied text (method, path) is cleaned like the
+			// identities below.
+			attrs := []any{"route", routeLabel, "method", logSafe(req.Method, 16),
+				"path", logSafe(req.URL.Path, 256), "code", rw.status(), "size", rw.size,
+				"duration_ms", d.Milliseconds(), "remote", req.RemoteAddr}
+			// Verified identities only: they cannot be forged by the
+			// client.
+			if user, ok := userOf(req.Context()); ok {
+				attrs = append(attrs, "user", logSafe(user, 64))
+			}
+			if name := certName(req.TLS); name != "" {
+				attrs = append(attrs, "client_cert", logSafe(name, 64))
+			}
+			h.logger.Info("request", attrs...)
 		}
 	}()
 
@@ -220,6 +242,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	query, problem := checkParams(rt.params, req.URL.RawQuery)
+	if problem != "" {
+		h.logger.Log(req.Context(), h.warnLevel(), "request refused: query string", "route", rt.path, "problem", problem)
+		http.Error(rw, problem, http.StatusBadRequest)
+		return
+	}
+
 	// Answer before the scraper gives up: its timeout can only shorten the
 	// route timeout, which the source still applies.
 	budget, hasBudget := scrapeBudget(req.Header)
@@ -227,7 +256,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The delimited protobuf format (native histograms) when the scraper
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
-	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto}, budget, hasBudget)
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query}, budget, hasBudget)
 	if errors.Is(err, errNoSlot) {
 		h.rec.RequestRejected(h.listener)
 		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
@@ -261,6 +290,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	body := rd.body
 	hdr := rw.Header()
+	if rt.cacheTTL > 0 {
+		// The answer may come from the cache: tell its age.
+		hdr.Set("Age", strconv.Itoa(int(time.Since(rd.at).Seconds())))
+	}
 	hdr.Set("Content-Type", contentType)
 	if rd.protobuf {
 		hdr.Set("Content-Type", protobufContentType)
@@ -284,17 +317,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// logSafe prepares text for logs: line breaks and other control
+// characters removed (the log handlers escape them too), then cut to n
+// bytes.
+func logSafe(s string, n int) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", ""), "\r", "")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+	return truncate(s, n)
+}
+
 // truncate cuts s to at most n bytes, for logs.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Never cut a UTF-8 character in two.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }
 
 // scrapeTimeoutHeader is sent by Prometheus and vmagent with the scrape
 // timeout of the target, in seconds.
-const scrapeTimeoutHeader = "X-Prometheus-Scrape-Timeout-Seconds"
+const scrapeTimeoutHeader = source.ScrapeTimeoutHeader
 
 // scrapeMargin is kept from the scraper's timeout to validate the content
 // and send the answer.
@@ -344,6 +395,8 @@ type sharedRead struct {
 	gzipOnce sync.Once
 	gzip     []byte
 
+	at time.Time // when the read ended; set before done is closed
+
 	// Protected by Handler.mu.
 	clients int                // requests waiting for the result
 	cancel  context.CancelFunc // cancels the read
@@ -368,7 +421,18 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 	if sreq.Protobuf {
 		key += "\x00protobuf"
 	}
+	// Nor requests forwarding different parameters (other targets).
+	if len(sreq.Query) > 0 {
+		key += "\x00?" + sreq.Query.Encode()
+	}
 	h.mu.Lock()
+	if rt.cacheTTL > 0 {
+		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL {
+			h.mu.Unlock()
+			h.rec.CacheHit(h.listener, rt.path)
+			return c, nil
+		}
+	}
 	rd, ok := h.reads[key]
 	if ok {
 		rd.clients++
@@ -395,9 +459,15 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		go func() {
 			defer cancel()
 			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
+			rd.at = time.Now()
 			h.mu.Lock()
 			if h.reads[key] == rd {
 				delete(h.reads, key)
+			}
+			// Only validated results are kept: a failure is retried by
+			// the next request.
+			if rt.cacheTTL > 0 && rd.err == nil {
+				h.cache[key] = rd
 			}
 			h.mu.Unlock()
 			// The slot is free before anyone gets the result: a scraper's
@@ -526,4 +596,5 @@ func (NopRecorder) ContentParsed(string, string, int, time.Duration, bool) {}
 func (NopRecorder) AuthFailed(string, AuthReason)                          {}
 func (NopRecorder) SourceFailed(string, string, source.Reason)             {}
 func (NopRecorder) RequestShared(string, string)                           {}
+func (NopRecorder) CacheHit(string, string)                                {}
 func (NopRecorder) WebConfigRead(string, bool, bool)                       {}

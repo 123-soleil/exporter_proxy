@@ -62,7 +62,8 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 |-----------|--------|-------|
 | Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
-| Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
+| Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
+| Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
@@ -101,7 +102,11 @@ Each route has exactly one source:
   example `max_age: 15m` for a file written every 5 minutes).
 - Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
   the delimited protobuf format first, when the scraper prefers it: see
-  "Formats") and a `User-Agent: exporter_proxy/<version>`; no client header is forwarded
+  "Formats"), a `User-Agent: exporter_proxy/<version>` and
+  `X-Prometheus-Scrape-Timeout-Seconds` with the time the read may take
+  (the route timeout, computed by the proxy, never copied from the
+  client), which exporters such as blackbox_exporter and snmp_exporter use
+  to bound their work; no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
@@ -118,6 +123,59 @@ Each route has exactly one source:
   data.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
+
+### Forwarded query parameters
+
+Multi-target exporters (blackbox_exporter, snmp_exporter) take the target
+in the query string (`/probe?target=…&module=…`). By default the proxy
+ignores the query string. `forward_params` forwards some parameters,
+each restricted to listed values or patterns:
+
+```yaml
+routes:
+  - path: /probe
+    upstream: http://127.0.0.1:9115/probe
+    forward_params:
+      target:
+        values: [https://www.example.com]
+        patterns: ['10\.0\.0\.[0-9]{1,3}:443']   # whole value, RE2 syntax
+        required: true
+      module:
+        values: [http_2xx, tcp_connect]
+```
+
+- Only listed parameters are accepted, each once, with a value of at most
+  1024 bytes that is one of `values` or matches one of `patterns` (anchored:
+  the whole value must match). Anything else gets `400` and never reaches
+  the upstream. A `required` parameter must be present.
+- Restrict values as tightly as possible: an exporter probing any target
+  it is given would let the clients of the route probe the internal
+  network (and cloud metadata addresses) through it.
+- Forwarded parameters are appended to the query of the `upstream` URL,
+  which is kept as written and cannot be overridden: a parameter set in
+  the URL cannot be listed, and that query must be plain `name=value`
+  pairs joined by `&` (so that every name in it is seen).
+- Each pattern must be a valid regular expression on its own: one closing
+  the anchoring early (`a)|(.*`) is refused.
+- Requests with different parameters never share a read.
+- Routes with a `required` parameter are left out of `/sd` (service
+  discovery): configure their targets in Prometheus, for example:
+
+```yaml
+scrape_configs:
+  - job_name: blackbox
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: [https://www.example.com]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: node1.example.com:9443   # the proxy listener
+```
 
 ### HTTPS upstreams
 
@@ -146,6 +204,32 @@ routes:
   reload (`systemctl reload exporter_proxy`); `--check` checks them and
   their dates.
 - Handshake and certificate failures count as `unavailable` source errors.
+
+### Cache
+
+For an exporter that is slow or costly to read (a database, a slow SNMP
+device), `cache_ttl` keeps a validated result for that long:
+
+```yaml
+routes:
+  - path: /postgres/metrics
+    upstream: http://127.0.0.1:19187/metrics
+    cache_ttl: 30s
+```
+
+- Off by default. Allowed on `upstream` routes only (files are read
+  without cost), at most `1h`, and not with `forward_params` (each target
+  would be a cache entry, and probes must be live).
+- Only valid results are kept: a failure is never cached, the next request
+  reads again.
+- Answers from such a route carry `Age` (seconds since the read); they
+  stay `Cache-Control: no-store` for anything downstream. Requests served
+  from the cache are counted in `exporter_proxy_cache_hits_total`.
+- One entry per format (text, protobuf). A reload empties the cache.
+- Prometheus records samples with the scrape time, not the read time: with
+  a `cache_ttl` close to the scrape interval, consecutive scrapes may get
+  the same values. Keep it below the scrape interval unless that is
+  wanted.
 
 ### Formats
 
@@ -182,8 +266,9 @@ validated once and compressed once.
   are neither refused with `503` nor counted in
   `exporter_proxy_requests_in_flight`. They are counted in
   `exporter_proxy_requests_shared_total`.
-- Nothing is cached: a request arriving after the read finished reads the
-  source again, so no answer is ever older than the scrape that asked.
+- Nothing is cached unless the route sets `cache_ttl` (see "Cache"): a
+  request arriving after the read finished reads the source again, so no
+  answer is ever older than the scrape that asked.
 - The read runs with the route timeout only: the request that started it
   does not cut it short for others with a longer scrape timeout. Every
   request waits at most its own scrape budget; the read goes on while at
@@ -476,6 +561,8 @@ Besides the standard `go_*`, `process_*` and
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
+- `exporter_proxy_cache_hits_total{listener,route}`: requests answered from
+  the cache of a route with `cache_ttl`, without reading the source.
 - `exporter_proxy_requests_shared_total{listener,route}`: requests answered
   with the result of a source read started by a concurrent request of the
   same route (shared reads, below).
@@ -598,6 +685,8 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
+| `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
@@ -632,6 +721,21 @@ Other built-in defaults:
 | `--log.level`     | `info`                            |
 | `--log.format`    | `logfmt`                          |
 | `--log.access`    | off                               |
+
+### Health endpoints
+
+The metrics endpoint also serves, like Prometheus:
+
+- `/-/healthy`: `200` while the process serves;
+- `/-/ready`: `200` once every listener serves, `503` from the start of the
+  shutdown (`SIGTERM`), so that load balancers stop sending traffic before
+  the ports close.
+
+They are protected like `/metrics` (web configuration and
+`allowed_networks`): a probe needs the same access, so they reveal nothing
+to anyone else. For a probe without credentials, give the metrics endpoint
+a web configuration without authentication and restrict it with
+`allowed_networks`.
 
 ### Service discovery
 
@@ -909,7 +1013,7 @@ docker run -d --name exporter_proxy --restart unless-stopped \
 | Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
 | Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.1.0 --log.format=json`. |
 | Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.1.0 --check` |
-| Health | No shell in the image, so no `HEALTHCHECK`: Prometheus scraping the metrics endpoint (`up`) is the health check. |
+| Health | No shell in the image, so no `HEALTHCHECK`. Orchestrators probe `/-/healthy` and `/-/ready` on the metrics endpoint (see "Health endpoints"); Prometheus scraping the metrics endpoint (`up`) remains the main health check. |
 | Not available | systemd socket activation (`listen: "systemd:<name>"`). |
 
 ## Usage
@@ -970,8 +1074,13 @@ for log pipelines that prefer JSON.
   (rejected sources, refused requests, reload results) are always logged at
   `warn` or `error`.
 - `--log.access` adds one `info` line per request (listener, route, status
-  code, duration, size, client address), useful for debugging but noisy at
-  normal scrape rates.
+  code, duration, size, client address), useful for debugging and as an
+  audit of who read what, but noisy at normal scrape rates. Verified
+  identities are added: `user` (basic authentication, once its password is
+  checked) and `client_cert` (common name, else first subject alternative
+  name, of a client certificate verified against the client CA), each
+  truncated to 64 characters; an unverified header or certificate never
+  appears.
 - Context is always in separate fields, never concatenated into `msg`. No
   colors are used.
 

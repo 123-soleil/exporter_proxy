@@ -49,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `labels`), the metrics endpoint serves `/sd`, the routes in the
   Prometheus HTTP service discovery format, with their listener's actual
   port and scheme.
+- HTTP upstreams get `X-Prometheus-Scrape-Timeout-Seconds` with the time
+  the read may take, computed by the proxy.
+- Health endpoints `/-/healthy` and `/-/ready` on the metrics endpoint,
+  protected like `/metrics`; not ready from the start of the shutdown.
+- The access log (`--log.access`) names verified identities: `user` and
+  `client_cert`.
+- `forward_params` forwards query parameters to multi-target exporters
+  (blackbox, snmp), each restricted to listed values or anchored patterns;
+  anything else gets `400`. Routes requiring a parameter are left out of
+  `/sd`.
+- Optional per-route cache, `cache_ttl` (upstream routes, at most `1h`, not
+  with `forward_params`): validated results only, `Age` header, counter
+  `exporter_proxy_cache_hits_total{listener,route}`.
 
 ## [0.1.0] - 2026-11-08
 

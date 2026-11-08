@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -22,17 +23,26 @@ type sdTargetGroup struct {
 	Labels  map[string]string `json:"labels"`
 }
 
-// sdHandler serves the routes of the configuration as Prometheus HTTP
-// service discovery targets: one per route, at the address and with the
-// scheme its listener actually serves.
-type sdHandler struct {
+// Health endpoints of the metrics endpoint, like Prometheus'.
+const (
+	HealthyPath = "/-/healthy"
+	ReadyPath   = "/-/ready"
+)
+
+// metricsEndpoint serves the metrics endpoint: the metrics, the health
+// endpoints, and the Prometheus HTTP service discovery targets when
+// configured (one per route, at the address and with the scheme its
+// listener actually serves).
+type metricsEndpoint struct {
 	s    *Server
 	cfg  *config.Config
-	next http.Handler // the metrics endpoint
+	next http.Handler // the metrics
 }
 
-func (h *sdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != SDPath {
+func (h *metricsEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case HealthyPath, ReadyPath, SDPath:
+	default:
 		h.next.ServeHTTP(w, r)
 		return
 	}
@@ -41,13 +51,30 @@ func (h *sdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.URL.Path {
+	case HealthyPath:
+		// Serving at all is healthy.
+		_, _ = io.WriteString(w, "exporter_proxy is healthy.\n")
+		return
+	case ReadyPath:
+		if !h.s.ready.Load() {
+			http.Error(w, "exporter_proxy is not ready.", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "exporter_proxy is ready.\n")
+		return
+	}
+	if h.cfg.Metrics.ServiceDiscovery == nil {
+		http.NotFound(w, r)
+		return
+	}
 	body, err := json.Marshal(h.targets())
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	if r.Method == http.MethodHead {
 		return
@@ -57,7 +84,7 @@ func (h *sdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // targets lists the routes of the listeners serving now. Listeners on a
 // Unix socket are left out: Prometheus scrapes over TCP.
-func (h *sdHandler) targets() []sdTargetGroup {
+func (h *metricsEndpoint) targets() []sdTargetGroup {
 	sd := h.cfg.Metrics.ServiceDiscovery
 	groups := []sdTargetGroup{}
 	h.s.mu.Lock()
@@ -77,6 +104,9 @@ func (h *sdHandler) targets() []sdTargetGroup {
 			scheme = "https"
 		}
 		for _, r := range l.Routes {
+			if requiresParams(r) {
+				continue // one target per parameter value: configured per target
+			}
 			labels := maps.Clone(sd.Labels)
 			if labels == nil {
 				labels = map[string]string{}
@@ -89,4 +119,15 @@ func (h *sdHandler) targets() []sdTargetGroup {
 		}
 	}
 	return groups
+}
+
+// requiresParams reports whether a route cannot be scraped without query
+// parameters (a required forward_params entry).
+func requiresParams(r config.Route) bool {
+	for _, p := range r.ForwardParams {
+		if p.Required {
+			return true
+		}
+	}
+	return false
 }
