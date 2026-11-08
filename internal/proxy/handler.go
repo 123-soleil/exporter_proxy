@@ -429,6 +429,10 @@ type sharedRead struct {
 
 	at time.Time // when the read ended; set before done is closed
 
+	// advertised is the timeout told to the upstream (0: the route
+	// timeout); only requests with a budget no longer than it join.
+	advertised time.Duration
+
 	// Protected by Handler.mu.
 	clients int                // requests waiting for the result
 	cancel  context.CancelFunc // cancels the read
@@ -466,6 +470,12 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		}
 	}
 	rd, ok := h.reads[key]
+	// A read that told the upstream a shorter timeout than this request's
+	// budget (another client's scrape timeout) may answer with a failure
+	// this request had time to avoid: it reads on its own instead.
+	if ok && rd.advertised > 0 && (sreq.Timeout == 0 || sreq.Timeout > rd.advertised) {
+		ok = false
+	}
 	if ok {
 		rd.clients++
 		h.mu.Unlock()
@@ -488,7 +498,7 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			}
 		}
 		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-		rd = &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel}
+		rd = &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel, advertised: sreq.Timeout}
 		h.reads[key] = rd
 		h.mu.Unlock()
 		h.rec.InFlight(h.listener, 1)

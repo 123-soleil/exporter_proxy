@@ -195,30 +195,6 @@ func TestReadsNotSharedAcrossRoutes(t *testing.T) {
 	}
 }
 
-// A request starting a read with a short budget does not cut it short for
-// a request joining it with a longer one.
-func TestSharedReadOutlivesTheStarterBudget(t *testing.T) {
-	src := newCountingSource()
-	rec := &recorder{}
-	h := newTestHandler(src, 1, rec, &bytes.Buffer{}, false)
-	short := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	short.Header.Set(scrapeTimeoutHeader, "0.1") // budget: minScrapeBudget
-	first := serve(h, short)
-	<-src.started
-	second := serve(h, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	waitShared(t, rec, 1)
-	if w := <-first; w.Code != http.StatusBadGateway {
-		t.Errorf("short budget: code %d, want 502 timeout", w.Code)
-	}
-	close(src.release) // after the first request's budget
-	if w := <-second; w.Code != http.StatusOK {
-		t.Errorf("joining request: code %d, want 200", w.Code)
-	}
-	if src.canceled.Load() != 0 {
-		t.Error("read canceled by the first request's budget")
-	}
-}
-
 // panicSource panics while reading.
 type panicSource struct{}
 
@@ -241,5 +217,48 @@ func TestSharedReadRecoversFromPanics(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("second request: code %d", w.Code)
+	}
+}
+
+// A request does not join a read that told the upstream a shorter
+// timeout than its own budget: another client's short scrape timeout
+// cannot shorten its answer.
+func TestSharedReadNotJoinedWithAShorterAdvertisedTimeout(t *testing.T) {
+	src := newCountingSource()
+	rec := &recorder{}
+	h := newTestHandler(src, 2, rec, &bytes.Buffer{}, false)
+	short := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	short.Header.Set(scrapeTimeoutHeader, "0.001") // budget raised to 1s, told to the upstream
+	first := serve(h, short)
+	<-src.started
+	long := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	long.Header.Set(scrapeTimeoutHeader, "10")
+	second := serve(h, long)
+	<-src.started // a read of its own
+	close(src.release)
+	<-first
+	if w := <-second; w.Code != http.StatusOK {
+		t.Errorf("second request: code %d", w.Code)
+	}
+	if n := src.reads.Load(); n != 2 || rec.shared != 0 {
+		t.Errorf("reads %d, shared %d: want 2 reads, none shared", n, rec.shared)
+	}
+	// The reverse joins: a shorter budget than what the upstream was told.
+	src2 := newCountingSource()
+	rec2 := &recorder{}
+	h2 := newTestHandler(src2, 2, rec2, &bytes.Buffer{}, false)
+	long2 := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	long2.Header.Set(scrapeTimeoutHeader, "10")
+	short2 := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	short2.Header.Set(scrapeTimeoutHeader, "0.001")
+	a := serve(h2, long2)
+	<-src2.started
+	b := serve(h2, short2)
+	waitShared(t, rec2, 1)
+	close(src2.release)
+	<-a
+	<-b
+	if n := src2.reads.Load(); n != 1 {
+		t.Errorf("reverse case: %d reads, want 1", n)
 	}
 }

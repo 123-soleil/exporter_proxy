@@ -105,7 +105,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	logger.Info("starting "+appName, version.Slog()...)
 	if opts.check {
-		return runCheck(opts.configPath, opts.probe, logger)
+		return runCheck(ctx, opts.configPath, opts.probe, logger)
 	}
 
 	cfg, err := config.Load(opts.configPath)
@@ -189,7 +189,7 @@ func reload(path string, running *config.Config, srv *server.Server, m *metrics.
 
 // runCheck implements --check: it reports every problem, one log line each,
 // and returns exitOK only if there is none. Warnings do not fail the check.
-func runCheck(path string, probe bool, logger *slog.Logger) int {
+func runCheck(ctx context.Context, path string, probe bool, logger *slog.Logger) int {
 	cfg, err := config.Load(path)
 	if err != nil {
 		var verr *config.ValidationError
@@ -208,7 +208,8 @@ func runCheck(path string, probe bool, logger *slog.Logger) int {
 	findings := check.Run(cfg, time.Now())
 	if probe {
 		// Sources are read one by one, each bounded by its route timeout.
-		findings = append(findings, check.Probe(context.Background(), cfg)...)
+		// SIGINT or SIGTERM stops the probes in progress.
+		findings = append(findings, check.Probe(ctx, cfg)...)
 	}
 	for _, f := range findings {
 		switch f.Severity {

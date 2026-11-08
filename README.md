@@ -103,10 +103,12 @@ Each route has exactly one source:
 - Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
   the delimited protobuf format first, when the scraper prefers it: see
   "Formats"), a `User-Agent: exporter_proxy/<version>` and
-  `X-Prometheus-Scrape-Timeout-Seconds`, computed by the proxy and never
-  copied from the client: the scrape budget of the request starting the
-  read (its scrape timeout minus 500 ms), or the route timeout without a
-  scrape timeout header, whichever is shorter. Exporters such as
+  `X-Prometheus-Scrape-Timeout-Seconds`, computed by the proxy: the scrape
+  budget of the request starting the read (derived from its scrape
+  timeout, see "Response validation and limits"), or the route timeout without a scrape
+  timeout header, whichever is shorter. A request does not join a read
+  that told the upstream less than its own budget: another client's short
+  timeout never shortens its answer. Exporters such as
   blackbox_exporter and snmp_exporter use it to answer in time (a failed
   probe as `probe_success 0` rather than a failed scrape); no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
