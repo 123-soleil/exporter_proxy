@@ -1,7 +1,7 @@
 # exporter_proxy
 
-> **Status: pre-release.** Implemented and tested; the configuration and
-> metrics may still change before the first release.
+> **Status: 0.x.** Implemented and tested; the configuration and metrics
+> may still change before 1.0.
 
 A small reverse proxy that puts **TLS, mutual TLS (mTLS) and/or HTTP basic
 authentication** in front of Prometheus exporters that do not support them
@@ -559,9 +559,8 @@ service can read but not modify them (like the files in `deploy/config/`).
 
 ## Installation
 
-Until the first stable release, `exporter_proxy` is built from source and
-installed by hand. The files of `deploy/` are the ones a package will
-install.
+`exporter_proxy` is installed by hand, from a release archive or built
+from source. The files of `deploy/` are the ones a package will install.
 
 ### Requirements
 
@@ -569,7 +568,29 @@ install.
 - `procps`, which provides `/bin/kill` for `systemctl reload` (installed by
   default on Debian, missing from minimal container images).
 
-### Build
+### From a release
+
+Each [release](https://github.com/123-soleil/exporter_proxy/releases)
+provides an archive per platform,
+`exporter_proxy_<version>_<os>_<arch>.tar.gz` (Linux, FreeBSD, NetBSD,
+OpenBSD: `386`, `amd64`, `arm64`, `armv5`, `armv6`, `armv7`; macOS:
+`amd64`, `arm64`), and `sha256sums.txt`. An archive holds the static
+binary, `README.md`, `CHANGELOG.md`, `LICENSE` and `deploy/`.
+
+```sh
+VERSION=0.1.0 ARCH=amd64
+BASE=https://github.com/123-soleil/exporter_proxy/releases/download/$VERSION
+curl -fsSLO "$BASE/exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz"
+curl -fsSLO "$BASE/sha256sums.txt"
+sha256sum -c --ignore-missing sha256sums.txt   # must print "OK"
+mkdir exporter_proxy && tar -xzf "exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz" -C exporter_proxy
+cd exporter_proxy && ./exporter_proxy --version
+```
+
+Then install the files below from that directory, the binary being
+`./exporter_proxy` instead of `bin/exporter_proxy`.
+
+### From source
 
 ```sh
 make build        # static binary: bin/exporter_proxy
@@ -579,7 +600,7 @@ make build        # static binary: bin/exporter_proxy
 
 | Source in `deploy/` | Installed as | Notes |
 |---------------------|--------------|-------|
-| `bin/exporter_proxy` (built) | `/usr/sbin/exporter_proxy` | mode `0755` |
+| `bin/exporter_proxy` (built), or `exporter_proxy` from an archive | `/usr/sbin/exporter_proxy` | mode `0755` |
 | `sysusers/exporter_proxy.conf.exemple` | `/usr/lib/sysusers.d/exporter_proxy.conf` | then `systemd-sysusers` creates the `exporter_proxy` user and group |
 | `systemd/exporter_proxy.service.exemple` | `/usr/lib/systemd/system/exporter_proxy.service` | then `systemctl daemon-reload` |
 | `default/exporter_proxy.exemple` | `/etc/default/exporter_proxy` | optional `ARGS` (`--log.format=json`, ...) |
