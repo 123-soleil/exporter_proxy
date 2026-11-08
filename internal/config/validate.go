@@ -185,6 +185,30 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	v.checkAuthorize(where, r.Authorize)
 	v.checkForwardParams(where, r)
 	v.checkCacheTTL(where, r)
+	v.checkMetricsFilter(where, r.MetricsFilter)
+}
+
+// checkMetricsFilter requires patterns, each valid on its own (so that it
+// cannot close the anchoring group) and once anchored.
+func (v *validator) checkMetricsFilter(where string, f *fileMetricsFilter) {
+	if f == nil {
+		return
+	}
+	if len(f.Allow) == 0 && len(f.Deny) == 0 {
+		v.addf(where, "metrics_filter must list allow or deny patterns")
+	}
+	for _, list := range []struct {
+		key      string
+		patterns []string
+	}{{"allow", f.Allow}, {"deny", f.Deny}} {
+		for _, pat := range list.patterns {
+			if _, err := regexp.Compile(pat); err != nil {
+				v.addf(where, "metrics_filter %s: invalid pattern %q: %v", list.key, pat, err)
+			} else if _, err := regexp.Compile(AnchorPattern(pat)); err != nil {
+				v.addf(where, "metrics_filter %s: invalid pattern %q: %v", list.key, pat, err)
+			}
+		}
+	}
 }
 
 // checkCacheTTL allows a cache on upstream routes only, without

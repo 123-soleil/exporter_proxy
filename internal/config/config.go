@@ -116,6 +116,9 @@ type Route struct {
 	// the listener's limit; 0: only the listener's limit.
 	MaxConcurrentRequests int
 
+	// MetricsFilter keeps some metric families only; nil: all of them.
+	MetricsFilter *MetricsFilter
+
 	Limits Limits
 }
 
@@ -134,6 +137,32 @@ type ForwardParam struct {
 	Values   []string
 	Patterns []*regexp.Regexp // anchored: they match the whole value
 	Required bool
+}
+
+// MetricsFilter selects metric families by name: kept when Allow is
+// empty or one of its patterns matches, and none of Deny matches.
+// Patterns match whole names.
+type MetricsFilter struct {
+	Allow []*regexp.Regexp
+	Deny  []*regexp.Regexp
+}
+
+// Keep reports whether the family name is served.
+func (f *MetricsFilter) Keep(name string) bool {
+	for _, re := range f.Deny {
+		if re.MatchString(name) {
+			return false
+		}
+	}
+	if len(f.Allow) == 0 {
+		return true
+	}
+	for _, re := range f.Allow {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxCacheTTL bounds cache_ttl: a cached answer older than that would
@@ -214,6 +243,12 @@ type fileRoute struct {
 	ForwardParams         map[string]fileForwardParam `yaml:"forward_params"`
 	CacheTTL              *time.Duration              `yaml:"cache_ttl"`
 	MaxConcurrentRequests *int                        `yaml:"max_concurrent_requests"`
+	MetricsFilter         *fileMetricsFilter          `yaml:"metrics_filter"`
+}
+
+type fileMetricsFilter struct {
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
 }
 
 type fileForwardParam struct {
@@ -318,6 +353,7 @@ func resolve(fc *fileConfig) *Config {
 				ForwardParams:         forwardParamsOf(fr.ForwardParams),
 				CacheTTL:              valueOr(fr.CacheTTL, 0),
 				MaxConcurrentRequests: valueOr(fr.MaxConcurrentRequests, 0),
+				MetricsFilter:         metricsFilterOf(fr.MetricsFilter),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -335,6 +371,20 @@ func upstreamTLSOf(f *fileUpstreamTLS) *UpstreamTLS {
 		return nil
 	}
 	return &UpstreamTLS{CAFile: f.CAFile, CertFile: f.CertFile, KeyFile: f.KeyFile, ServerName: f.ServerName}
+}
+
+func metricsFilterOf(f *fileMetricsFilter) *MetricsFilter {
+	if f == nil {
+		return nil
+	}
+	compile := func(patterns []string) []*regexp.Regexp {
+		var res []*regexp.Regexp
+		for _, p := range patterns {
+			res = append(res, regexp.MustCompile(AnchorPattern(p))) // validated before
+		}
+		return res
+	}
+	return &MetricsFilter{Allow: compile(f.Allow), Deny: compile(f.Deny)}
 }
 
 func forwardParamsOf(f map[string]fileForwardParam) map[string]ForwardParam {

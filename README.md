@@ -60,7 +60,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 
 | Situation | Status | Notes |
 |-----------|--------|-------|
-| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
+| Content read and validated | `200` | Body returned unchanged (unless the route has a `metrics_filter`), `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
 | Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
@@ -254,6 +254,35 @@ format that native histograms need:
   `sample_limit`; classic buckets still count one each, plus `_sum` and
   `_count`.
 - Requests asking for different formats do not share reads.
+
+### Metrics filter
+
+`metrics_filter` serves only some metric families of a route, for example
+part of node_exporter to a third party (combined with `authorize`):
+
+```yaml
+routes:
+  - path: /partner/metrics
+    upstream: http://127.0.0.1:19100/metrics
+    metrics_filter:
+      allow: ['node_cpu_.*', 'node_load[0-9]+']   # whole family names, RE2
+      deny: ['.*_bytes']                          # wins over allow
+    authorize:
+      users: [partner]
+```
+
+- A family is served when `allow` is empty or one of its patterns matches
+  its name, and no `deny` pattern matches. Names are family names: a
+  histogram `http_latency_seconds` covers its `_bucket`, `_sum` and
+  `_count` series, and is matched as `http_latency_seconds` only: denying
+  `http_latency_seconds_bucket` does not hide it.
+- Patterns match whole names; each must be a valid regular expression on
+  its own.
+- The source is validated first, whole (`max_samples` counts what the
+  source sent), then filtered. Protobuf messages kept are copied as they
+  are; text is re-encoded family by family, sorted by name: the body is no
+  longer the source's byte for byte, but the same families, series and
+  values.
 
 ### Route concurrency limit
 
@@ -747,6 +776,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `metrics_filter` | Optional, on routes: `allow` and/or `deny` patterns (RE2, valid on their own), at least one. |
 | route `max_concurrent_requests` | Optional, greater than 0 and at most the listener's resolved `max_concurrent_requests`. |
 | `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
 | `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |

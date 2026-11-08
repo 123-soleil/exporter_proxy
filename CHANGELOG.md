@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `max_concurrent_requests` on routes, within the listener's: slow reads
   of one route (probes of many targets) no longer take every slot of the
   listener.
+- `metrics_filter` on routes: `allow`/`deny` patterns on metric family
+  names, applied after validation (protobuf copied as is, text
+  re-encoded).
 
 ## [0.1.0] - 2026-11-08
 

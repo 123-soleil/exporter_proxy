@@ -106,6 +106,8 @@ type route struct {
 	// slots bounds the reads of this route (max_concurrent_requests of
 	// the route), within the listener's; nil: no route limit.
 	slots chan struct{}
+	// filter keeps some metric families only; nil: all.
+	filter *config.MetricsFilter
 }
 
 // Handler serves the routes of one listener.
@@ -151,7 +153,7 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
 			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL,
-			slots: routeSlots(r.MaxConcurrentRequests)})
+			slots: routeSlots(r.MaxConcurrentRequests), filter: r.MetricsFilter})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -580,6 +582,14 @@ func (h *Handler) fetch(ctx context.Context, rt route, req source.Request) (body
 	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 	if err != nil {
 		return nil, false, err
+	}
+	if rt.filter != nil {
+		// After validation: what is filtered was checked as a whole.
+		body, err := content.Filter(res.Body, res.Protobuf, rt.filter.Keep)
+		if err != nil {
+			return nil, false, err
+		}
+		return body, res.Protobuf, nil
 	}
 	return res.Body, res.Protobuf, nil
 }

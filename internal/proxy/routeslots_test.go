@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
@@ -47,5 +48,31 @@ func TestRouteConcurrencyLimit(t *testing.T) {
 	}
 	if rec.inFlight != 0 {
 		t.Errorf("in flight %d, want 0", rec.inFlight)
+	}
+}
+
+func TestHandlerMetricsFilter(t *testing.T) {
+	src := fakeSource{res: &source.Result{Body: []byte("# TYPE secret_token gauge\nsecret_token 1\n# TYPE up gauge\nup 1\n")}}
+	cfg, err := config.Parse([]byte(`metrics:
+  listen: "127.0.0.1:9999"
+  web_config_file: /etc/ep/web.yml
+listeners:
+  - name: a
+    listen: ":9100"
+    web_config_file: /etc/ep/web.yml
+    routes:
+      - path: /metrics
+        upstream: http://h/m
+        metrics_filter:
+          deny: ['secret_.*']
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandler("test", []route{{path: "/metrics", src: src, maxSamples: 100,
+		filter: cfg.Listeners[0].Routes[0].MetricsFilter}}, 2, Options{})
+	w := get(h)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "secret") || !strings.Contains(w.Body.String(), "up 1") {
+		t.Errorf("code %d body %q", w.Code, w.Body.String())
 	}
 }
