@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -128,5 +129,35 @@ func TestReloadRemovingAuthorizeRefused(t *testing.T) {
 	l.Routes[0].Path = "/other"
 	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
 		t.Errorf("removing the route: %v", err)
+	}
+}
+
+// A reload removing a route's metrics_filter, or shortening its deny list
+// (a file cut while being written), is refused; adding to it is not.
+func TestReloadWeakeningMetricsFilterRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	deny := func(patterns ...string) *config.MetricsFilter {
+		f := &config.MetricsFilter{}
+		for _, p := range patterns {
+			f.Deny = append(f.Deny, regexp.MustCompile(config.AnchorPattern(p)))
+		}
+		return f
+	}
+	l.Routes[0].MetricsFilter = deny("secret_.*", "token_.*")
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	for name, f := range map[string]*config.MetricsFilter{"removed": nil, "shorter deny list": deny("secret_.*")} {
+		l.Routes[0].MetricsFilter = f
+		if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
+			!strings.Contains(err.Error(), `metrics_filter of route "/metrics"`) {
+			t.Errorf("%s: err = %v, want a refusal", name, err)
+		}
+	}
+	l.Routes[0].MetricsFilter = deny("secret_.*", "token_.*", "key_.*")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("longer deny list: %v", err)
 	}
 }

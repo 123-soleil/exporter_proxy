@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"strings"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
@@ -38,6 +39,9 @@ type authorization struct {
 	uris  map[string]bool
 }
 
+// uriScheme matches an entry starting with a URI scheme (RFC 3986).
+var uriScheme = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
+
 func newAuthorization(a *config.Authorize) *authorization {
 	if a == nil {
 		return nil
@@ -53,10 +57,11 @@ func newAuthorization(a *config.Authorize) *authorization {
 			continue
 		}
 		switch {
+		case uriScheme.MatchString(s):
+			// Before emails: a URI may hold @ (mailto:, user@host).
+			z.uris[s] = true
 		case strings.Contains(s, "@"):
 			z.email[s] = true
-		case strings.Contains(s, ":"):
-			z.uris[s] = true
 		default:
 			z.dns[strings.ToLower(s)] = true
 		}

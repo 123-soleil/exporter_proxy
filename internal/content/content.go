@@ -50,7 +50,14 @@ func ValidateFormat(body []byte, maxSamples int, protobuf bool) (Result, error) 
 	// The parser allocates far more than the body for cheap samples
 	// (`a 1` lines): bodies with more sample lines than max_samples are
 	// refused before parsing.
-	if n := sampleLines(body, maxSamples); n > maxSamples {
+	n, line := sampleLines(body, maxSamples)
+	if line > 0 {
+		// prometheus/common's parser is quadratic in the labels of a line:
+		// one line with thousands of labels costs minutes of CPU.
+		return Result{Duration: time.Since(start)}, source.NewError(source.ReasonInvalid,
+			"line %d: more than %d labels", line, MaxLabelsPerLine)
+	}
+	if n > maxSamples {
 		return Result{Samples: n, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
 			"more than %d samples (max_samples)", maxSamples)
 	}
@@ -121,12 +128,17 @@ func validateProtobuf(body []byte, maxSamples int) (Result, error) {
 	return res, nil
 }
 
+// MaxLabelsPerLine bounds the labels of one sample line in the text
+// format, checked before parsing: the parser's cost grows with the square
+// of a line's labels. Real exporters stay far below.
+const MaxLabelsPerLine = 128
+
 // sampleLines counts the lines of a text body that are neither blank nor
-// comments: one per sample (buckets, quantiles, _sum and _count included).
-// It stops counting past limit.
-func sampleLines(body []byte, limit int) int {
-	n := 0
-	for len(body) > 0 && n <= limit {
+// comments: one per sample (buckets, quantiles, _sum and _count included),
+// stopping past limit. tooManyLabels is the 1-based number of the first
+// line with more than MaxLabelsPerLine labels, 0 when none.
+func sampleLines(body []byte, limit int) (n, tooManyLabels int) {
+	for lineNo := 1; len(body) > 0 && n <= limit; lineNo++ {
 		line := body
 		if i := bytes.IndexByte(body, '\n'); i >= 0 {
 			line, body = body[:i], body[i+1:]
@@ -134,7 +146,31 @@ func sampleLines(body []byte, limit int) int {
 			body = nil
 		}
 		line = bytes.TrimLeft(line, " \t")
-		if len(line) > 0 && line[0] != '#' {
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		n++
+		if labelCount(line) > MaxLabelsPerLine {
+			return n, lineNo
+		}
+	}
+	return n, 0
+}
+
+// labelCount counts the '=' of a sample line outside quoted strings: one
+// per label pair (an upper bound for a malformed line, which the parser
+// refuses anyway).
+func labelCount(line []byte) int {
+	n, quoted, escaped := 0, false, false
+	for _, c := range line {
+		switch {
+		case escaped:
+			escaped = false
+		case quoted && c == '\\':
+			escaped = true
+		case c == '"':
+			quoted = !quoted
+		case !quoted && c == '=':
 			n++
 		}
 	}

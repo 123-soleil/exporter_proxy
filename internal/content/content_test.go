@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/source"
 )
@@ -200,5 +201,60 @@ func TestSafeMessageHidesEscapedQuotes(t *testing.T) {
 		if strings.Contains(err.Error(), "SECRET") {
 			t.Errorf("%q: message leaks content: %v", body, err)
 		}
+	}
+}
+
+// labelLine returns one sample line with n labels.
+func labelLine(n int) string {
+	var b strings.Builder
+	b.WriteString("m{")
+	for i := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "l%d=\"v=%d\"", i, i) // '=' inside values does not count
+	}
+	b.WriteString("} 1\n")
+	return b.String()
+}
+
+// The parser is quadratic in the labels of a line: lines with more than
+// MaxLabelsPerLine labels are refused before parsing, at once.
+func TestTooManyLabelsOnALine(t *testing.T) {
+	if _, err := Validate([]byte(labelLine(MaxLabelsPerLine)), 100); err != nil {
+		t.Errorf("%d labels: %v", MaxLabelsPerLine, err)
+	}
+	start := time.Now()
+	_, err := Validate([]byte("# TYPE m gauge\n"+labelLine(20000)), 100)
+	if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), "line 2: more than 128 labels") {
+		t.Errorf("20000 labels: err = %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("refusal took %s", d)
+	}
+}
+
+// The worst body within the limits (lines of MaxLabelsPerLine empty
+// labels, 2 MiB) stays cheap.
+func TestWorstLabelBodyIsBounded(t *testing.T) {
+	var b strings.Builder
+	for i := 0; b.Len() < 2<<20; i++ {
+		b.WriteString("m{")
+		for j := range MaxLabelsPerLine - 1 { // plus i: exactly the limit
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "a%d=\"\"", j)
+		}
+		fmt.Fprintf(&b, ",i=\"%d\"} 1\n", i)
+	}
+	start := time.Now()
+	if _, err := Validate([]byte(b.String()), 1<<20); err != nil {
+		t.Fatalf("lines at the limit refused: %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("2 MiB of %d-label lines took %s", MaxLabelsPerLine, d)
+	} else {
+		t.Logf("2 MiB of %d-label lines: %s", MaxLabelsPerLine, d)
 	}
 }

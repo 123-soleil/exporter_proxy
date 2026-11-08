@@ -237,12 +237,11 @@ func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, er
 	return cfg, nil
 }
 
-// routesOf returns the route paths of l, with true for those restricted
-// by authorize.
-func routesOf(l config.Listener) map[string]bool {
-	routes := make(map[string]bool, len(l.Routes))
+// routesOf returns what restricts each route of l.
+func routesOf(l config.Listener) map[string]routeProtection {
+	routes := make(map[string]routeProtection, len(l.Routes))
 	for _, r := range l.Routes {
-		routes[r.Path] = r.Authorize != nil
+		routes[r.Path] = routeProtection{authorize: r.Authorize != nil, filter: r.MetricsFilter}
 	}
 	return routes
 }
@@ -405,16 +404,23 @@ type spec struct {
 	writeTimeout time.Duration
 	allowed      []netip.Prefix // allowed_networks, nil for every address
 	clientCRL    string         // client_crl_file, empty for none
-	// routes holds the route paths, with true for those restricted by
-	// authorize (nil for the metrics endpoint).
-	routes map[string]bool
+	// routes holds what restricts each route path (nil for the metrics
+	// endpoint).
+	routes map[string]routeProtection
+}
+
+// routeProtection is what restricts a route in the main configuration.
+type routeProtection struct {
+	authorize bool
+	filter    *config.MetricsFilter
 }
 
 // specWeakens reports what a reload from old to next removes of the
 // protection set in the main configuration: allowed_networks removed, a
 // route's authorize removed. Changing their content is not weakening (new
 // scrapers, new users); dropping them entirely, as a file cut while being
-// written would, takes a restart.
+// written would, takes a restart. For metrics_filter, fewer deny patterns
+// or no allow list any more count as dropping.
 func specWeakens(old, next spec) []string {
 	var lost []string
 	if old.clientCRL != "" && next.clientCRL == "" {
@@ -423,9 +429,19 @@ func specWeakens(old, next spec) []string {
 	if old.allowed != nil && next.allowed == nil {
 		lost = append(lost, "allowed_networks")
 	}
-	for path, restricted := range old.routes {
-		if stillRestricted, exists := next.routes[path]; restricted && exists && !stillRestricted {
+	for path, was := range old.routes {
+		now, exists := next.routes[path]
+		if !exists {
+			continue // removed: nobody reads it any more
+		}
+		if was.authorize && !now.authorize {
 			lost = append(lost, fmt.Sprintf("authorize of route %q", path))
+		}
+		if f, g := was.filter, now.filter; f != nil &&
+			(g == nil || len(g.Deny) < len(f.Deny) || (len(f.Allow) > 0 && len(g.Allow) == 0)) {
+			// Removed, fewer deny patterns, or no allow list any more:
+			// families hidden before could be served.
+			lost = append(lost, fmt.Sprintf("metrics_filter of route %q", path))
 		}
 	}
 	slices.Sort(lost)

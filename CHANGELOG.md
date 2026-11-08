@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `authorize.client_sans` entries match names of their own kind only
   (DNS, IP, email, URI): a DNS entry no longer matched an email or URI
   name written the same way.
+- Text lines with more than 128 labels are refused before parsing: the
+  parser is quadratic in a line's labels, and one line with thousands of
+  them took minutes of CPU while holding the listener's slots.
+- A reload removing a route's `metrics_filter`, shortening its `deny`
+  list or emptying its `allow` list is refused as weakening.
 
 ## [0.4.0] - 2026-11-08
 

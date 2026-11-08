@@ -197,3 +197,14 @@ func TestAuthorizationMatchesByKind(t *testing.T) {
 		t.Error("IP entry did not match the certificate's IP address")
 	}
 }
+
+// URI entries may hold @ (mailto:, user@host): they match URIs.
+func TestAuthorizationURIWithAt(t *testing.T) {
+	u, _ := url.Parse("mailto:ops@example.com")
+	leaf := &x509.Certificate{URIs: []*url.URL{u}}
+	req := httptest.NewRequest(http.MethodGet, "/m", nil)
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, VerifiedChains: [][]*x509.Certificate{{leaf}}}
+	if ok, _ := newAuthorization(&config.Authorize{ClientSANs: []string{"mailto:ops@example.com"}}).allows(req); !ok {
+		t.Error("mailto: URI entry did not match the URI name")
+	}
+}

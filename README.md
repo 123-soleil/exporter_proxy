@@ -399,16 +399,18 @@ page) from being exposed through the proxy.
   is the price of the memory bound (restrict who may connect with
   `allowed_networks` and authentication). Answers from the cache take no
   slot and keep the usual write deadline.
-- Parsing is linear in the response size, but the parser allocates about
-  **10 times the body size** for typical exporters, and up to about 40
-  times for bodies made of very small series or labels (the cost is per
-  series and per label). Bodies with more sample lines (text) or series
-  (protobuf) than `max_samples` are refused before parsing, which removes
-  the most expensive case (a flood of tiny samples). Peak memory is
+- The parser allocates about **10 times the body size** for typical
+  exporters, and up to about 50 times for bodies made of very small
+  series, labels or buckets (the cost is per series and per label). Before
+  parsing, bodies with more sample lines (text) or series (protobuf) than
+  `max_samples` are refused (`too_many_samples`), and so are text lines
+  with more than 128 labels (`invalid`): the text parser's cost grows with
+  the square of a line's labels, and one line with thousands of them would
+  take minutes of CPU while holding the listener's slots. Peak memory is
   therefore bounded by roughly `11 × max_body_bytes ×` the sum of
   `max_concurrent_requests` over all listeners for typical content (with
   the defaults, 2 MiB and 2 requests, about 45 MiB for one listener), and
-  about four times that against a hostile source: size `MemoryMax=` for
+  about five times that against a hostile source: size `MemoryMax=` for
   the sources you do not trust. Routes with `cache_ttl` add up to two
   kept answers each (text and protobuf, with their gzip copies), and
   answers served from the cache take no slot: an answer replaced in the
@@ -499,8 +501,9 @@ routes:
   or when its client certificate has a subject alternative name in
   `client_sans`. Otherwise it gets `403`. Each entry matches names of its
   own kind only: an IP address the certificate's IP addresses, an entry
-  with `@` its email addresses, an entry with `:` its URIs, any other its
-  DNS names (compared without case).
+  starting with a URI scheme (`spiffe:`, `mailto:`, ...) its URIs, another
+  entry with `@` its email addresses, any other its DNS names (compared
+  without case).
 - Only identities the listener verified count: the user once its password
   is checked, the certificate only when the web configuration verifies it
   against the client CA (`RequireAndVerifyClientCert` or
@@ -1395,8 +1398,9 @@ accepted under the previous ones.
 lower a protection (basic authentication removed, a client certificate no
 longer required or no longer verified, client CA or `client_allowed_sans`
 removed, TLS lost; in the main configuration, `client_crl_file` or
-`allowed_networks` removed from a listener, or `authorize` removed from a
-route that remains), including for the previous listener of a port when
+`allowed_networks` removed from a listener, or, on a route that remains,
+`authorize` removed or `metrics_filter` removed, with fewer `deny`
+patterns or without its `allow` list), including for the previous listener of a port when
 listeners are renamed or swap addresses, is refused as a whole: the error
 names the listeners, the running configuration is kept and
 `exporter_proxy_config_last_reload_successful` is set to 0. A web
