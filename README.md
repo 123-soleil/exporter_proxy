@@ -126,6 +126,12 @@ Each route has exactly one source:
   below). Any failure returns `502 Bad Gateway`, is logged and counted, so
   Prometheus marks the target down instead of scraping partial or unexpected
   data.
+- `file` paths are followed through symbolic links (Kubernetes
+  ConfigMaps and atomic writers rely on them): whoever may write the
+  directory of a route's file may point it at another file the proxy can
+  read, including another route's, past that route's `authorize` and
+  `metrics_filter`. Keep these directories writable by the writer of the
+  file only.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
 
@@ -389,12 +395,38 @@ page) from being exposed through the proxy.
   label values are still free text chosen by the source.
 - Each listener serves at most `max_concurrent_requests` requests at the same
   time (default 2, set in `defaults` or per listener). Extra requests are answered immediately with
-  `503 Service Unavailable` instead of queuing.
-- Parsing is linear in the response size, but the parser allocates about
-  **10 times the body size** while it runs. Peak memory is therefore bounded
-  by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
-  all listeners: with the defaults (2 MiB, 2 requests) and one listener,
-  about 45 MiB in the worst case. The defaults fit common exporters; raise
+  `503 Service Unavailable` instead of queuing. A read keeps its slot until
+  every request that got its result has written it, so clients reading
+  slowly cannot make the proxy hold more answers than that. Once its
+  answer is ready, a client has 5 s plus 2 s per MiB sent (compressed
+  when gzip is used) to read it, at most the route timeout plus 10 s; an
+  HTTP/2 connection whose writes make no progress for 10 s is closed.
+  An authenticated client that does not read keeps a slot that long, which
+  is the price of the memory bound (restrict who may connect with
+  `allowed_networks` and authentication). Answers from the cache take no
+  slot and keep the usual write deadline.
+- The parser allocates about **10 times the body size** for typical
+  exporters, and up to about 50 times for bodies made of very small
+  series, labels or buckets (the cost is per series and per label). Before
+  parsing, bodies with more sample lines (text) or series (protobuf) than
+  `max_samples` are refused (`too_many_samples`), and so are text lines
+  with more than 256 labels and bodies whose lines hold many tiny labels
+  (the sum over lines of labels² above 8 × the body size + 65536,
+  `invalid`): the text parser's cost grows with the square of a line's
+  labels, and one line with thousands of them would take minutes of CPU
+  while holding the listener's slots. Real exporters, which spend tens of
+  bytes per label, stay far below. Upstream answers may carry at most
+  64 KiB of headers. Peak memory is
+  therefore bounded by roughly `11 × max_body_bytes ×` the sum of
+  `max_concurrent_requests` over all listeners for typical content (with
+  the defaults, 2 MiB and 2 requests, about 45 MiB for one listener), and
+  about five times that against a hostile source: size `MemoryMax=` for
+  the sources you do not trust. Routes with `cache_ttl` add up to two
+  kept answers each (text and protobuf, with their gzip copies), and
+  answers served from the cache take no slot: an answer replaced in the
+  cache stays in memory while slow clients are still reading it (at most
+  the write time above). The
+  defaults fit common exporters; raise
   `max_body_bytes` (and `max_concurrent_requests`) only on the routes or
   listeners that need it (see `exporter_proxy_response_size_bytes`), and
   size `MemoryMax=` in the systemd unit accordingly.
@@ -476,9 +508,12 @@ routes:
 ```
 
 - A request is allowed when its basic authentication user is in `users`,
-  or when its client certificate has a subject alternative name (DNS name,
-  IP address, email address or URI; DNS names compared without case) in
-  `client_sans`. Otherwise it gets `403`.
+  or when its client certificate has a subject alternative name in
+  `client_sans`. Otherwise it gets `403`. Each entry matches names of its
+  own kind only: an IP address the certificate's IP addresses, an entry
+  starting with a URI scheme (`spiffe:`, `mailto:`, ...) its URIs, another
+  entry with `@` its email addresses, any other its DNS names (compared
+  without case).
 - Only identities the listener verified count: the user once its password
   is checked, the certificate only when the web configuration verifies it
   against the client CA (`RequireAndVerifyClientCert` or
@@ -665,8 +700,9 @@ Besides the standard `go_*`, `process_*` and
   `missing_credentials`, `invalid_credentials`, `rate_limited`,
   `network_not_allowed`, `forbidden`, `certificate_revoked`); the metrics
   endpoint is reported as `listener="metrics"`.
-- `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
-  concurrency slot (reading a source).
+- `exporter_proxy_requests_in_flight{listener}` (gauge): source reads
+  holding a concurrency slot, while reading the source or while their
+  answer is being written.
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
 - `exporter_proxy_cache_hits_total{listener,route}`: requests answered from
@@ -984,7 +1020,7 @@ OpenBSD: `386`, `amd64`, `arm64`, `armv5`, `armv6`, `armv7`; macOS:
 binary, `README.md`, `CHANGELOG.md`, `LICENSE` and `deploy/`.
 
 ```sh
-VERSION=0.4.0 ARCH=amd64
+VERSION=0.4.1 ARCH=amd64
 BASE=https://github.com/123-soleil/exporter_proxy/releases/download/$VERSION
 curl -fsSLO "$BASE/exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/sha256sums.txt"
@@ -1053,6 +1089,12 @@ sudo systemctl enable --now exporter_proxy
 
 ### systemd hardening
 
+The unit is `Type=notify`: exporter_proxy tells systemd it is ready once
+every listener serves, so `systemctl start` waits for it (and fails if a
+listener cannot start), and a `systemctl reload` sent right after a start
+waits too, instead of killing a process that has not set up its `SIGHUP`
+handling yet.
+
 The unit follows a least-privilege profile: dedicated user, no capability
 (`CapabilityBoundingSet=` empty), read-only file system
 (`ProtectSystem=strict`, `ProtectHome=yes`), private `/tmp` and devices,
@@ -1095,10 +1137,10 @@ pinned by digest and kept up to date by Dependabot.
 Build the image (no registry image is published yet):
 
 ```sh
-docker build -t exporter_proxy:0.4.0 \
-  --build-arg VERSION=0.4.0 --build-arg REVISION="$(git rev-parse HEAD)" .
+docker build -t exporter_proxy:0.4.1 \
+  --build-arg VERSION=0.4.1 --build-arg REVISION="$(git rev-parse HEAD)" .
 # Other platforms, cross-compiled without emulation:
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.4.0 .
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.4.1 .
 ```
 
 Run it:
@@ -1110,7 +1152,7 @@ docker run -d --name exporter_proxy --restart unless-stopped \
   -v /etc/exporter_proxy:/etc/exporter_proxy:ro \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --stop-timeout 30 \
-  exporter_proxy:0.4.0
+  exporter_proxy:0.4.1
 ```
 
 `deploy/docker/compose.yml.exemple` is the same with Docker Compose.
@@ -1124,8 +1166,8 @@ docker run -d --name exporter_proxy --restart unless-stopped \
 | File routes, Unix socket upstreams | Mount their directories (read-only for files; the socket's directory for Unix sockets, with the socket file writable by the container's uid or gid). |
 | Reload | `docker kill --signal HUP exporter_proxy` (`systemctl reload` equivalent): same all-or-nothing rules, see "Configuration reload". |
 | Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
-| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.4.0 --log.format=json`. |
-| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.4.0 --check` |
+| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.4.1 --log.format=json`. |
+| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.4.1 --check` |
 | Health | No shell in the image, so no `HEALTHCHECK`. Orchestrators probe `/-/healthy` and `/-/ready` on the metrics endpoint (see "Health endpoints"); Prometheus scraping the metrics endpoint (`up`) remains the main health check. |
 | Not available | systemd socket activation (`listen: "systemd:<name>"`). |
 
@@ -1365,7 +1407,10 @@ accepted under the previous ones.
 **A reload never weakens authentication.** A reload that would remove or
 lower a protection (basic authentication removed, a client certificate no
 longer required or no longer verified, client CA or `client_allowed_sans`
-removed, TLS lost), including for the previous listener of a port when
+removed, TLS lost; in the main configuration, `client_crl_file` or
+`allowed_networks` removed from a listener, or, on a route that remains,
+`authorize` removed or `metrics_filter` removed, with a `deny` or `allow`
+pattern removed or changed, or without its `allow` list), including for the previous listener of a port when
 listeners are renamed or swap addresses, is refused as a whole: the error
 names the listeners, the running configuration is kept and
 `exporter_proxy_config_last_reload_successful` is set to 0. A web

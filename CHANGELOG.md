@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+### Changed
+
+- A read keeps its `max_concurrent_requests` slots until every request
+  that got its result has written it: slow clients can no longer make the
+  proxy hold more answers in memory than the limit (the memory bound of
+  the README holds). A client has 5 s plus 2 s per MiB to read a ready
+  answer, and an HTTP/2 connection whose writes make no progress for 10 s
+  is closed, so one that does not read holds a slot briefly.
+- The systemd unit is `Type=notify`: the service is started, and accepts
+  reloads, once every listener serves; a reload right after a start no
+  longer kills it. Upgrade: reinstall the unit from `deploy/systemd/` to
+  get it (an installed `Type=simple` unit keeps working as before).
+
+### Fixed
+
+- Parse errors hid quoted content only up to its first escaped quote:
+  part of the source content could reach the logs.
+- Bodies with more sample lines (text) or series (protobuf) than
+  `max_samples` are refused before parsing: a hostile source sending tiny
+  samples made validation allocate 50 to 70 times the body.
+- A reload removing `allowed_networks` from a listener or `authorize`
+  from a route that remains is refused as weakening (a file cut while
+  being written widened access); changing their content still applies.
+- `authorize.client_sans` entries match names of their own kind only
+  (DNS, IP, email, URI): a DNS entry no longer matched an email or URI
+  name written the same way.
+- Text bodies whose label count makes parsing costly are refused before
+  parsing: lines with more than 256 labels, or a sum over lines of
+  labels² above 8 × the body size + 65536. The parser is quadratic in a
+  line's labels: one line with thousands of them took minutes of CPU
+  while holding the listener's slots. With `metrics_filter`, the text is
+  parsed once.
+- Upstream answers may carry at most 64 KiB of headers (Go's default,
+  10 MiB, let one read allocate about 150 MiB).
+- A reload removing a route's `metrics_filter`, removing or changing one
+  of its `deny` or `allow` patterns or emptying its `allow` list is
+  refused as weakening.
+- Protobuf content with a `__name__` label or duplicate label names is
+  refused, like text.
+
 ## [0.4.0] - 2026-11-08
 
 ### Added
@@ -366,7 +408,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
 
-[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.1...HEAD
+[0.4.1]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/123-soleil/exporter_proxy/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/123-soleil/exporter_proxy/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...0.2.0

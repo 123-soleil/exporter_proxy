@@ -268,7 +268,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The delimited protobuf format (native histograms) when the scraper
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
-	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(rt, budget, hasBudget)}, budget, hasBudget)
+	rd, done, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(rt, budget, hasBudget)}, budget, hasBudget)
+	// The read keeps its slots until this request has written its answer:
+	// max_concurrent_requests also bounds the answers held in memory for
+	// slow clients. done is nil for answers holding no slot (cache).
+	if done != nil {
+		defer done()
+	}
 	if errors.Is(err, errNoSlot) || errors.Is(err, errNoRouteSlot) {
 		h.rec.RequestRejected(h.listener)
 		limit, scope := cap(h.slots), "listener"
@@ -324,6 +330,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hdr.Set("Content-Length", strconv.Itoa(len(body)))
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Content-Type-Options", "nosniff")
+	// The answer is ready: the client gets a write time in proportion to
+	// its size (bytes sent, compressed or not), not what is left of the
+	// route timeout. A client that does not read keeps the read's slot
+	// that long only.
+	if done != nil {
+		// Only answers holding a slot: one from the cache keeps the
+		// deadline of the request.
+		_ = http.NewResponseController(rw).SetWriteDeadline(time.Now().Add(writeTime(len(body), rt.timeout)))
+	}
 	rw.WriteHeader(http.StatusOK)
 	if req.Method == http.MethodHead {
 		return
@@ -331,6 +346,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// Write time given to a client once its answer is ready: writeBase plus
+// writePerMiB per MiB of body (a client reading 512 KiB/s), never more
+// than the route timeout plus the write margin it had before.
+const (
+	writeBase   = 5 * time.Second
+	writePerMiB = 2 * time.Second
+	writeMargin = 10 * time.Second
+)
+
+func writeTime(size int, routeTimeout time.Duration) time.Duration {
+	d := writeBase + time.Duration(float64(writePerMiB)*float64(size)/(1<<20))
+	if routeTimeout > 0 {
+		d = min(d, routeTimeout+writeMargin)
+	}
+	return d
 }
 
 // logSafe prepares text for logs: line breaks and other control
@@ -440,8 +472,11 @@ type sharedRead struct {
 	advertised time.Duration
 
 	// Protected by Handler.mu.
-	clients int                // requests waiting for the result
-	cancel  context.CancelFunc // cancels the read
+	finished   bool               // the source read ended
+	released   bool               // its slots were given back
+	routeSlots chan struct{}      // the route's slots it holds, nil without
+	clients    int                // requests waiting for or writing the result
+	cancel     context.CancelFunc // cancels the read
 }
 
 // gzipped returns the body compressed, computed once for all the requests
@@ -457,7 +492,7 @@ func (r *sharedRead) gzipped() []byte {
 // read takes a concurrency slot. The read runs on its own, as long as one
 // request waits for it: it is canceled once none does, and every request
 // stops waiting when its client leaves or its scrape budget is spent.
-func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budget time.Duration, hasBudget bool) (*sharedRead, error) {
+func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budget time.Duration, hasBudget bool) (*sharedRead, func(), error) {
 	// Requests asking for different formats do not share reads.
 	key := rt.path
 	if sreq.Protobuf {
@@ -477,7 +512,7 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			if joinable(c, sreq) {
 				h.mu.Unlock()
 				h.rec.CacheHit(h.listener, rt.path)
-				return c, nil
+				return c, nil, nil
 			}
 			cached = c // still better than a 503 when no slot is free
 		}
@@ -498,7 +533,7 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			// that may fail for lack of time.
 			h.mu.Unlock()
 			h.rec.CacheHit(h.listener, rt.path)
-			return cached, nil
+			return cached, nil, nil
 		}
 	}
 	if ok {
@@ -514,13 +549,14 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 				h.mu.Unlock()
 				if cached != nil {
 					h.rec.CacheHit(h.listener, rt.path)
-					return cached, nil
+					return cached, nil, nil
 				}
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-		nr := &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel, advertised: sreq.Timeout}
+		nr := &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel, advertised: sreq.Timeout,
+			routeSlots: rt.slots}
 		h.reads[key] = nr
 		h.mu.Unlock()
 		h.rec.InFlight(h.listener, 1)
@@ -535,16 +571,12 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			nr.body, nr.protobuf, nr.err = h.safeFetch(fetchCtx, rt, sreq)
 			nr.at = time.Now()
 			h.mu.Lock()
-			// Counted out before its slots are free, so that the gauge
-			// never exceeds the limit.
-			h.rec.InFlight(h.listener, -1)
-			// The slots are free before the read stops being shareable, and
-			// before anyone gets the result: a request arriving meanwhile
-			// either joins the read or finds a slot.
-			if rt.slots != nil {
-				<-rt.slots
+			nr.finished = true
+			// The slots stay taken while requests still write the result
+			// (released by the last one); none left: free them now.
+			if nr.clients == 0 {
+				h.releaseSlots(nr)
 			}
-			<-h.slots
 			if h.reads[key] == nr {
 				delete(h.reads, key)
 			}
@@ -570,22 +602,38 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		wait, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
+	release := sync.OnceFunc(func() { h.leave(key, rd) })
 	select {
 	case <-rd.done:
-		return rd, rd.err
+		return rd, release, rd.err
 	case <-wait.Done():
 	}
 	select {
 	case <-rd.done: // finished at the same time: use it
-		return rd, rd.err
+		return rd, release, rd.err
 	default:
 	}
-	h.leave(key, rd)
+	release()
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
-	return nil, source.NewError(source.ReasonTimeout,
+	return nil, nil, source.NewError(source.ReasonTimeout,
 		"no complete answer within %s (left by the scraper's timeout)", budget.Round(time.Millisecond))
+}
+
+// releaseSlots gives back the slots of a read, once. Called with h.mu
+// held, decrementing the in-flight gauge first so that it never exceeds
+// the limit.
+func (h *Handler) releaseSlots(rd *sharedRead) {
+	if rd.released {
+		return
+	}
+	rd.released = true
+	h.rec.InFlight(h.listener, -1)
+	if rd.routeSlots != nil {
+		<-rd.routeSlots
+	}
+	<-h.slots
 }
 
 // safeFetch is fetch for a read running on its own goroutine, where a
@@ -629,8 +677,9 @@ func (h *Handler) takeSlots(rt route) error {
 	return nil
 }
 
-// leave records that a request no longer waits for rd: the last one
-// leaving cancels the read, and later requests start a new one.
+// leave records that a request is done with rd: it stopped waiting, or
+// wrote the result. The last one frees the slots of a finished read, or
+// cancels a read still running (later requests start a new one).
 func (h *Handler) leave(key string, rd *sharedRead) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -638,6 +687,13 @@ func (h *Handler) leave(key string, rd *sharedRead) {
 	if rd.clients > 0 {
 		return
 	}
+	if rd.finished {
+		// The last request done with the result: the slots are free.
+		h.releaseSlots(rd)
+		return
+	}
+	// Nobody waits any more: the read is canceled; it frees its slots
+	// when it ends.
 	if h.reads[key] == rd {
 		delete(h.reads, key)
 	}
@@ -655,18 +711,19 @@ func (h *Handler) fetch(ctx context.Context, rt route, req source.Request) (body
 	}
 	h.rec.SourceRead(h.listener, rt.path, len(res.Body))
 
-	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
-	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
-	if err != nil {
-		return nil, false, err
-	}
 	if rt.filter != nil {
-		// After validation: what is filtered was checked as a whole.
-		body, err := content.Filter(res.Body, res.Protobuf, rt.filter.Keep)
+		// Validated as a whole, then filtered, from a single parse.
+		parsed, body, err := content.ValidateAndFilter(res.Body, rt.maxSamples, res.Protobuf, rt.filter.Keep)
+		h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 		if err != nil {
 			return nil, false, err
 		}
 		return body, res.Protobuf, nil
+	}
+	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
+	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
+	if err != nil {
+		return nil, false, err
 	}
 	return res.Body, res.Protobuf, nil
 }

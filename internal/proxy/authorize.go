@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"strings"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
@@ -29,21 +30,39 @@ func userOf(ctx context.Context) (string, bool) {
 // authorization is the authorize block of a route.
 type authorization struct {
 	users map[string]bool
-	sans  map[string]bool // exact names: IP addresses, email addresses, URIs
+	// client_sans by kind: each entry only matches names of its kind in
+	// the certificate (a DNS name spelled like an IP address or a URI
+	// never matches an IP or URI entry, and the reverse).
 	dns   map[string]bool // lower-cased: DNS names compare without case
+	ips   map[netip.Addr]bool
+	email map[string]bool
+	uris  map[string]bool
 }
+
+// uriScheme matches an entry starting with a URI scheme (RFC 3986).
+var uriScheme = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
 
 func newAuthorization(a *config.Authorize) *authorization {
 	if a == nil {
 		return nil
 	}
-	z := &authorization{users: map[string]bool{}, sans: map[string]bool{}, dns: map[string]bool{}}
+	z := &authorization{users: map[string]bool{}, dns: map[string]bool{}, ips: map[netip.Addr]bool{},
+		email: map[string]bool{}, uris: map[string]bool{}}
 	for _, u := range a.Users {
 		z.users[u] = true
 	}
 	for _, s := range a.ClientSANs {
-		z.sans[s] = true
-		if dnsLike(s) {
+		if ip, err := netip.ParseAddr(s); err == nil {
+			z.ips[ip.Unmap()] = true
+			continue
+		}
+		switch {
+		case uriScheme.MatchString(s):
+			// Before emails: a URI may hold @ (mailto:, user@host).
+			z.uris[s] = true
+		case strings.Contains(s, "@"):
+			z.email[s] = true
+		default:
 			z.dns[strings.ToLower(s)] = true
 		}
 	}
@@ -65,24 +84,23 @@ func (z *authorization) allows(r *http.Request) (allowed bool, who string) {
 				return true, name
 			}
 		}
-		for _, san := range otherSANs(leaf) {
-			if z.sans[san] {
-				return true, san
+		for _, raw := range leaf.IPAddresses {
+			if ip, ok := netip.AddrFromSlice(raw); ok && z.ips[ip.Unmap()] {
+				return true, ip.Unmap().String()
+			}
+		}
+		for _, e := range leaf.EmailAddresses {
+			if z.email[e] {
+				return true, e
+			}
+		}
+		for _, u := range leaf.URIs {
+			if z.uris[u.String()] {
+				return true, u.String()
 			}
 		}
 	}
 	return false, user
-}
-
-// dnsLike reports whether a client_sans entry can only be a DNS name: not
-// an IP address, an email address or a URI. Only those match DNS names of
-// certificates, so that a DNS name spelled like an IP address does not
-// match an IP entry.
-func dnsLike(s string) bool {
-	if _, err := netip.ParseAddr(s); err == nil {
-		return false
-	}
-	return !strings.ContainsAny(s, "@:")
 }
 
 // verified reports whether the connection has a client certificate

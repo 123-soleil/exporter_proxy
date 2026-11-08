@@ -105,7 +105,7 @@ func TestValidateProtobufRejects(t *testing.T) {
 				Gauge: &dto.Gauge{Value: proto.Float64(1)},
 			}},
 		}), 100, source.ReasonInvalid, "metric family 1"},
-		{"too many samples", valid, 1, source.ReasonTooManySamples, "2 samples exceed max_samples (1)"},
+		{"too many samples", valid, 1, source.ReasonTooManySamples, "more than 1 samples (max_samples)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -146,5 +146,51 @@ func TestValidateProtobufHugeLengthPrefix(t *testing.T) {
 	// An empty message has no metric name.
 	if _, err := ValidateFormat([]byte{0}, 100, true); source.ReasonOf(err) != source.ReasonInvalid {
 		t.Errorf("empty family: err = %v", err)
+	}
+}
+
+// Bodies made of the cheapest samples are refused on their count before
+// parsing: they made the parsers allocate 50 to 70 times their size.
+func TestCheapSampleFloodsRefusedBeforeParsing(t *testing.T) {
+	text := bytes.Repeat([]byte("a 1\n"), 512<<10) // 2 MiB, 512k samples
+	// One protobuf family named "a" holding a million empty series.
+	family := protowire.AppendTag(nil, 1, protowire.BytesType)
+	family = protowire.AppendString(family, "a")
+	for range 1 << 20 {
+		family = protowire.AppendTag(family, metricField, protowire.BytesType)
+		family = protowire.AppendVarint(family, 0)
+	}
+	pb := protowire.AppendVarint(nil, uint64(len(family)))
+	pb = append(pb, family...)
+	for name, tc := range map[string]struct {
+		body     []byte
+		protobuf bool
+	}{"text": {text, false}, "protobuf": {pb, true}} {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, err := ValidateFormat(tc.body, 24000, tc.protobuf)
+		runtime.ReadMemStats(&after)
+		if source.ReasonOf(err) != source.ReasonTooManySamples {
+			t.Errorf("%s: err = %v, want too_many_samples", name, err)
+		}
+		if grown := after.TotalAlloc - before.TotalAlloc; grown > 4<<20 {
+			t.Errorf("%s: allocated %d MiB for a %d MiB body", name, grown>>20, len(tc.body)>>20)
+		}
+	}
+}
+
+// Like the text parser, protobuf content may not carry __name__ or
+// duplicate label names.
+func TestValidateProtobufLabelRules(t *testing.T) {
+	for name, labels := range map[string][]*dto.LabelPair{
+		"__name__":  {{Name: proto.String("__name__"), Value: proto.String("other")}},
+		"duplicate": {{Name: proto.String("a"), Value: proto.String("1")}, {Name: proto.String("a"), Value: proto.String("2")}},
+	} {
+		body := encodeProto(t, &dto.MetricFamily{Name: proto.String("m"), Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{{Label: labels, Gauge: &dto.Gauge{Value: proto.Float64(1)}}}})
+		if _, err := ValidateFormat(body, 100, true); source.ReasonOf(err) != source.ReasonInvalid {
+			t.Errorf("%s: err = %v, want invalid", name, err)
+		}
 	}
 }

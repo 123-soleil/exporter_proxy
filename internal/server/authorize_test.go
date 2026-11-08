@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -101,5 +102,90 @@ func TestRouteAuthorizeClientSANs(t *testing.T) {
 	}
 	if err := tlsGet(b, m.url()); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Errorf("unlisted client: %v, want code 403", err)
+	}
+}
+
+// A reload removing a route's authorize (a file cut while being written)
+// is refused; changing its list is not.
+func TestReloadRemovingAuthorizeRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", usersYAML(t, map[string]string{"alice": "pw"}))
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	l.Routes[0].Authorize = &config.Authorize{Users: []string{"alice"}}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+
+	l.Routes[0].Authorize = &config.Authorize{Users: []string{"alice", "bob"}}
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("changing the authorize list: %v", err)
+	}
+	l.Routes[0].Authorize = nil
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
+		!strings.Contains(err.Error(), `authorize of route "/metrics"`) {
+		t.Errorf("removing authorize: err = %v, want a refusal", err)
+	}
+	// Removing the route itself is fine: nobody reads it any more.
+	l.Routes[0].Path = "/other"
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("removing the route: %v", err)
+	}
+}
+
+// A reload removing a route's metrics_filter, or shortening its deny list
+// (a file cut while being written), is refused; adding to it is not.
+func TestReloadWeakeningMetricsFilterRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	deny := func(patterns ...string) *config.MetricsFilter {
+		f := &config.MetricsFilter{}
+		for _, p := range patterns {
+			f.Deny = append(f.Deny, regexp.MustCompile(config.AnchorPattern(p)))
+		}
+		return f
+	}
+	l.Routes[0].MetricsFilter = deny("secret_.*", "token_.*")
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	for name, f := range map[string]*config.MetricsFilter{"removed": nil, "shorter deny list": deny("secret_.*"),
+		"deny pattern cut": deny("secret_.*", "tok")} {
+		l.Routes[0].MetricsFilter = f
+		if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
+			!strings.Contains(err.Error(), `metrics_filter of route "/metrics"`) {
+			t.Errorf("%s: err = %v, want a refusal", name, err)
+		}
+	}
+	l.Routes[0].MetricsFilter = deny("secret_.*", "token_.*", "key_.*")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("longer deny list: %v", err)
+	}
+}
+
+// A reload changing an allow pattern of metrics_filter (a file cut inside
+// it may widen it) is refused; adding allow patterns applies.
+func TestReloadChangingAllowPatternRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	allow := func(patterns ...string) *config.MetricsFilter {
+		f := &config.MetricsFilter{}
+		for _, p := range patterns {
+			f.Allow = append(f.Allow, regexp.MustCompile(config.AnchorPattern(p)))
+		}
+		return f
+	}
+	l.Routes[0].MetricsFilter = allow("node_.*_total")
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	l.Routes[0].MetricsFilter = allow("node_.*")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil {
+		t.Error("cut allow pattern applied")
+	}
+	l.Routes[0].MetricsFilter = allow("node_.*_total", "up")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("adding an allow pattern: %v", err)
 	}
 }

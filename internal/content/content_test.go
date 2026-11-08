@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/source"
 )
@@ -75,7 +76,7 @@ func TestValidateRejects(t *testing.T) {
 		{"invalid utf-8 label", "m{l=\"\xff\"} 1\n", 1000, source.ReasonInvalid, "line 1"},
 		{"bad line after valid ones", "a 1\nb 2\nnot valid line\n", 1000, source.ReasonInvalid, "line 3"},
 		{"duplicate TYPE", "# TYPE m gauge\nm 1\n# TYPE m gauge\n", 1000, source.ReasonInvalid, "line 3"},
-		{"too many samples", sample, 5, source.ReasonTooManySamples, "14 samples exceed max_samples (5)"},
+		{"too many samples", sample, 5, source.ReasonTooManySamples, "more than 5 samples (max_samples)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,5 +185,101 @@ func BenchmarkValidate(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// Quoted content holding escaped quotes is hidden whole.
+func TestSafeMessageHidesEscapedQuotes(t *testing.T) {
+	for _, body := range []string{
+		"m{l=\"abc\\\"SECRET-PASSWORD-123\\xff\"} 1\n",
+		"m 1 2 \"SECRET-PASSWORD-123\n",
+	} {
+		_, err := Validate([]byte(body), 100)
+		if err == nil {
+			t.Fatalf("%q: accepted", body)
+		}
+		if strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("%q: message leaks content: %v", body, err)
+		}
+	}
+}
+
+// labelLine returns one sample line with n labels.
+func labelLine(n int) string {
+	var b strings.Builder
+	b.WriteString("m{")
+	for i := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "l%d=\"v=%d\"", i, i) // '=' inside values does not count
+	}
+	b.WriteString("} 1\n")
+	return b.String()
+}
+
+// The parser is quadratic in the labels of a line: lines with more than
+// MaxLabelsPerLine labels are refused before parsing, at once.
+func TestTooManyLabelsOnALine(t *testing.T) {
+	if _, err := Validate([]byte(labelLine(MaxLabelsPerLine)), 100); err != nil {
+		t.Errorf("%d labels: %v", MaxLabelsPerLine, err)
+	}
+	start := time.Now()
+	_, err := Validate([]byte("# TYPE m gauge\n"+labelLine(20000)), 100)
+	if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), "line 2: more than 256 labels") {
+		t.Errorf("20000 labels: err = %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("refusal took %s", d)
+	}
+}
+
+// tinyLabelBody returns about size bytes of lines with labels tiny labels
+// each: the cheapest bytes for the parser's quadratic cost.
+func tinyLabelBody(size, labels int) []byte {
+	var b strings.Builder
+	for i := 0; b.Len() < size; i++ {
+		b.WriteString("m{")
+		for j := range labels - 1 {
+			fmt.Fprintf(&b, "a%d=\"\",", j)
+		}
+		fmt.Fprintf(&b, "i=\"%d\"} 1\n", i)
+	}
+	return []byte(b.String())
+}
+
+// Lines of many tiny labels are refused on their total parse cost; the
+// most expensive body still accepted parses fast.
+func TestLabelCostBudget(t *testing.T) {
+	if _, err := Validate(tinyLabelBody(2<<20, 128), 1<<20); source.ReasonOf(err) != source.ReasonInvalid ||
+		!strings.Contains(err.Error(), "too many labels for the body size") {
+		t.Errorf("2 MiB of 128 tiny labels per line: err = %v, want refused", err)
+	}
+	// Under the budget: about 24 tiny labels per line.
+	body := tinyLabelBody(2<<20, 20)
+	start := time.Now()
+	if _, err := Validate(body, 1<<20); err != nil {
+		t.Fatalf("lines of 20 tiny labels refused: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("2 MiB of 20-label lines took %s", d)
+	} else {
+		t.Logf("2 MiB of 20-label lines: %s", d)
+	}
+}
+
+// Real long labels (Node Feature Discovery node labels, about 57 bytes
+// each) on many lines stay within the budget.
+func TestNodeFeatureDiscoveryLabelsAccepted(t *testing.T) {
+	var b strings.Builder
+	for node := range 100 {
+		b.WriteString("kube_node_labels{")
+		for i := range MaxLabelsPerLine - 1 {
+			fmt.Fprintf(&b, "label_feature_node_kubernetes_io_cpu_cpuid_flag_%03d=\"true\",", i)
+		}
+		fmt.Fprintf(&b, "node=\"node-%d\"} 1\n", node)
+	}
+	if _, err := Validate([]byte(b.String()), 24000); err != nil {
+		t.Errorf("NFD-labelled nodes refused: %v", err)
 	}
 }
