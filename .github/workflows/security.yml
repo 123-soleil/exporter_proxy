@@ -1,0 +1,32 @@
+name: Security
+
+# Vulnerabilities are published after the code is merged: check the
+# dependencies of main every week too, not only on pull requests (ci.yml).
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Latest Go release, used to build the releases: govulncheck also
+          # reports vulnerabilities of its standard library.
+          go-version: stable
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

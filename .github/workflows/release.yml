@@ -1,0 +1,136 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests before building
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: go test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload the archives to the release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux
+          - { goos: linux, goarch: "386", suffix: "386" }
+          - { goos: linux, goarch: amd64, suffix: amd64 }
+          - { goos: linux, goarch: arm64, suffix: arm64 }
+          - { goos: linux, goarch: arm, goarm: "5", suffix: armv5 }
+          - { goos: linux, goarch: arm, goarm: "6", suffix: armv6 }
+          - { goos: linux, goarch: arm, goarm: "7", suffix: armv7 }
+          # darwin (no 386 or arm: Go only supports darwin/amd64 and darwin/arm64)
+          - { goos: darwin, goarch: amd64, suffix: amd64 }
+          - { goos: darwin, goarch: arm64, suffix: arm64 }
+          # freebsd
+          - { goos: freebsd, goarch: "386", suffix: "386" }
+          - { goos: freebsd, goarch: amd64, suffix: amd64 }
+          - { goos: freebsd, goarch: arm64, suffix: arm64 }
+          - { goos: freebsd, goarch: arm, goarm: "5", suffix: armv5 }
+          - { goos: freebsd, goarch: arm, goarm: "6", suffix: armv6 }
+          - { goos: freebsd, goarch: arm, goarm: "7", suffix: armv7 }
+          # netbsd
+          - { goos: netbsd, goarch: "386", suffix: "386" }
+          - { goos: netbsd, goarch: amd64, suffix: amd64 }
+          - { goos: netbsd, goarch: arm64, suffix: arm64 }
+          - { goos: netbsd, goarch: arm, goarm: "5", suffix: armv5 }
+          - { goos: netbsd, goarch: arm, goarm: "6", suffix: armv6 }
+          - { goos: netbsd, goarch: arm, goarm: "7", suffix: armv7 }
+          # openbsd
+          - { goos: openbsd, goarch: "386", suffix: "386" }
+          - { goos: openbsd, goarch: amd64, suffix: amd64 }
+          - { goos: openbsd, goarch: arm64, suffix: arm64 }
+          - { goos: openbsd, goarch: arm, goarm: "5", suffix: armv5 }
+          - { goos: openbsd, goarch: arm, goarm: "6", suffix: armv6 }
+          - { goos: openbsd, goarch: arm, goarm: "7", suffix: armv7 }
+          # Windows is not supported (Unix sockets, systemd activation).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      # make build: static binary (CGO_ENABLED=0), -trimpath, version
+      # information injected like a local build.
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: make build VERSION="${TAG#v}" BRANCH=main
+
+      - name: Package tar.gz (binary, README.md, CHANGELOG.md, LICENSE, deploy/)
+        env:
+          ARCHIVE: exporter_proxy_${{ github.event.release.tag_name }}_${{ matrix.goos }}_${{ matrix.suffix }}.tar.gz
+        run: |
+          mkdir -p package
+          cp -R bin/exporter_proxy README.md CHANGELOG.md LICENSE deploy package/
+          tar -czf "$ARCHIVE" -C package .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "$ARCHIVE" --clobber --repo "${{ github.repository }}"
+
+      - name: Compute sha256 checksum
+        run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksum-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
+          path: ${{ env.ARCHIVE }}.sha256
+          retention-days: 1
+
+  checksums:
+    name: Publish combined sha256sums.txt
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload sha256sums.txt to the release
+    steps:
+      - name: Download all per-archive checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: checksum-*
+          path: checksums
+          merge-multiple: true
+
+      - name: Combine into sha256sums.txt
+        run: cat checksums/*.sha256 | sort -k2 > sha256sums.txt
+
+      - name: Upload sha256sums.txt to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" sha256sums.txt --clobber --repo "${{ github.repository }}"

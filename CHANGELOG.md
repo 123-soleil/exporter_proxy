@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GitHub Actions: code checks, dependency vulnerability checks and tests
+  on pull requests to `main`; weekly `govulncheck`; release binaries for
+  Linux, macOS and the BSDs with `sha256sums.txt`; Dependabot.
 - Project README describing goals, design and configuration format.
 - Design: route sources may be an HTTP exporter over TCP, an HTTP exporter
   over a Unix domain socket, or a static Prometheus text file.
