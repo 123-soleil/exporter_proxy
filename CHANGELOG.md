@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Parse errors hid quoted content only up to its first escaped quote:
   part of the source content could reach the logs.
+- Bodies with more sample lines (text) or series (protobuf) than
+  `max_samples` are refused before parsing: a hostile source sending tiny
+  samples made validation allocate 50 to 70 times the body.
+- A reload removing `allowed_networks` from a listener or `authorize`
+  from a route that remains is refused as weakening (a file cut while
+  being written widened access); changing their content still applies.
+- `authorize.client_sans` entries match names of their own kind only
+  (DNS, IP, email, URI): a DNS entry no longer matched an email or URI
+  name written the same way.
 
 ## [0.4.0] - 2026-11-08
 

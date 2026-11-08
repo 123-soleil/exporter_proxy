@@ -237,6 +237,16 @@ func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, er
 	return cfg, nil
 }
 
+// routesOf returns the route paths of l, with true for those restricted
+// by authorize.
+func routesOf(l config.Listener) map[string]bool {
+	routes := make(map[string]bool, len(l.Routes))
+	for _, r := range l.Routes {
+		routes[r.Path] = r.Authorize != nil
+	}
+	return routes
+}
+
 // checkCRLSpec checks the client_crl_file of a listener at startup and
 // reload: it needs client certificates verified against a client CA, and
 // must parse. A CRL outside its dates is logged, not refused: like a
@@ -395,6 +405,31 @@ type spec struct {
 	writeTimeout time.Duration
 	allowed      []netip.Prefix // allowed_networks, nil for every address
 	clientCRL    string         // client_crl_file, empty for none
+	// routes holds the route paths, with true for those restricted by
+	// authorize (nil for the metrics endpoint).
+	routes map[string]bool
+}
+
+// specWeakens reports what a reload from old to next removes of the
+// protection set in the main configuration: allowed_networks removed, a
+// route's authorize removed. Changing their content is not weakening (new
+// scrapers, new users); dropping them entirely, as a file cut while being
+// written would, takes a restart.
+func specWeakens(old, next spec) []string {
+	var lost []string
+	if old.clientCRL != "" && next.clientCRL == "" {
+		lost = append(lost, "client_crl_file")
+	}
+	if old.allowed != nil && next.allowed == nil {
+		lost = append(lost, "allowed_networks")
+	}
+	for path, restricted := range old.routes {
+		if stillRestricted, exists := next.routes[path]; restricted && exists && !stillRestricted {
+			lost = append(lost, fmt.Sprintf("authorize of route %q", path))
+		}
+	}
+	slices.Sort(lost)
+	return lost
 }
 
 // swapHandler serves through a handler that a reload can replace
@@ -568,8 +603,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 			// is set by the first one): not a reason to restart.
 			running, next := cur.running(), settingsOf(wc)
 			running.basicAuth = running.basicAuth || next.basicAuth
-			if cur.spec.clientCRL != "" && sp.clientCRL == "" {
-				weakened = append(weakened, fmt.Sprintf("listener %q: client_crl_file", sp.name))
+			if lost := specWeakens(cur.spec, sp); len(lost) > 0 {
+				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
 			if next == running {
 				if sp.allowed != nil && cur.ln.Addr().Network() == "unix" {
@@ -622,8 +657,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 			if lost := prev.weakens(l.settings); len(lost) > 0 {
 				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
-			if prev.spec.clientCRL != "" && sp.clientCRL == "" {
-				weakened = append(weakened, fmt.Sprintf("listener %q: client_crl_file", sp.name))
+			if lost := specWeakens(prev.spec, sp); len(lost) > 0 {
+				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
 			byAddr := byListen[sp.listen] == prev
 			if r, ok := replaced[prev]; !ok || byAddr || !r.byAddr {
@@ -637,7 +672,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 		// authentication: a reload never does. Lowering it on purpose takes
 		// a restart.
 		s.abortReload(started)
-		return fmt.Errorf("the reload would weaken authentication (%s): fix the web configuration, "+
+		return fmt.Errorf("the reload would weaken authentication (%s): fix the configuration, "+
 			"or restart the service to apply it", strings.Join(weakened, "; "))
 	}
 
@@ -764,6 +799,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			writeTimeout: maxTimeout + writeMargin,
 			allowed:      l.AllowedNetworks,
 			clientCRL:    l.ClientCRLFile,
+			routes:       routesOf(l),
 		})
 	}
 

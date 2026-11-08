@@ -47,6 +47,13 @@ func ValidateFormat(body []byte, maxSamples int, protobuf bool) (Result, error) 
 		return validateProtobuf(body, maxSamples)
 	}
 	start := time.Now()
+	// The parser allocates far more than the body for cheap samples
+	// (`a 1` lines): bodies with more sample lines than max_samples are
+	// refused before parsing.
+	if n := sampleLines(body, maxSamples); n > maxSamples {
+		return Result{Samples: n, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
+			"more than %d samples (max_samples)", maxSamples)
+	}
 	// UTF-8 validation accepts classic names and quoted UTF-8 names, like
 	// Prometheus 3. A parser is not safe for concurrent use: one per call.
 	parser := expfmt.NewTextParser(model.UTF8Validation)
@@ -81,6 +88,18 @@ func validateProtobuf(body []byte, maxSamples int) (Result, error) {
 		return Result{Samples: n, Duration: time.Since(start)},
 			source.NewError(source.ReasonInvalid, "not in delimited protobuf format: metric family %d", families+1)
 	}
+	// Decoding allocates far more than the body for empty series: bodies
+	// with more series than max_samples (each is at least one sample) are
+	// refused before decoding.
+	series, bad := protobufSeries(body, maxSamples)
+	if bad > 0 {
+		families = bad - 1
+		return invalid()
+	}
+	if series > maxSamples {
+		return Result{Samples: series, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
+			"more than %d samples (max_samples)", maxSamples)
+	}
 	for rest := body; len(rest) > 0; {
 		size, prefix := protowire.ConsumeVarint(rest)
 		if prefix < 0 || size > uint64(len(rest)-prefix) {
@@ -100,6 +119,61 @@ func validateProtobuf(body []byte, maxSamples int) (Result, error) {
 		return res, source.NewError(source.ReasonTooManySamples, "%d samples exceed max_samples (%d)", n, maxSamples)
 	}
 	return res, nil
+}
+
+// sampleLines counts the lines of a text body that are neither blank nor
+// comments: one per sample (buckets, quantiles, _sum and _count included).
+// It stops counting past limit.
+func sampleLines(body []byte, limit int) int {
+	n := 0
+	for len(body) > 0 && n <= limit {
+		line := body
+		if i := bytes.IndexByte(body, '\n'); i >= 0 {
+			line, body = body[:i], body[i+1:]
+		} else {
+			body = nil
+		}
+		line = bytes.TrimLeft(line, " \t")
+		if len(line) > 0 && line[0] != '#' {
+			n++
+		}
+	}
+	return n
+}
+
+// metricField is the field number of MetricFamily.metric.
+const metricField = 4
+
+// protobufSeries counts the series (MetricFamily.metric entries) of a
+// delimited protobuf body by walking the wire format, without decoding.
+// It stops counting past limit; bad is the 1-based position of a
+// malformed family, 0 when none.
+func protobufSeries(body []byte, limit int) (n, bad int) {
+	family := 0
+	for rest := body; len(rest) > 0 && n <= limit; {
+		family++
+		size, prefix := protowire.ConsumeVarint(rest)
+		if prefix < 0 || size > uint64(len(rest)-prefix) {
+			return n, family
+		}
+		msg := rest[prefix : prefix+int(size)]
+		rest = rest[prefix+int(size):]
+		for len(msg) > 0 {
+			num, typ, tagLen := protowire.ConsumeTag(msg)
+			if tagLen < 0 {
+				return n, family
+			}
+			valLen := protowire.ConsumeFieldValue(num, typ, msg[tagLen:])
+			if valLen < 0 {
+				return n, family
+			}
+			if num == metricField && typ == protowire.BytesType {
+				n++
+			}
+			msg = msg[tagLen+valLen:]
+		}
+	}
+	return n, 0
 }
 
 // validFamily checks the names and label values of a decoded family, like

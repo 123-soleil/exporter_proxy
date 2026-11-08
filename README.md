@@ -400,10 +400,16 @@ page) from being exposed through the proxy.
   `allowed_networks` and authentication). Answers from the cache take no
   slot and keep the usual write deadline.
 - Parsing is linear in the response size, but the parser allocates about
-  **10 times the body size** while it runs. Peak memory is therefore bounded
-  by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
-  all listeners: with the defaults (2 MiB, 2 requests) and one listener,
-  about 45 MiB in the worst case. Routes with `cache_ttl` add up to two
+  **10 times the body size** for typical exporters, and up to about 40
+  times for bodies made of very small series or labels (the cost is per
+  series and per label). Bodies with more sample lines (text) or series
+  (protobuf) than `max_samples` are refused before parsing, which removes
+  the most expensive case (a flood of tiny samples). Peak memory is
+  therefore bounded by roughly `11 × max_body_bytes ×` the sum of
+  `max_concurrent_requests` over all listeners for typical content (with
+  the defaults, 2 MiB and 2 requests, about 45 MiB for one listener), and
+  about four times that against a hostile source: size `MemoryMax=` for
+  the sources you do not trust. Routes with `cache_ttl` add up to two
   kept answers each (text and protobuf, with their gzip copies), and
   answers served from the cache take no slot: an answer replaced in the
   cache stays in memory while slow clients are still reading it (at most
@@ -490,9 +496,11 @@ routes:
 ```
 
 - A request is allowed when its basic authentication user is in `users`,
-  or when its client certificate has a subject alternative name (DNS name,
-  IP address, email address or URI; DNS names compared without case) in
-  `client_sans`. Otherwise it gets `403`.
+  or when its client certificate has a subject alternative name in
+  `client_sans`. Otherwise it gets `403`. Each entry matches names of its
+  own kind only: an IP address the certificate's IP addresses, an entry
+  with `@` its email addresses, an entry with `:` its URIs, any other its
+  DNS names (compared without case).
 - Only identities the listener verified count: the user once its password
   is checked, the certificate only when the web configuration verifies it
   against the client CA (`RequireAndVerifyClientCert` or
@@ -1386,7 +1394,9 @@ accepted under the previous ones.
 **A reload never weakens authentication.** A reload that would remove or
 lower a protection (basic authentication removed, a client certificate no
 longer required or no longer verified, client CA or `client_allowed_sans`
-removed, TLS lost), including for the previous listener of a port when
+removed, TLS lost; in the main configuration, `client_crl_file` or
+`allowed_networks` removed from a listener, or `authorize` removed from a
+route that remains), including for the previous listener of a port when
 listeners are renamed or swap addresses, is refused as a whole: the error
 names the listeners, the running configuration is kept and
 `exporter_proxy_config_last_reload_successful` is set to 0. A web

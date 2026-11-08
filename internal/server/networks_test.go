@@ -83,13 +83,12 @@ func TestAllowedNetworks(t *testing.T) {
 		t.Errorf("allowed address after reload: code %d, err %v", code, err)
 	}
 
-	// Removing allowed_networks allows every address.
+	// Removing allowed_networks (a file cut while being written) would
+	// allow every address: the reload is refused, a restart applies it.
 	l.AllowedNetworks = nil
-	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
-		t.Fatal(err)
-	}
-	if code, err := getErr(url); err != nil || code != http.StatusOK {
-		t.Errorf("without allowed_networks: code %d, err %v", code, err)
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
+		!strings.Contains(err.Error(), "allowed_networks") {
+		t.Errorf("reload removing allowed_networks: err = %v, want a refusal", err)
 	}
 }
 

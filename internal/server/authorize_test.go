@@ -103,3 +103,30 @@ func TestRouteAuthorizeClientSANs(t *testing.T) {
 		t.Errorf("unlisted client: %v, want code 403", err)
 	}
 }
+
+// A reload removing a route's authorize (a file cut while being written)
+// is refused; changing its list is not.
+func TestReloadRemovingAuthorizeRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", usersYAML(t, map[string]string{"alice": "pw"}))
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	l.Routes[0].Authorize = &config.Authorize{Users: []string{"alice"}}
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+
+	l.Routes[0].Authorize = &config.Authorize{Users: []string{"alice", "bob"}}
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("changing the authorize list: %v", err)
+	}
+	l.Routes[0].Authorize = nil
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
+		!strings.Contains(err.Error(), `authorize of route "/metrics"`) {
+		t.Errorf("removing authorize: err = %v, want a refusal", err)
+	}
+	// Removing the route itself is fine: nobody reads it any more.
+	l.Routes[0].Path = "/other"
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("removing the route: %v", err)
+	}
+}

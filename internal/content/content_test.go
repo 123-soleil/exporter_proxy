@@ -75,7 +75,7 @@ func TestValidateRejects(t *testing.T) {
 		{"invalid utf-8 label", "m{l=\"\xff\"} 1\n", 1000, source.ReasonInvalid, "line 1"},
 		{"bad line after valid ones", "a 1\nb 2\nnot valid line\n", 1000, source.ReasonInvalid, "line 3"},
 		{"duplicate TYPE", "# TYPE m gauge\nm 1\n# TYPE m gauge\n", 1000, source.ReasonInvalid, "line 3"},
-		{"too many samples", sample, 5, source.ReasonTooManySamples, "14 samples exceed max_samples (5)"},
+		{"too many samples", sample, 5, source.ReasonTooManySamples, "more than 5 samples (max_samples)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

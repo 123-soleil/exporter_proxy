@@ -179,3 +179,21 @@ func TestLogSafe(t *testing.T) {
 		t.Errorf("logSafe = %q", got)
 	}
 }
+
+// An entry matches names of its own kind only: a DNS entry does not match
+// an email or URI subject alternative name written the same way.
+func TestAuthorizationMatchesByKind(t *testing.T) {
+	u, _ := url.Parse("node1.example.com")
+	leaf := &x509.Certificate{EmailAddresses: []string{"node1.example.com"}, URIs: []*url.URL{u}}
+	req := httptest.NewRequest(http.MethodGet, "/m", nil)
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, VerifiedChains: [][]*x509.Certificate{{leaf}}}
+	if ok, _ := newAuthorization(&config.Authorize{ClientSANs: []string{"node1.example.com"}}).allows(req); ok {
+		t.Error("DNS entry matched an email or URI name")
+	}
+	// IPv4-mapped forms are the same address.
+	leaf = &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("192.0.2.7").To16()}}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}, VerifiedChains: [][]*x509.Certificate{{leaf}}}
+	if ok, _ := newAuthorization(&config.Authorize{ClientSANs: []string{"192.0.2.7"}}).allows(req); !ok {
+		t.Error("IP entry did not match the certificate's IP address")
+	}
+}
