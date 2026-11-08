@@ -1,6 +1,6 @@
 # exporter_proxy container image. See "Docker" in README.md.
 #
-#   docker build -t exporter_proxy --build-arg VERSION=0.2.0 .
+#   docker build -t exporter_proxy --build-arg VERSION=0.4.0 .
 #
 # The builder runs on the build machine's platform and cross-compiles for
 # the target (docker buildx --platform linux/amd64,linux/arm64,linux/arm/v7):
