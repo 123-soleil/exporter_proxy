@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 ### Added
 
 - GitHub Actions: code checks, dependency vulnerability checks and tests
@@ -261,3 +263,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a slow source gives a `502 timeout` before the scraper gives up. It never
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
+
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/123-soleil/exporter_proxy/releases/tag/v0.1.0
