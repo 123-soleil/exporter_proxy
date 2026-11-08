@@ -999,7 +999,7 @@ GitHub Actions (`.github/workflows/`):
 
 | Workflow | When | What |
 |----------|------|------|
-| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`); tests with the race detector on Linux and macOS, Go 1.26 and the latest Go, and `make build`. |
+| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`. |
 | `security.yml` | Every Monday, or by hand | `go mod verify` and `govulncheck` on `main`, for vulnerabilities published after a merge. |
 | `release.yml` | A GitHub release is published | Tests and `govulncheck`, then `make build` for Linux, macOS, FreeBSD, NetBSD and OpenBSD (386, amd64, arm64, armv5/6/7 where supported), each packaged as `exporter_proxy_<tag>_<os>_<arch>.tar.gz` (binary, README, CHANGELOG, LICENSE, `deploy/`) and uploaded to the release with `sha256sums.txt`. |
 
