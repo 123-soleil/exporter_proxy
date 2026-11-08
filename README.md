@@ -51,7 +51,8 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
   to one source. Only `GET` (and `HEAD`) requests are accepted.
 - Authentication is **per listener**: all routes of a listener share the same
   TLS/mTLS/basic auth settings. Routes needing different authentication must
-  go on different listeners.
+  go on different listeners. Within a listener, a route can be restricted to
+  some of its authenticated clients (`authorize`, see "Route authorization").
 - Request credentials (`Authorization` header) are never forwarded upstream.
 
 ### HTTP responses
@@ -59,6 +60,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Situation | Status | Notes |
 |-----------|--------|-------|
 | Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
+| Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
@@ -249,8 +251,40 @@ net/http errors clients can cause, never hides them.
 | `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA, or a server certificate outside its validity dates) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
+| `forbidden` | Authenticated, but neither the basic auth user nor a name of the verified client certificate is in the route's `authorize` list | `403` | `warn` `msg="request forbidden: not in the authorize list of the route"` with `route`, `user` and `remote` |
 | `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
+
+### Route authorization
+
+By default, every client a listener authenticates may read all its routes.
+`authorize` restricts a route to some of them, so that teams can share a
+listener (one port, one certificate) without reading each other's metrics:
+
+```yaml
+routes:
+  - path: /app/metrics
+    upstream: http://127.0.0.1:9000/metrics
+    authorize:
+      users: [app-team]                     # basic_auth_users names
+      client_sans: [prometheus-app.example.com]  # client certificate names
+```
+
+- A request is allowed when its basic authentication user is in `users`,
+  or when its client certificate has a subject alternative name (DNS name,
+  IP address, email address or URI; DNS names compared without case) in
+  `client_sans`. Otherwise it gets `403`.
+- Only identities the listener verified count: the user once its password
+  is checked, the certificate only when the web configuration verifies it
+  against the client CA (`RequireAndVerifyClientCert` or
+  `VerifyClientCertIfGiven`). A self-signed certificate accepted by
+  `RequireAnyClientCert` matches nothing.
+- Authentication comes first: a wrong password still gets `401`.
+- `authorize` must list at least one name. A list that cannot match on its
+  listener (`users` without `basic_auth_users`, `client_sans` without
+  verified client certificates) is reported as a warning at startup, at
+  reload and by `--check`; such a route then refuses every request.
+- A reload applies changed lists without restarting the listener.
 
 ### Allowed networks
 
@@ -508,6 +542,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream` | `http://` only, with a host, without credentials (`user:password@`) or fragment. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
 
@@ -865,6 +900,7 @@ otherwise; warnings do not fail the check:
   then be refused): run `--check` after changing certificates;
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
+- an `authorize` list that cannot match on its listener is a warning;
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times
   would tell users apart);

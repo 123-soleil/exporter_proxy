@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exporter_proxy_auth_failures_total`. Applied by a reload without
   restart; connections opened before a reload that removed their address
   get `403` at their next request and are closed.
+- Route authorization: `authorize` (`users`, `client_sans`) restricts a
+  route to some of the clients its listener authenticates; others get
+  `403`, counted as `forbidden` in `exporter_proxy_auth_failures_total`.
+  Only verified identities count (checked password, client certificate
+  verified against the client CA).
 
 ## [0.1.0] - 2026-11-08
 

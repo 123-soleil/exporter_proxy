@@ -31,7 +31,7 @@ func TestRead(t *testing.T) {
 		{
 			"mTLS only",
 			"tls_server_config:\n  client_ca_file: ca.crt\n  client_auth_type: RequireAndVerifyClientCert\n",
-			Summary{TLSEnabled: true, ClientCAFile: "DIR/ca.crt"},
+			Summary{TLSEnabled: true, ClientCAFile: "DIR/ca.crt", ClientCertsVerified: true},
 			false,
 		},
 		{"unknown keys ignored", "http_server_config:\n  http2: false\n", Summary{}, false},

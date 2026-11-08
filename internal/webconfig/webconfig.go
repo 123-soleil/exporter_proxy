@@ -120,6 +120,9 @@ type Summary struct {
 	CertPEM     string
 	ClientCAPEM string
 	HasUsers    bool
+	// ClientCertsVerified: TLS with a client_auth_type that verifies
+	// client certificates against the client CA.
+	ClientCertsVerified bool
 	// MinBcryptCost and MaxBcryptCost are the lowest and highest costs of
 	// the basic_auth_users hashes (0 without users).
 	MinBcryptCost, MaxBcryptCost int
@@ -146,16 +149,37 @@ func Read(path string) (Summary, error) {
 		maxCost = max(maxCost, cost)
 	}
 	return Summary{
-		MinBcryptCost: minCost,
-		MaxBcryptCost: maxCost,
-		TLSEnabled:    c.TLSConfig.IsEnabled(),
-		CertFile:      c.TLSConfig.TLSCertPath,
-		KeyFile:       c.TLSConfig.TLSKeyPath,
-		ClientCAFile:  c.TLSConfig.ClientCAs,
-		CertPEM:       c.TLSConfig.TLSCert,
-		ClientCAPEM:   c.TLSConfig.ClientCAsText,
-		HasUsers:      len(c.Users) > 0,
+		MinBcryptCost:       minCost,
+		MaxBcryptCost:       maxCost,
+		TLSEnabled:          c.TLSConfig.IsEnabled(),
+		CertFile:            c.TLSConfig.TLSCertPath,
+		KeyFile:             c.TLSConfig.TLSKeyPath,
+		ClientCAFile:        c.TLSConfig.ClientCAs,
+		CertPEM:             c.TLSConfig.TLSCert,
+		ClientCAPEM:         c.TLSConfig.ClientCAsText,
+		HasUsers:            len(c.Users) > 0,
+		ClientCertsVerified: c.TLSConfig.IsEnabled() && verifies(c.TLSConfig.ClientAuth),
 	}, nil
+}
+
+func verifies(clientAuth string) bool {
+	_, verified := ClientCertPolicy(clientAuth)
+	return verified
+}
+
+// AuthorizeWarnings returns why an authorize block could never match on a
+// listener with this web configuration: users without basic
+// authentication, client_sans without verified client certificates.
+func (s Summary) AuthorizeWarnings(users, clientSANs int) []string {
+	var w []string
+	if users > 0 && !s.HasUsers {
+		w = append(w, "authorize users: the web configuration has no basic_auth_users, so no request can match them")
+	}
+	if clientSANs > 0 && !s.ClientCertsVerified {
+		w = append(w, "authorize client_sans: the web configuration does not verify client certificates "+
+			"(TLS with client_auth_type RequireAndVerifyClientCert or VerifyClientCertIfGiven), so no request can match them")
+	}
+	return w
 }
 
 // NormalizeClientAuth resolves exporter-toolkit's names for the same

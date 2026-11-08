@@ -67,11 +67,12 @@ const (
 	AuthInvalidCredentials AuthReason = "invalid_credentials" // unknown user or wrong password
 	AuthRateLimited        AuthReason = "rate_limited"        // too many attempts, answered 429
 	AuthNetworkNotAllowed  AuthReason = "network_not_allowed" // client address outside allowed_networks
+	AuthForbidden          AuthReason = "forbidden"           // authenticated, but not in the route's authorize
 )
 
 // AuthReasons lists every AuthReason, to initialize metric series.
 var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited,
-	AuthNetworkNotAllowed}
+	AuthNetworkNotAllowed, AuthForbidden}
 
 // Options configures a handler.
 type Options struct {
@@ -84,6 +85,7 @@ type route struct {
 	path       string
 	src        source.Source
 	maxSamples int
+	authz      *authorization // nil: every authenticated client
 }
 
 // Handler serves the routes of one listener.
@@ -125,7 +127,8 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 		if err != nil {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
-		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples})
+		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
+			authz: newAuthorization(r.Authorize)})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -199,6 +202,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if rt.authz != nil {
+		if ok, who := rt.authz.allows(req); !ok {
+			h.rec.AuthFailed(h.listener, AuthForbidden)
+			h.logger.Log(req.Context(), h.warnLevel(), "request forbidden: not in the authorize list of the route",
+				"route", rt.path, "user", truncate(who, 64), "remote", req.RemoteAddr)
+			http.Error(rw, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+
 	// Answer before the scraper gives up: its timeout can only shorten the
 	// route timeout, which the source still applies.
 	budget, hasBudget := scrapeBudget(req.Header)
@@ -254,6 +267,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// truncate cuts s to at most n bytes, for logs.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // scrapeTimeoutHeader is sent by Prometheus and vmagent with the scrape

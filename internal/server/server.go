@@ -716,6 +716,20 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 				"listener", sp.name, "web_config_file", sp.webConfig)
 		}
 	}
+	for _, l := range cfg.Listeners {
+		wc, err := webconfig.Read(l.WebConfigFile)
+		if err != nil {
+			continue
+		}
+		for _, r := range l.Routes {
+			if r.Authorize == nil {
+				continue
+			}
+			for _, w := range wc.AuthorizeWarnings(len(r.Authorize.Users), len(r.Authorize.ClientSANs)) {
+				s.logger.Warn(w, "listener", l.Name, "route", r.Path, "web_config_file", l.WebConfigFile)
+			}
+		}
+	}
 	return specs, nil
 }
 

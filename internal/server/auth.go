@@ -438,13 +438,14 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// never kept in memory.
 	key := sha256.Sum256([]byte(user + "\x00" + string(hash) + "\x00" + pass))
 	if known && h.successes.has(key) {
-		h.next.ServeHTTP(w, r)
+		// Verified: routes with an authorize list can rely on the user.
+		h.next.ServeHTTP(w, r.WithContext(proxy.WithUser(r.Context(), user)))
 		return
 	}
 
 	switch h.verify(r, key, []byte(hash), known, c.Users, pass) {
 	case verifyOK:
-		h.next.ServeHTTP(w, r)
+		h.next.ServeHTTP(w, r.WithContext(proxy.WithUser(r.Context(), user)))
 	case verifyLimited:
 		h.refuse(w, r, proxy.AuthRateLimited, user, http.StatusTooManyRequests)
 	default:

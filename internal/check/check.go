@@ -56,6 +56,13 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 			case r.UnixSocket != "":
 				c.socket(rwhere, r.UnixSocket)
 			}
+			if r.Authorize != nil {
+				if wc, err := webconfig.Read(l.WebConfigFile); err == nil {
+					for _, w := range wc.AuthorizeWarnings(len(r.Authorize.Users), len(r.Authorize.ClientSANs)) {
+						c.add(Warning, rwhere, "%s", w)
+					}
+				}
+			}
 		}
 	}
 	return c.findings

@@ -84,7 +84,19 @@ type Route struct {
 	File       string
 	MaxAge     time.Duration // file routes only
 
+	// Authorize restricts the route to some of the listener's clients;
+	// nil: every client the listener authenticates.
+	Authorize *Authorize
+
 	Limits Limits
+}
+
+// Authorize lists who may read a route: a request is allowed when its
+// basic authentication user is in Users, or when its verified client
+// certificate has a subject alternative name in ClientSANs.
+type Authorize struct {
+	Users      []string
+	ClientSANs []string
 }
 
 // Limits bound the work done for one request on a route.
@@ -136,6 +148,12 @@ type fileRoute struct {
 	UnixSocket string         `yaml:"unix_socket"`
 	File       string         `yaml:"file"`
 	MaxAge     *time.Duration `yaml:"max_age"`
+	Authorize  *fileAuthorize `yaml:"authorize"`
+}
+
+type fileAuthorize struct {
+	Users      []string `yaml:"users"`
+	ClientSANs []string `yaml:"client_sans"`
 }
 
 // Load reads and decodes the configuration file at path.
@@ -210,6 +228,7 @@ func resolve(fc *fileConfig) *Config {
 				UnixSocket: fr.UnixSocket,
 				File:       fr.File,
 				MaxAge:     valueOr(fr.MaxAge, 0),
+				Authorize:  authorizeOf(fr.Authorize),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -220,6 +239,13 @@ func resolve(fc *fileConfig) *Config {
 		cfg.Listeners = append(cfg.Listeners, l)
 	}
 	return cfg
+}
+
+func authorizeOf(fa *fileAuthorize) *Authorize {
+	if fa == nil {
+		return nil
+	}
+	return &Authorize{Users: fa.Users, ClientSANs: fa.ClientSANs}
 }
 
 // networks returns validated allowed_networks entries as prefixes, nil when

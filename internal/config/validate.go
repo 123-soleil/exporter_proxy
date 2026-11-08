@@ -144,6 +144,33 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	v.checkPositiveDuration(where, "max_age", r.MaxAge)
 
 	v.checkLimits(where, r.fileLimits)
+	v.checkAuthorize(where, r.Authorize)
+}
+
+// checkAuthorize rejects an authorize block that would refuse every
+// request, or that holds empty names.
+func (v *validator) checkAuthorize(where string, a *fileAuthorize) {
+	if a == nil {
+		return
+	}
+	if len(a.Users) == 0 && len(a.ClientSANs) == 0 {
+		v.addf(where, "authorize must list users or client_sans (an empty authorize would refuse every request)")
+	}
+	for _, list := range []struct {
+		key   string
+		names []string
+	}{{"users", a.Users}, {"client_sans", a.ClientSANs}} {
+		seen := map[string]bool{}
+		for _, n := range list.names {
+			switch {
+			case strings.TrimSpace(n) == "":
+				v.addf(where, "authorize %s: empty name", list.key)
+			case seen[n]:
+				v.addf(where, "authorize %s: duplicate %q", list.key, n)
+			}
+			seen[n] = true
+		}
+	}
 }
 
 func (v *validator) checkUpstream(where, raw string) {
