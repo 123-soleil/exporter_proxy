@@ -1020,7 +1020,7 @@ OpenBSD: `386`, `amd64`, `arm64`, `armv5`, `armv6`, `armv7`; macOS:
 binary, `README.md`, `CHANGELOG.md`, `LICENSE` and `deploy/`.
 
 ```sh
-VERSION=0.4.1 ARCH=amd64
+VERSION=0.4.2 ARCH=amd64
 BASE=https://github.com/123-soleil/exporter_proxy/releases/download/$VERSION
 curl -fsSLO "$BASE/exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/sha256sums.txt"
@@ -1137,10 +1137,10 @@ pinned by digest and kept up to date by Dependabot.
 Build the image (no registry image is published yet):
 
 ```sh
-docker build -t exporter_proxy:0.4.1 \
-  --build-arg VERSION=0.4.1 --build-arg REVISION="$(git rev-parse HEAD)" .
+docker build -t exporter_proxy:0.4.2 \
+  --build-arg VERSION=0.4.2 --build-arg REVISION="$(git rev-parse HEAD)" .
 # Other platforms, cross-compiled without emulation:
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.4.1 .
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.4.2 .
 ```
 
 Run it:
@@ -1152,7 +1152,7 @@ docker run -d --name exporter_proxy --restart unless-stopped \
   -v /etc/exporter_proxy:/etc/exporter_proxy:ro \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --stop-timeout 30 \
-  exporter_proxy:0.4.1
+  exporter_proxy:0.4.2
 ```
 
 `deploy/docker/compose.yml.exemple` is the same with Docker Compose.
@@ -1166,8 +1166,8 @@ docker run -d --name exporter_proxy --restart unless-stopped \
 | File routes, Unix socket upstreams | Mount their directories (read-only for files; the socket's directory for Unix sockets, with the socket file writable by the container's uid or gid). |
 | Reload | `docker kill --signal HUP exporter_proxy` (`systemctl reload` equivalent): same all-or-nothing rules, see "Configuration reload". |
 | Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
-| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.4.1 --log.format=json`. |
-| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.4.1 --check` |
+| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.4.2 --log.format=json`. |
+| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.4.2 --check` |
 | Health | No shell in the image, so no `HEALTHCHECK`. Orchestrators probe `/-/healthy` and `/-/ready` on the metrics endpoint (see "Health endpoints"); Prometheus scraping the metrics endpoint (`up`) remains the main health check. |
 | Not available | systemd socket activation (`listen: "systemd:<name>"`). |
 
@@ -1537,7 +1537,7 @@ GitHub Actions (`.github/workflows/`):
 
 | Workflow | When | What |
 |----------|------|------|
-| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`; the Docker image built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`, then run as documented in "Docker" (`test/docker/run.sh`: hardened, uid 65532, serving, reload with `SIGHUP` after an atomic file replacement, clean stop). |
+| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`; a build for every release platform (Linux, macOS and the BSDs, every architecture); the Docker image built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`, then run as documented in "Docker" (`test/docker/run.sh`: hardened, uid 65532, serving, reload with `SIGHUP` after an atomic file replacement, clean stop). |
 | `integration.yml` | Pull requests to `main`, pushes to `main` | `test/systemd/run.sh` under the runner's real systemd: installation from `deploy/` as described above, the hardened unit, socket activation on port 443 (no capability), TLS and basic auth, `--check`, reload (successful and failed) without restarting the process, clean stop. |
 | `codeql.yml` | Pull requests to `main`, pushes to `main`, every Monday | CodeQL static analysis of the code (`security-and-quality` queries), results in the Security tab. |
 | `security.yml` | Every Monday, or by hand | `go mod verify` and `govulncheck` on `main`, for vulnerabilities published after a merge. |

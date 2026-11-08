@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-09
+
+### Fixed
+
+- The NetBSD binaries did not build: go-systemd's daemon package, used
+  for the `Type=notify` readiness of 0.4.1, does not support NetBSD. The
+  notification is now sent by a few lines of portable code. CI builds
+  every release platform on each pull request. The 0.4.1 release has no
+  NetBSD archives and no `sha256sums.txt`: use 0.4.2.
+
 ## [0.4.1] - 2026-11-08
 
 ### Changed
@@ -408,7 +418,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
 
-[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.1...HEAD
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.2...HEAD
+[0.4.2]: https://github.com/123-soleil/exporter_proxy/compare/0.4.1...0.4.2
 [0.4.1]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/123-soleil/exporter_proxy/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/123-soleil/exporter_proxy/compare/0.2.0...0.3.0
