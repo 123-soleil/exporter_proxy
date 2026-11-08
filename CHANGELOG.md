@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client certificate for mTLS, `server_name`). The upstream certificate is
   always verified; files are loaded at startup and reload, and checked by
   `--check`.
+- Service discovery: with `metrics.service_discovery` (`host`, optional
+  `labels`), the metrics endpoint serves `/sd`, the routes in the
+  Prometheus HTTP service discovery format, with their listener's actual
+  port and scheme.
 
 ## [0.1.0] - 2026-11-08
 

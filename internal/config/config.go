@@ -60,6 +60,17 @@ type MetricsEndpoint struct {
 	Listen          string
 	WebConfigFile   string
 	AllowedNetworks []netip.Prefix // nil: every client address
+	// ServiceDiscovery enables the Prometheus HTTP service discovery
+	// endpoint; nil: disabled.
+	ServiceDiscovery *ServiceDiscovery
+}
+
+// ServiceDiscovery describes the targets the discovery endpoint lists.
+type ServiceDiscovery struct {
+	// Host is the name or address Prometheus reaches the listeners at.
+	Host string
+	// Labels are added to every target.
+	Labels map[string]string
 }
 
 // Listener is one listening address with its authentication and routes.
@@ -126,9 +137,15 @@ type fileConfig struct {
 }
 
 type fileMetrics struct {
-	Listen          string   `yaml:"listen"`
-	WebConfigFile   string   `yaml:"web_config_file"`
-	AllowedNetworks []string `yaml:"allowed_networks"`
+	Listen           string                `yaml:"listen"`
+	WebConfigFile    string                `yaml:"web_config_file"`
+	AllowedNetworks  []string              `yaml:"allowed_networks"`
+	ServiceDiscovery *fileServiceDiscovery `yaml:"service_discovery"`
+}
+
+type fileServiceDiscovery struct {
+	Host   string            `yaml:"host"`
+	Labels map[string]string `yaml:"labels"`
 }
 
 type fileLimits struct {
@@ -223,11 +240,16 @@ func resolve(fc *fileConfig) *Config {
 	}
 	baseConcurrency := valueOr(fc.Defaults.MaxConcurrentRequests, DefaultMaxConcurrentRequests)
 
+	var sd *ServiceDiscovery
+	if f := fc.Metrics.ServiceDiscovery; f != nil {
+		sd = &ServiceDiscovery{Host: f.Host, Labels: f.Labels}
+	}
 	cfg := &Config{
 		Metrics: MetricsEndpoint{
-			Listen:          fc.Metrics.Listen,
-			WebConfigFile:   fc.Metrics.WebConfigFile,
-			AllowedNetworks: networks(fc.Metrics.AllowedNetworks),
+			Listen:           fc.Metrics.Listen,
+			WebConfigFile:    fc.Metrics.WebConfigFile,
+			AllowedNetworks:  networks(fc.Metrics.AllowedNetworks),
+			ServiceDiscovery: sd,
 		},
 		Listeners: make([]Listener, 0, len(fc.Listeners)),
 	}

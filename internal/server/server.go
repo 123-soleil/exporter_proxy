@@ -649,11 +649,15 @@ func (s *Server) pruneSuccesses() {
 func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	var specs []spec
 	if s.opts.MetricsHandler != nil {
+		handler := s.opts.MetricsHandler
+		if cfg.Metrics.ServiceDiscovery != nil {
+			handler = &sdHandler{s: s, cfg: cfg, next: handler}
+		}
 		specs = append(specs, spec{
 			name:         MetricsListener,
 			listen:       cfg.Metrics.Listen,
 			webConfig:    cfg.Metrics.WebConfigFile,
-			handler:      s.opts.MetricsHandler,
+			handler:      handler,
 			writeTimeout: metricsWriteTimeout,
 			allowed:      cfg.Metrics.AllowedNetworks,
 		})

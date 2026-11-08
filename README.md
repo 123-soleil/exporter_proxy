@@ -587,6 +587,7 @@ together on one log line (each prefixed with its location, e.g.
 | Scope      | Rule |
 |------------|------|
 | `metrics`  | Required, with `listen` and `web_config_file`. |
+| `service_discovery` | Optional, in `metrics`: `host` required (a name or an address, without scheme, port or brackets); `labels` with classic label names, not starting with `__` nor named `exporter_proxy_listener` or `exporter_proxy_route`. |
 | Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label); `metrics` is reserved for the metrics endpoint. |
 | `listen`   | Required, `host:port` with a port from 1 to 65535, or `systemd:<name>` (socket activation, see below); not shared with another listener or with `metrics`. |
 | `web_config_file` | Required on every listener and on `metrics`. |
@@ -631,6 +632,48 @@ Other built-in defaults:
 | `--log.level`     | `info`                            |
 | `--log.format`    | `logfmt`                          |
 | `--log.access`    | off                               |
+
+### Service discovery
+
+With `metrics.service_discovery`, the metrics endpoint also serves
+`/sd`: the routes of the listeners, in the
+[Prometheus HTTP service discovery](https://prometheus.io/docs/prometheus/latest/http_sd/)
+format, so that Prometheus finds every route without listing them by hand.
+
+```yaml
+metrics:
+  listen: ":9999"
+  web_config_file: /etc/exporter_proxy/web-metrics.yml
+  service_discovery:
+    host: node1.example.com      # how Prometheus reaches this machine
+    labels:                      # optional, added to every target
+      dc: par1
+```
+
+Each route is one target, `host:port` with the port its listener actually
+serves (a `systemd:` TCP socket included), and the labels
+`__metrics_path__` (the route path), `__scheme__` (`https` when the
+listener serves TLS), `exporter_proxy_listener` and
+`exporter_proxy_route`. Listeners on a Unix socket are left out. The list
+follows reloads.
+
+The endpoint is protected like `/metrics` (same web configuration and
+`allowed_networks`). Credentials are not part of service discovery: set
+them in the Prometheus job, and use one job per kind of authentication,
+selected with the `exporter_proxy_listener` label:
+
+```yaml
+scrape_configs:
+  - job_name: exporter_proxy-mtls
+    http_sd_configs:
+      - url: https://node1.example.com:9999/sd
+        tls_config: { ca_file: ca.pem, cert_file: prom.crt, key_file: prom.key }
+    tls_config: { ca_file: ca.pem, cert_file: prom.crt, key_file: prom.key }
+    relabel_configs:
+      - source_labels: [exporter_proxy_listener]
+        regex: node
+        action: keep
+```
 
 ### systemd socket activation
 

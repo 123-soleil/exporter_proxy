@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"path"
 	"path/filepath"
@@ -48,6 +49,7 @@ func validate(fc *fileConfig) error {
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)
 	v.checkNetworks("metrics", fc.Metrics.AllowedNetworks)
+	v.checkServiceDiscovery(fc.Metrics.ServiceDiscovery)
 
 	// defaults section: every value set must be positive.
 	v.checkLimits("defaults", fc.Defaults.fileLimits)
@@ -254,6 +256,38 @@ func (v *validator) checkListen(where, addr string, seen map[string]string) {
 		return
 	}
 	seen[addr] = where
+}
+
+// labelNamePattern restricts service discovery label names to classic
+// Prometheus label names; names starting with "__" are reserved.
+var labelNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// checkServiceDiscovery checks the service_discovery block of metrics.
+func (v *validator) checkServiceDiscovery(sd *fileServiceDiscovery) {
+	if sd == nil {
+		return
+	}
+	const where = "metrics service_discovery"
+	switch {
+	case sd.Host == "":
+		v.addf(where, "host is required: the name or address Prometheus reaches the listeners at")
+	case strings.ContainsAny(sd.Host, "/[]@ ") || strings.Count(sd.Host, ":") == 1:
+		v.addf(where, "host %q must be a name or an address, without scheme, port or brackets", sd.Host)
+	case strings.Contains(sd.Host, ":"):
+		if _, err := netip.ParseAddr(sd.Host); err != nil {
+			v.addf(where, "host %q is not a valid IPv6 address", sd.Host)
+		}
+	}
+	for name := range sd.Labels {
+		switch {
+		case !labelNamePattern.MatchString(name):
+			v.addf(where, "label name %q is not a valid Prometheus label name", name)
+		case strings.HasPrefix(name, "__"):
+			v.addf(where, "label name %q is reserved (names starting with \"__\")", name)
+		case name == "exporter_proxy_listener" || name == "exporter_proxy_route":
+			v.addf(where, "label name %q is set by exporter_proxy", name)
+		}
+	}
 }
 
 // checkNetworks checks allowed_networks: unset allows every address, an
