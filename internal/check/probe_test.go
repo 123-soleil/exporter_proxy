@@ -56,3 +56,18 @@ func TestProbeInterrupted(t *testing.T) {
 	}}}}
 	expect(t, Probe(ctx, cfg), want{Problem, "interrupted"})
 }
+
+// A signal during a read reports it as interrupted, not as a failure.
+func TestProbeInterruptedDuringRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+	limits := config.Limits{Timeout: 5 * time.Second, MaxBodyBytes: 1 << 20, MaxSamples: 10}
+	cfg := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{
+		{Path: "/last", Upstream: up.URL + "/m", Limits: limits},
+	}}}}
+	expect(t, Probe(ctx, cfg), want{Problem, "interrupted"})
+}

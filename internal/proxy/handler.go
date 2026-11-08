@@ -467,15 +467,19 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 	if len(sreq.Query) > 0 {
 		key += "\x00?" + sreq.Query.Encode()
 	}
+	var cached *sharedRead
 	h.mu.Lock()
 	if rt.cacheTTL > 0 {
 		// Served only to requests that could have joined the read that
 		// produced it: an answer obtained with another client's shorter
 		// timeout is not handed to a scraper with more time.
-		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL && joinable(c, sreq) {
-			h.mu.Unlock()
-			h.rec.CacheHit(h.listener, rt.path)
-			return c, nil
+		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL {
+			if joinable(c, sreq) {
+				h.mu.Unlock()
+				h.rec.CacheHit(h.listener, rt.path)
+				return c, nil
+			}
+			cached = c // still better than a 503 when no slot is free
 		}
 	}
 	var rd *sharedRead
@@ -497,9 +501,14 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		h.rec.RequestShared(h.listener, rt.path)
 	} else {
 		if running == nil {
-			// Never queue: a full listener or route answers immediately.
+			// Never queue: a full listener or route answers immediately,
+			// from the cache if an answer is there.
 			if err := h.takeSlots(rt); err != nil {
 				h.mu.Unlock()
+				if cached != nil {
+					h.rec.CacheHit(h.listener, rt.path)
+					return cached, nil
+				}
 				return nil, err
 			}
 		}
@@ -519,6 +528,9 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			nr.body, nr.protobuf, nr.err = h.safeFetch(fetchCtx, rt, sreq)
 			nr.at = time.Now()
 			h.mu.Lock()
+			// Counted out before its slots are free, so that the gauge
+			// never exceeds the limit.
+			h.rec.InFlight(h.listener, -1)
 			// The slots are free before the read stops being shareable, and
 			// before anyone gets the result: a request arriving meanwhile
 			// either joins the read or finds a slot.
@@ -531,11 +543,16 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			}
 			// Only validated results are kept: a failure is retried by
 			// the next request.
+			// A read told a shorter timeout does not replace a fresh entry
+			// that more requests can use.
 			if rt.cacheTTL > 0 && nr.err == nil {
-				h.cache[key] = nr
+				old := h.cache[key]
+				if old == nil || time.Since(old.at) >= rt.cacheTTL || nr.advertised == 0 ||
+					(old.advertised != 0 && nr.advertised >= old.advertised) {
+					h.cache[key] = nr
+				}
 			}
 			h.mu.Unlock()
-			h.rec.InFlight(h.listener, -1)
 			close(nr.done)
 		}()
 	}

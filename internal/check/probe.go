@@ -21,12 +21,14 @@ func Probe(ctx context.Context, cfg *config.Config) []Finding {
 	for _, l := range cfg.Listeners {
 		for _, r := range l.Routes {
 			if ctx.Err() != nil {
-				// Interrupted: no false failures for the remaining routes.
-				c.add(Problem, "probe", "interrupted: the remaining sources were not read")
-				return c.findings
+				break
 			}
 			c.probe(ctx, fmt.Sprintf("listener %q route %q", l.Name, r.Path), r)
 		}
+	}
+	if ctx.Err() != nil {
+		// Interrupted: no false failures, one finding.
+		c.add(Problem, "probe", "interrupted: some sources were not read")
 	}
 	return c.findings
 }
@@ -47,6 +49,9 @@ func (c *checker) probe(ctx context.Context, where string, r config.Route) {
 		defer closer.CloseIdleConnections()
 	}
 	res, err := src.Fetch(ctx, source.Request{})
+	if err != nil && ctx.Err() != nil {
+		return // interrupted: reported once by Probe
+	}
 	if err != nil {
 		c.add(Problem, where, "probe: %s: %v", source.ReasonOf(err), err)
 		return

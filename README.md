@@ -65,7 +65,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
 | Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
-| `max_concurrent_requests` reached (listener, or route when set) | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
+| `max_concurrent_requests` reached (listener, or route when set) | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below), or starts its own if the running read was told a shorter timeout than its budget and a slot is free. |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
@@ -227,7 +227,9 @@ routes:
   would be a cache entry, and probes must be live).
 - A cached answer is only served to requests that could have shared the
   read producing it: one obtained with a shorter scrape timeout than a
-  request's budget is not handed to it, which reads again.
+  request's budget is not handed to it, which reads again (and gets the
+  cached answer if no slot is free, rather than `503`). Such an answer
+  never replaces a fresh one more requests can use.
 - Only valid results are kept: a failure is never cached, the next request
   reads again.
 - Answers from such a route carry `Age` (seconds since the read); they
@@ -325,6 +327,10 @@ validated once and compressed once.
   are neither refused with `503` nor counted in
   `exporter_proxy_requests_in_flight`. They are counted in
   `exporter_proxy_requests_shared_total`.
+- Except that a request does not share a read that told the upstream a
+  shorter timeout than its own budget (another client's shorter scrape
+  timeout): it starts its own read, taking a slot, when one is free, and
+  shares the running read otherwise.
 - Nothing is cached unless the route sets `cache_ttl` (see "Cache"): a
   request arriving after the read finished reads the source again, so no
   answer is ever older than the scrape that asked.
