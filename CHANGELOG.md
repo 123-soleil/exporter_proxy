@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (blackbox, snmp), each restricted to listed values or anchored patterns;
   anything else gets `400`. Routes requiring a parameter are left out of
   `/sd`.
+- Optional per-route cache, `cache_ttl` (upstream routes, at most `1h`, not
+  with `forward_params`): validated results only, `Age` header, counter
+  `exporter_proxy_cache_hits_total{listener,route}`.
 
 ## [0.1.0] - 2026-11-08
 

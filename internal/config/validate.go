@@ -172,6 +172,26 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	v.checkLimits(where, r.fileLimits)
 	v.checkAuthorize(where, r.Authorize)
 	v.checkForwardParams(where, r)
+	v.checkCacheTTL(where, r)
+}
+
+// checkCacheTTL allows a cache on upstream routes only, without
+// forward_params (unbounded keys; probes must be live), bounded by
+// MaxCacheTTL.
+func (v *validator) checkCacheTTL(where string, r fileRoute) {
+	if r.CacheTTL == nil {
+		return
+	}
+	switch {
+	case *r.CacheTTL <= 0:
+		v.addf(where, "cache_ttl must be greater than 0")
+	case *r.CacheTTL > MaxCacheTTL:
+		v.addf(where, "cache_ttl must be at most %s", MaxCacheTTL)
+	case r.Upstream == "":
+		v.addf(where, "cache_ttl requires an upstream (files are read without cost)")
+	case r.ForwardParams != nil:
+		v.addf(where, "cache_ttl and forward_params are mutually exclusive (probes must be live)")
+	}
 }
 
 // paramNamePattern restricts forwarded query parameter names.

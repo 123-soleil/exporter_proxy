@@ -48,6 +48,7 @@ type Metrics struct {
 	inFlight        *inFlightGauge
 	rejected        *prometheus.CounterVec
 	shared          *prometheus.CounterVec
+	cacheHits       *prometheus.CounterVec
 	authFailures    *prometheus.CounterVec
 	fileModified    *prometheus.GaugeVec
 	webConfigError  *prometheus.GaugeVec
@@ -114,6 +115,10 @@ func New() *Metrics {
 			Namespace: namespace, Name: "requests_rejected_total",
 			Help: "Requests refused with 503 because max_concurrent_requests was reached.",
 		}, []string{"listener"}),
+		cacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "cache_hits_total",
+			Help: "Requests answered from the cache of a route with cache_ttl, without reading the source.",
+		}, lr),
 		shared: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "requests_shared_total",
 			Help: "Requests answered with the result of a source read started by a concurrent request of the same route.",
@@ -146,7 +151,7 @@ func New() *Metrics {
 
 	m.registry.MustRegister(
 		m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples,
-		m.sourceErrors, m.inFlight, m.rejected, m.shared, m.authFailures, m.fileModified, m.webConfigError,
+		m.sourceErrors, m.inFlight, m.rejected, m.shared, m.cacheHits, m.authFailures, m.fileModified, m.webConfigError,
 		m.configHash, m.reloadSuccessful, m.reloadSuccessTstamp,
 		versioncollector.NewCollector(namespace),
 		collectors.NewGoCollector(),
@@ -205,6 +210,9 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 		}
 		for _, r := range l.Routes {
 			m.shared.WithLabelValues(l.Name, r.Path)
+			if r.CacheTTL > 0 {
+				m.cacheHits.WithLabelValues(l.Name, r.Path)
+			}
 			for _, reason := range reasons {
 				m.sourceErrors.WithLabelValues(l.Name, r.Path, string(reason))
 			}
@@ -217,7 +225,7 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 func (m *Metrics) deleteSeries(labels prometheus.Labels) {
 	routeVecs := []interface {
 		DeletePartialMatch(prometheus.Labels) int
-	}{m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples, m.sourceErrors, m.shared, m.fileModified}
+	}{m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples, m.sourceErrors, m.shared, m.cacheHits, m.fileModified}
 	for _, v := range routeVecs {
 		v.DeletePartialMatch(labels)
 	}
@@ -410,6 +418,16 @@ func (m *Metrics) WebConfigRead(listener string, tls, ok bool) {
 		v = 1
 	}
 	m.webConfigError.WithLabelValues(listener).Set(v)
+}
+
+// CacheHit implements proxy.Recorder.
+func (m *Metrics) CacheHit(listener, route string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.known(listener, route) {
+		return
+	}
+	m.cacheHits.WithLabelValues(listener, route).Inc()
 }
 
 // RequestShared implements proxy.Recorder.

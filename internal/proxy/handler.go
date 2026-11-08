@@ -50,6 +50,9 @@ type Recorder interface {
 	// ContentParsed is called after parsing, successful or not; samples is
 	// only meaningful when valid.
 	ContentParsed(listener, route string, samples int, duration time.Duration, valid bool)
+	// CacheHit is called for a request answered from the cache of a
+	// route with cache_ttl.
+	CacheHit(listener, route string)
 	// RequestShared is called for a request answered with the result of a
 	// read started by a concurrent request of the same route.
 	RequestShared(listener, route string)
@@ -96,6 +99,7 @@ type route struct {
 	maxSamples int
 	authz      *authorization                 // nil: every authenticated client
 	params     map[string]config.ForwardParam // nil: the query string is ignored
+	cacheTTL   time.Duration                  // 0: no cache
 }
 
 // Handler serves the routes of one listener.
@@ -106,9 +110,11 @@ type Handler struct {
 	logger    *slog.Logger
 	rec       Recorder
 	accessLog bool
-	// mu protects reads: the source reads running, by route.
+	// mu protects reads, the source reads running, and cache, the results
+	// kept for routes with cache_ttl, by route and format.
 	mu    sync.Mutex
 	reads map[string]*sharedRead
+	cache map[string]*sharedRead
 	// logs bounds the warn lines a client can trigger on this listener
 	// (rejections, source failures): beyond, they are logged at debug
 	// level. They are all counted in the metrics.
@@ -138,7 +144,7 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
-			authz: newAuthorization(r.Authorize), params: r.ForwardParams})
+			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -153,6 +159,7 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 		accessLog: opts.AccessLog,
 		logs:      rate.NewLimiter(logRate, logBurst),
 		reads:     map[string]*sharedRead{},
+		cache:     map[string]*sharedRead{},
 	}
 	if h.logger == nil {
 		h.logger = slog.New(slog.DiscardHandler)
@@ -279,6 +286,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	body := rd.body
 	hdr := rw.Header()
+	if rt.cacheTTL > 0 {
+		// The answer may come from the cache: tell its age.
+		hdr.Set("Age", strconv.Itoa(int(time.Since(rd.at).Seconds())))
+	}
 	hdr.Set("Content-Type", contentType)
 	if rd.protobuf {
 		hdr.Set("Content-Type", protobufContentType)
@@ -366,6 +377,8 @@ type sharedRead struct {
 	gzipOnce sync.Once
 	gzip     []byte
 
+	at time.Time // when the read ended; set before done is closed
+
 	// Protected by Handler.mu.
 	clients int                // requests waiting for the result
 	cancel  context.CancelFunc // cancels the read
@@ -395,6 +408,13 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		key += "\x00?" + sreq.Query.Encode()
 	}
 	h.mu.Lock()
+	if rt.cacheTTL > 0 {
+		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL {
+			h.mu.Unlock()
+			h.rec.CacheHit(h.listener, rt.path)
+			return c, nil
+		}
+	}
 	rd, ok := h.reads[key]
 	if ok {
 		rd.clients++
@@ -421,9 +441,15 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		go func() {
 			defer cancel()
 			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
+			rd.at = time.Now()
 			h.mu.Lock()
 			if h.reads[key] == rd {
 				delete(h.reads, key)
+			}
+			// Only validated results are kept: a failure is retried by
+			// the next request.
+			if rt.cacheTTL > 0 && rd.err == nil {
+				h.cache[key] = rd
 			}
 			h.mu.Unlock()
 			// The slot is free before anyone gets the result: a scraper's
@@ -552,4 +578,5 @@ func (NopRecorder) ContentParsed(string, string, int, time.Duration, bool) {}
 func (NopRecorder) AuthFailed(string, AuthReason)                          {}
 func (NopRecorder) SourceFailed(string, string, source.Reason)             {}
 func (NopRecorder) RequestShared(string, string)                           {}
+func (NopRecorder) CacheHit(string, string)                                {}
 func (NopRecorder) WebConfigRead(string, bool, bool)                       {}

@@ -205,6 +205,32 @@ routes:
   their dates.
 - Handshake and certificate failures count as `unavailable` source errors.
 
+### Cache
+
+For an exporter that is slow or costly to read (a database, a slow SNMP
+device), `cache_ttl` keeps a validated result for that long:
+
+```yaml
+routes:
+  - path: /postgres/metrics
+    upstream: http://127.0.0.1:19187/metrics
+    cache_ttl: 30s
+```
+
+- Off by default. Allowed on `upstream` routes only (files are read
+  without cost), at most `1h`, and not with `forward_params` (each target
+  would be a cache entry, and probes must be live).
+- Only valid results are kept: a failure is never cached, the next request
+  reads again.
+- Answers from such a route carry `Age` (seconds since the read); they
+  stay `Cache-Control: no-store` for anything downstream. Requests served
+  from the cache are counted in `exporter_proxy_cache_hits_total`.
+- One entry per format (text, protobuf). A reload empties the cache.
+- Prometheus records samples with the scrape time, not the read time: with
+  a `cache_ttl` close to the scrape interval, consecutive scrapes may get
+  the same values. Keep it below the scrape interval unless that is
+  wanted.
+
 ### Formats
 
 The proxy serves the text exposition format, and the delimited protobuf
@@ -240,8 +266,9 @@ validated once and compressed once.
   are neither refused with `503` nor counted in
   `exporter_proxy_requests_in_flight`. They are counted in
   `exporter_proxy_requests_shared_total`.
-- Nothing is cached: a request arriving after the read finished reads the
-  source again, so no answer is ever older than the scrape that asked.
+- Nothing is cached unless the route sets `cache_ttl` (see "Cache"): a
+  request arriving after the read finished reads the source again, so no
+  answer is ever older than the scrape that asked.
 - The read runs with the route timeout only: the request that started it
   does not cut it short for others with a longer scrape timeout. Every
   request waits at most its own scrape budget; the read goes on while at
@@ -534,6 +561,8 @@ Besides the standard `go_*`, `process_*` and
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
+- `exporter_proxy_cache_hits_total{listener,route}`: requests answered from
+  the cache of a route with `cache_ttl`, without reading the source.
 - `exporter_proxy_requests_shared_total{listener,route}`: requests answered
   with the result of a source read started by a concurrent request of the
   same route (shared reads, below).
@@ -656,6 +685,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
 | `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |

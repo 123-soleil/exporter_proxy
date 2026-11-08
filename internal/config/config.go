@@ -105,6 +105,9 @@ type Route struct {
 	// by name; nil: the query string is ignored.
 	ForwardParams map[string]ForwardParam
 
+	// CacheTTL keeps a validated result that long; 0: no cache.
+	CacheTTL time.Duration
+
 	Limits Limits
 }
 
@@ -124,6 +127,10 @@ type ForwardParam struct {
 	Patterns []*regexp.Regexp // anchored: they match the whole value
 	Required bool
 }
+
+// MaxCacheTTL bounds cache_ttl: a cached answer older than that would
+// hide a failing exporter for too long.
+const MaxCacheTTL = time.Hour
 
 // MaxParamValueLength bounds the value of a forwarded query parameter.
 const MaxParamValueLength = 1024
@@ -195,6 +202,7 @@ type fileRoute struct {
 	// UpstreamTLS is decoded as is: no inheritance.
 	UpstreamTLS   *fileUpstreamTLS            `yaml:"upstream_tls"`
 	ForwardParams map[string]fileForwardParam `yaml:"forward_params"`
+	CacheTTL      *time.Duration              `yaml:"cache_ttl"`
 }
 
 type fileForwardParam struct {
@@ -295,6 +303,7 @@ func resolve(fc *fileConfig) *Config {
 				MaxAge:        valueOr(fr.MaxAge, 0),
 				Authorize:     authorizeOf(fr.Authorize),
 				ForwardParams: forwardParamsOf(fr.ForwardParams),
+				CacheTTL:      valueOr(fr.CacheTTL, 0),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
