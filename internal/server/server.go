@@ -98,6 +98,9 @@ type listener struct {
 	allowed atomic.Pointer[[]netip.Prefix]
 	// refused reports a connection refused by allowed_networks.
 	refused func(remote string)
+	// crl is the client_crl_file path ("" for none), read on every
+	// handshake and request. A reload keeping the listener replaces it.
+	crl atomic.Pointer[string]
 }
 
 // listenerSettings are the parts of a web configuration that apply when a
@@ -194,6 +197,12 @@ func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
 // client certificate settings must be those the listener started with, then
 // serverTLSConfig applies.
 func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
+	return l.tlsConfigWithCRL(c, *l.crl.Load())
+}
+
+// tlsConfigWithCRL is tlsConfigFor with the client_crl_file path given: a
+// reload checks the TLS settings with the CRL it is about to apply.
+func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, error) {
 	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
 		return nil, err
 	}
@@ -204,7 +213,66 @@ func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
 	if err := webconfig.ValidateHTTP2Ciphers(&withListenerHTTP2); err != nil {
 		return nil, err
 	}
-	return serverTLSConfig(c)
+	cfg, err := serverTLSConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	if path != "" {
+		set, err := loadCRL(path, time.Now())
+		if err != nil {
+			return nil, err // server side: refuses the handshake
+		}
+		// On every handshake, TLS 1.3 session resumption included.
+		prev := cfg.VerifyConnection
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			if prev != nil {
+				if err := prev(cs); err != nil {
+					return err
+				}
+			}
+			return set.check(cs.VerifiedChains)
+		}
+	}
+	return cfg, nil
+}
+
+// checkCRLSpec checks the client_crl_file of a listener at startup and
+// reload: it needs client certificates verified against a client CA, and
+// must parse. A CRL outside its dates is logged, not refused: like a
+// server certificate outside its dates, it refuses that listener's client
+// certificates while the others keep running.
+func checkCRLSpec(sp spec, wc *web.Config, logger *slog.Logger) string {
+	if _, verified := webconfig.ClientCertPolicy(wc.TLSConfig.ClientAuth); !wc.TLSConfig.IsEnabled() || !verified {
+		return fmt.Sprintf("listener %q: client_crl_file needs a web configuration verifying client certificates "+
+			"(TLS with client_auth_type RequireAndVerifyClientCert or VerifyClientCertIfGiven)", sp.name)
+	}
+	data, err := os.ReadFile(sp.clientCRL)
+	if err == nil {
+		_, err = parseCRLs(data)
+	}
+	if err != nil {
+		return fmt.Sprintf("listener %q: client_crl_file %s: %s", sp.name, sp.clientCRL, errfmt.OneLine(err))
+	}
+	if _, err := loadCRL(sp.clientCRL, time.Now()); err != nil {
+		logger.Error("client_crl_file outside its dates: client certificates will be refused",
+			"listener", sp.name, "err", errfmt.OneLine(err))
+	}
+	return ""
+}
+
+// revoked checks the client certificate of a request against the
+// client_crl_file now: a certificate revoked after its connection opened
+// is refused at its next request. Nil when there is nothing to refuse.
+func (l *listener) revoked(cs *tls.ConnectionState) error {
+	path := *l.crl.Load()
+	if path == "" || cs == nil || len(cs.VerifiedChains) == 0 {
+		return nil
+	}
+	set, err := loadCRL(path, time.Now())
+	if err != nil {
+		return err
+	}
+	return set.check(cs.VerifiedChains)
 }
 
 // serverTLSConfig builds a TLS configuration from c with exporter-toolkit,
@@ -325,6 +393,7 @@ type spec struct {
 	handler      http.Handler
 	writeTimeout time.Duration
 	allowed      []netip.Prefix // allowed_networks, nil for every address
+	clientCRL    string         // client_crl_file, empty for none
 }
 
 // swapHandler serves through a handler that a reload can replace
@@ -498,6 +567,9 @@ func (s *Server) Reload(cfg *config.Config) error {
 			// is set by the first one): not a reason to restart.
 			running, next := cur.running(), settingsOf(wc)
 			running.basicAuth = running.basicAuth || next.basicAuth
+			if cur.spec.clientCRL != "" && sp.clientCRL == "" {
+				weakened = append(weakened, fmt.Sprintf("listener %q: client_crl_file", sp.name))
+			}
 			if next == running {
 				if sp.allowed != nil && cur.ln.Addr().Network() == "unix" {
 					s.abortReload(started)
@@ -505,7 +577,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 				}
 				var tlsErr error
 				if next.tls {
-					_, tlsErr = cur.tlsConfigFor(wc)
+					// With the client_crl_file this reload applies.
+					_, tlsErr = cur.tlsConfigWithCRL(wc, sp.clientCRL)
 				}
 				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr, tlsGen})
 				kept[sp.name] = true
@@ -548,6 +621,9 @@ func (s *Server) Reload(cfg *config.Config) error {
 			if lost := prev.weakens(l.settings); len(lost) > 0 {
 				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
+			if prev.spec.clientCRL != "" && sp.clientCRL == "" {
+				weakened = append(weakened, fmt.Sprintf("listener %q: client_crl_file", sp.name))
+			}
 			byAddr := byListen[sp.listen] == prev
 			if r, ok := replaced[prev]; !ok || byAddr || !r.byAddr {
 				replaced[prev] = replacement{l, byAddr}
@@ -568,6 +644,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
 		sw.l.allowed.Store(&sw.sp.allowed)
+		sw.l.crl.Store(&sw.sp.clientCRL)
 		retire(sw.l.handler.store(sw.sp))
 		if sw.basicAuth {
 			// Users found by the reload are required from now on, like
@@ -606,6 +683,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 			// routes under the previous authentication.
 			if r, ok := replaced[l]; ok && sameAuthentication(l, r.l) {
 				l.allowed.Store(&r.l.spec.allowed)
+				l.crl.Store(&r.l.spec.clientCRL)
 				retire(l.handler.store(r.l.spec))
 			} else {
 				retire(l.handler.store(spec{handler: removedListener{}, writeTimeout: writeMargin}))
@@ -661,6 +739,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			handler:      handler,
 			writeTimeout: metricsWriteTimeout,
 			allowed:      cfg.Metrics.AllowedNetworks,
+			clientCRL:    cfg.Metrics.ClientCRLFile,
 		})
 	}
 	for _, l := range cfg.Listeners {
@@ -683,6 +762,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			handler:      h,
 			writeTimeout: maxTimeout + writeMargin,
 			allowed:      l.AllowedNetworks,
+			clientCRL:    l.ClientCRLFile,
 		})
 	}
 
@@ -710,6 +790,12 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
 				sp.name, sp.webConfig, errfmt.OneLine(err)))
+			continue
+		}
+		if sp.clientCRL != "" {
+			if p := checkCRLSpec(sp, wc, s.logger); p != "" {
+				problems = append(problems, p)
+			}
 		}
 	}
 	if len(problems) > 0 {
@@ -791,7 +877,9 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh,
 		accept: &handoffListener{Listener: ln}, fresh: fresh, served: make(chan struct{})}
 	l.allowed.Store(&sp.allowed)
+	l.crl.Store(&sp.clientCRL)
 	auth.allows = func(remote string) bool { return l.allowsRemote(remote) }
+	auth.revoked = l.revoked
 	logger := s.logger.With("listener", sp.name)
 	l.refused = func(remote string) {
 		s.recorder().AuthFailed(sp.name, proxy.AuthNetworkNotAllowed)

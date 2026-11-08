@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -307,6 +308,9 @@ type authHandler struct {
 	// allowed_networks on every request: a reload narrowing them refuses
 	// connections opened before it at their next request. Nil: no check.
 	allows func(remote string) bool
+	// revoked checks the request's client certificate against the
+	// client_crl_file on every request; nil: no check.
+	revoked func(cs *tls.ConnectionState) error
 	// retired is set once the listener is replaced or stopped: requests
 	// and handshakes it still finishes no longer report the web
 	// configuration state, which belongs to the listener of the same name
@@ -376,6 +380,19 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
 		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
+	}
+	if h.revoked != nil {
+		if err := h.revoked(r.TLS); err != nil {
+			if !h.retired.Load() {
+				h.rec.AuthFailed(h.listener, proxy.AuthCertificateRevoked)
+			}
+			h.logger.Log(r.Context(), h.clientLogs.level(slog.LevelWarn),
+				"request refused: client certificate revoked or not checkable, closing the connection",
+				"remote", r.RemoteAddr, "err", errfmt.OneLine(err))
+			w.Header().Set("Connection", "close")
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 	}
 	// Before reading the web configuration: refused requests cost nothing.
 	if h.limiter != nil && !h.limiter.Allow() {

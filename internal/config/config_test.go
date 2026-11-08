@@ -177,9 +177,9 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "field upstreem not found",
 		},
 		{
-			name:    "max_concurrent_requests is not a route key",
-			yaml:    "listeners:\n  - name: a\n    routes:\n      - path: /m\n        max_concurrent_requests: 3\n",
-			wantErr: "field max_concurrent_requests not found",
+			name:    "listen is not a route key",
+			yaml:    "listeners:\n  - name: a\n    routes:\n      - path: /m\n        listen: \":1\"\n",
+			wantErr: "field listen not found",
 		},
 		{
 			name:    "invalid duration",

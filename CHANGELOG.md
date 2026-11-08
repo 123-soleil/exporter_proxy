@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
+### Added
+
+- Client certificate revocation: `client_crl_file` on listeners and
+  `metrics`, checked on every handshake and request; fail closed (CRL past
+  its next update, issuer without CRL); `--check` warns 7 days before a
+  CRL's next update; a reload cannot remove it.
+- `--check --probe` reads every source once, like the proxy, and validates
+  its content (warning above 80% of `max_samples`).
+- `max_concurrent_requests` on routes, within the listener's: slow reads
+  of one route (probes of many targets) no longer take every slot of the
+  listener.
+- `metrics_filter` on routes: `allow`/`deny` patterns on metric family
+  names, applied after validation (protobuf copied as is, text
+  re-encoded).
+
+### Changed
+
+- HTTP upstreams are told the scrape budget of the request starting the
+  read (or the route timeout without one) instead of the route timeout:
+  blackbox_exporter answers `probe_success 0` before the scraper gives up
+  rather than the scrape failing with `502`.
+- Shared reads: a request does not share a read that told the upstream a
+  shorter timeout than its own budget; it starts its own read when a slot
+  is free, and shares the running read otherwise (never `503` because
+  another read runs). A cached answer is served under the same rule, and
+  rather than `503` when no slot is free.
+
+### Fixed
+
+- `exporter_proxy_cache_hits_total` series are deleted when `cache_ttl` is
+  removed by a reload.
+- `exporter_proxy_requests_in_flight` never exceeds
+  `max_concurrent_requests`, and a request arriving as a read ends no
+  longer gets `503`.
+- A reload checks a kept listener's TLS health with the client CRL it
+  applies.
+
+## [0.3.0] - 2026-11-08
+
+### Added
+
+- HTTP upstreams get `X-Prometheus-Scrape-Timeout-Seconds` with the time
+  the read may take (the route timeout), computed by the proxy.
+- Health endpoints `/-/healthy` and `/-/ready` on the metrics endpoint,
+  protected like `/metrics`; not ready from the start of the shutdown.
+- The access log (`--log.access`) names verified identities: `user` and
+  `client_cert`.
+- `forward_params` forwards query parameters to multi-target exporters
+  (blackbox, snmp), each restricted to listed values or anchored patterns;
+  anything else gets `400`. Routes requiring a parameter are left out of
+  `/sd`.
+- Optional per-route cache, `cache_ttl` (upstream routes, at most `1h`, not
+  with `forward_params`): validated results only, `Age` header, counter
+  `exporter_proxy_cache_hits_total{listener,route}`.
+
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - `SECURITY.md`: private vulnerability reporting through GitHub.
@@ -49,19 +108,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `labels`), the metrics endpoint serves `/sd`, the routes in the
   Prometheus HTTP service discovery format, with their listener's actual
   port and scheme.
-- HTTP upstreams get `X-Prometheus-Scrape-Timeout-Seconds` with the time
-  the read may take, computed by the proxy.
-- Health endpoints `/-/healthy` and `/-/ready` on the metrics endpoint,
-  protected like `/metrics`; not ready from the start of the shutdown.
-- The access log (`--log.access`) names verified identities: `user` and
-  `client_cert`.
-- `forward_params` forwards query parameters to multi-target exporters
-  (blackbox, snmp), each restricted to listed values or anchored patterns;
-  anything else gets `400`. Routes requiring a parameter are left out of
-  `/sd`.
-- Optional per-route cache, `cache_ttl` (upstream routes, at most `1h`, not
-  with `forward_params`): validated results only, `Age` header, counter
-  `exporter_proxy_cache_hits_total{listener,route}`.
 
 ## [0.1.0] - 2026-11-08
 
@@ -320,5 +366,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
 
-[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/123-soleil/exporter_proxy/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/123-soleil/exporter_proxy/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/123-soleil/exporter_proxy/releases/tag/0.1.0

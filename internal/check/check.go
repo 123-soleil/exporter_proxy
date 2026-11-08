@@ -46,9 +46,15 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 	c := &checker{now: now}
 
 	c.webConfig("metrics", cfg.Metrics.WebConfigFile)
+	if cfg.Metrics.ClientCRLFile != "" {
+		c.crl("metrics", cfg.Metrics.ClientCRLFile, cfg.Metrics.WebConfigFile)
+	}
 	for _, l := range cfg.Listeners {
 		where := fmt.Sprintf("listener %q", l.Name)
 		c.webConfig(where, l.WebConfigFile)
+		if l.ClientCRLFile != "" {
+			c.crl(where, l.ClientCRLFile, l.WebConfigFile)
+		}
 		for _, r := range l.Routes {
 			rwhere := fmt.Sprintf("%s route %q", where, r.Path)
 			switch {
@@ -124,6 +130,37 @@ func (c *checker) webConfig(where, path string) {
 		c.certificates(where, "client_ca_file", wc.ClientCAFile, true)
 	case wc.ClientCAPEM != "":
 		c.certificatesPEM(where, "client_ca (inline)", []byte(wc.ClientCAPEM), true)
+	}
+}
+
+// crlWarning is how long before its next update a CRL is reported: it
+// must be republished before, or client certificates get refused.
+const crlWarning = 7 * 24 * time.Hour
+
+// crl checks a client_crl_file: it parses, and every CRL in it is within
+// its dates.
+func (c *checker) crl(where, path, webConfig string) {
+	// Like startup and reload: a CRL only applies to verified client
+	// certificates.
+	if wc, err := webconfig.Read(webConfig); err == nil && !wc.ClientCertsVerified {
+		c.add(Problem, where, "client_crl_file needs a web configuration verifying client certificates "+
+			"(TLS with client_auth_type RequireAndVerifyClientCert or VerifyClientCertIfGiven): the service would not start")
+	}
+	lists, err := webconfig.ReadCRLs(path)
+	if err != nil {
+		c.add(Problem, where, "client_crl_file %s: %v", path, err)
+		return
+	}
+	for i, l := range lists {
+		switch {
+		case c.now.Before(l.ThisUpdate):
+			c.add(Problem, where, "client_crl_file %s: CRL %d is not valid before %s", path, i+1, l.ThisUpdate.UTC().Format(time.RFC3339))
+		case !l.NextUpdate.IsZero() && c.now.After(l.NextUpdate):
+			c.add(Problem, where, "client_crl_file %s: CRL %d is past its next update (%s): client certificates are refused",
+				path, i+1, l.NextUpdate.UTC().Format(time.RFC3339))
+		case !l.NextUpdate.IsZero() && l.NextUpdate.Sub(c.now) < crlWarning:
+			c.add(Warning, where, "client_crl_file %s: CRL %d must be republished before %s", path, i+1, l.NextUpdate.UTC().Format(time.RFC3339))
+		}
 	}
 }
 

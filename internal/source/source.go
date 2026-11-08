@@ -85,6 +85,13 @@ type Request struct {
 	// Files are always read as text.
 	Protobuf bool
 
+	// Timeout, when set, is the scrape budget of the request that
+	// started the read: an HTTP upstream is told at most that much
+	// (X-Prometheus-Scrape-Timeout-Seconds), so that an exporter such as
+	// blackbox_exporter answers (probe_success 0) before the scraper gives
+	// up. The read itself keeps the route timeout.
+	Timeout time.Duration
+
 	// Query holds the query parameters forwarded to an HTTP upstream,
 	// already checked against the route's forward_params; added to those
 	// of the upstream URL.

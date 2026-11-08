@@ -147,6 +147,9 @@ step "--check as the service user"
 # Self-signed certificate: no CA warning expected, only a clean check.
 runuser -u exporter_proxy -- /usr/sbin/exporter_proxy --check --config "$CONF/config.yml"
 
+step "--check --probe: every source read once"
+runuser -u exporter_proxy -- /usr/sbin/exporter_proxy --check --probe --config "$CONF/config.yml"
+
 step "Start"
 systemctl start exporter_proxy-node.socket exporter_proxy
 wait_for "service active" systemctl is-active --quiet exporter_proxy

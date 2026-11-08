@@ -60,12 +60,12 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 
 | Situation | Status | Notes |
 |-----------|--------|-------|
-| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
+| Content read and validated | `200` | Body returned unchanged (unless the route has a `metrics_filter`), `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
 | Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
-| `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
+| `max_concurrent_requests` reached (listener, or route when set) | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below), or starts its own if the running read was told a shorter timeout than its budget and a slot is free. On a route with `cache_ttl`, a fresh cached answer is served instead of `503`. |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
@@ -103,10 +103,15 @@ Each route has exactly one source:
 - Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
   the delimited protobuf format first, when the scraper prefers it: see
   "Formats"), a `User-Agent: exporter_proxy/<version>` and
-  `X-Prometheus-Scrape-Timeout-Seconds` with the time the read may take
-  (the route timeout, computed by the proxy, never copied from the
-  client), which exporters such as blackbox_exporter and snmp_exporter use
-  to bound their work; no client header is forwarded
+  `X-Prometheus-Scrape-Timeout-Seconds`, computed by the proxy: the scrape
+  budget of the request starting the read (derived from its scrape
+  timeout, see "Response validation and limits"), or the route timeout without a scrape
+  timeout header, whichever is shorter. A request does not join a read
+  that told the upstream less than its own budget (another client's short
+  timeout), unless no slot is left for a read of its own: it then shares
+  the running read rather than being refused. Exporters such as
+  blackbox_exporter and snmp_exporter use it to answer in time (a failed
+  probe as `probe_success 0` rather than a failed scrape); no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
@@ -220,6 +225,11 @@ routes:
 - Off by default. Allowed on `upstream` routes only (files are read
   without cost), at most `1h`, and not with `forward_params` (each target
   would be a cache entry, and probes must be live).
+- A cached answer is only served to requests that could have shared the
+  read producing it: one obtained with a shorter scrape timeout than a
+  request's budget is not handed to it, which reads again (and gets the
+  cached answer if no slot is free, rather than `503`). Such an answer
+  never replaces a fresh one more requests can use.
 - Only valid results are kept: a failure is never cached, the next request
   reads again.
 - Answers from such a route carry `Age` (seconds since the read); they
@@ -255,6 +265,57 @@ format that native histograms need:
   `_count`.
 - Requests asking for different formats do not share reads.
 
+### Metrics filter
+
+`metrics_filter` serves only some metric families of a route, for example
+part of node_exporter to a third party (combined with `authorize`):
+
+```yaml
+routes:
+  - path: /partner/metrics
+    upstream: http://127.0.0.1:19100/metrics
+    metrics_filter:
+      allow: ['node_cpu_.*', 'node_load[0-9]+']   # whole family names, RE2
+      deny: ['.*_bytes']                          # wins over allow
+    authorize:
+      users: [partner]
+```
+
+- A family is served when `allow` is empty or one of its patterns matches
+  its name, and no `deny` pattern matches. Names are family names: a
+  histogram `http_latency_seconds` covers its `_bucket`, `_sum` and
+  `_count` series, and is matched as `http_latency_seconds` only: denying
+  `http_latency_seconds_bucket` does not hide it.
+- Patterns match whole names; each must be a valid regular expression on
+  its own.
+- The source is validated first, whole (`max_samples` counts what the
+  source sent), then filtered. Protobuf messages kept are copied as they
+  are; text is re-encoded family by family, sorted by name: the body is no
+  longer the source's byte for byte, but the same families, series and
+  values.
+
+### Route concurrency limit
+
+`max_concurrent_requests` on a route bounds its source reads within the
+listener's limit: a read takes a slot of the listener and one of the
+route. Concurrent requests of a route already share one read (below), so
+this matters for routes reading several things at once: `forward_params`
+routes (each target is a read) and requests in both formats. Without it,
+slow probes of many targets can take every slot of the listener and get
+its other routes refused with `503`:
+
+```yaml
+routes:
+  - path: /probe
+    upstream: http://127.0.0.1:9115/probe
+    max_concurrent_requests: 4     # leaves the other slots to the other routes
+    forward_params: { ... }
+```
+
+A refused read gives its listener slot back at once; the rejection is
+counted in `exporter_proxy_requests_rejected_total{listener}` and logged
+with `limit_of=route`.
+
 ### Shared reads
 
 Requests for a route that arrive while its source is already being read
@@ -266,6 +327,10 @@ validated once and compressed once.
   are neither refused with `503` nor counted in
   `exporter_proxy_requests_in_flight`. They are counted in
   `exporter_proxy_requests_shared_total`.
+- Except that a request does not share a read that told the upstream a
+  shorter timeout than its own budget (another client's shorter scrape
+  timeout): it starts its own read, taking a slot, when one is free, and
+  shares the running read otherwise.
 - Nothing is cached unless the route sets `cache_ttl` (see "Cache"): a
   request arriving after the read finished reads the source again, so no
   answer is ever older than the scrape that asked.
@@ -391,6 +456,7 @@ net/http errors clients can cause, never hides them.
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
 | `forbidden` | Authenticated, but neither the basic auth user nor a name of the verified client certificate is in the route's `authorize` list | `403` | `warn` `msg="request forbidden: not in the authorize list of the route"` with `route`, `user` and `remote` |
+| `certificate_revoked` | Client certificate of an open connection revoked by the `client_crl_file` since (or its revocation no longer checkable: CRL outside its dates) | `403`, connection closed | `warn` `msg="request refused: client certificate revoked or not checkable, closing the connection"` |
 | `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
 
@@ -424,6 +490,45 @@ routes:
   verified client certificates) is reported as a warning at startup, at
   reload and by `--check`; such a route then refuses every request.
 - A reload applies changed lists without restarting the listener.
+
+### Client certificate revocation
+
+To cut off one client certificate without replacing the client CA (a
+compromised key, a decommissioned scraper), list it in a certificate
+revocation list:
+
+```yaml
+listeners:
+  - name: node
+    listen: ":9100"
+    web_config_file: /etc/exporter_proxy/web-mtls.yml
+    client_crl_file: /etc/exporter_proxy/tls/clients.crl   # PEM or DER, several CRLs allowed
+```
+
+- The file is read on every new connection and every request (parsed only
+  when it changes): publishing a new CRL applies without reload, and a
+  certificate revoked while its connection is open gets `403` at its next
+  request, the connection being closed.
+- Checked on every handshake, TLS 1.3 session resumption included. A
+  revoked certificate fails the handshake (`tls_handshake`); on an open
+  connection, the refusal is counted as `certificate_revoked`.
+- Fail closed: every certificate of the client's chain except the root
+  must be covered by a CRL from its issuer, signed by it. A certificate
+  whose issuer has no CRL in the file is refused, and so is every client
+  certificate while a CRL is past its `nextUpdate` (or not yet valid):
+  republish the CRL in time. `--check` warns 7 days before.
+- Every CRL of an issuer in the file counts: a certificate listed by any
+  of them is revoked. Only complete CRLs are supported: delta CRLs, CRLs
+  with an issuing distribution point (partitioned CRLs, authority
+  revocation lists) and CRLs or entries with an unsupported critical
+  extension are refused (Go would read them as complete CRLs).
+- Requires a web configuration verifying client certificates
+  (`RequireAndVerifyClientCert` or `VerifyClientCertIfGiven`). A file that
+  does not parse fails the startup or the reload; a CRL outside its dates
+  is logged at `error` level and refuses that listener's client
+  certificates, the others keep running.
+- Like other protections, a reload cannot remove `client_crl_file`:
+  restart the service to do so.
 
 ### Allowed networks
 
@@ -555,8 +660,11 @@ Besides the standard `go_*`, `process_*` and
 - `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
   of the last successful configuration load.
 - `exporter_proxy_auth_failures_total{listener,reason}`: connections and
-  requests refused before routing (see "Refused authentications"); the
-  metrics endpoint is reported as `listener="metrics"`.
+  requests refused by authentication or access control (see "Refused
+  authentications" for the reasons: `tls_handshake`,
+  `missing_credentials`, `invalid_credentials`, `rate_limited`,
+  `network_not_allowed`, `forbidden`, `certificate_revoked`); the metrics
+  endpoint is reported as `listener="metrics"`.
 - `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
@@ -685,9 +793,12 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `metrics_filter` | Optional, on routes: `allow` and/or `deny` patterns (RE2, valid on their own), at least one. |
+| route `max_concurrent_requests` | Optional, greater than 0 and at most the listener's resolved `max_concurrent_requests`. |
 | `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
 | `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
+| `client_crl_file` | Optional, on listeners and `metrics`: absolute path; needs a web configuration verifying client certificates. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
 
@@ -728,8 +839,10 @@ The metrics endpoint also serves, like Prometheus:
 
 - `/-/healthy`: `200` while the process serves;
 - `/-/ready`: `200` once every listener serves, `503` from the start of the
-  shutdown (`SIGTERM`), so that load balancers stop sending traffic before
-  the ports close.
+  shutdown (`SIGTERM`). The ports close right after, during the graceful
+  shutdown: to drain a load balancer first, mark the instance out of it
+  before stopping the service (a `preStop` hook in Kubernetes, for
+  example); `/-/ready` then confirms the state.
 
 They are protected like `/metrics` (web configuration and
 `allowed_networks`): a probe needs the same access, so they reveal nothing
@@ -871,12 +984,12 @@ OpenBSD: `386`, `amd64`, `arm64`, `armv5`, `armv6`, `armv7`; macOS:
 binary, `README.md`, `CHANGELOG.md`, `LICENSE` and `deploy/`.
 
 ```sh
-VERSION=0.1.0 ARCH=amd64
+VERSION=0.4.0 ARCH=amd64
 BASE=https://github.com/123-soleil/exporter_proxy/releases/download/$VERSION
 curl -fsSLO "$BASE/exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/sha256sums.txt"
 sha256sum -c --ignore-missing sha256sums.txt   # must print "OK"
-# From 0.2.0: proves the archive was built by this repository's CI
+# Proves the archive was built by this repository's CI (from 0.2.0)
 gh attestation verify "exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz" --repo 123-soleil/exporter_proxy
 mkdir exporter_proxy && tar -xzf "exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz" -C exporter_proxy
 cd exporter_proxy && ./exporter_proxy --version
@@ -982,10 +1095,10 @@ pinned by digest and kept up to date by Dependabot.
 Build the image (no registry image is published yet):
 
 ```sh
-docker build -t exporter_proxy:0.1.0 \
-  --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" .
+docker build -t exporter_proxy:0.4.0 \
+  --build-arg VERSION=0.4.0 --build-arg REVISION="$(git rev-parse HEAD)" .
 # Other platforms, cross-compiled without emulation:
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.1.0 .
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.4.0 .
 ```
 
 Run it:
@@ -997,7 +1110,7 @@ docker run -d --name exporter_proxy --restart unless-stopped \
   -v /etc/exporter_proxy:/etc/exporter_proxy:ro \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --stop-timeout 30 \
-  exporter_proxy:0.1.0
+  exporter_proxy:0.4.0
 ```
 
 `deploy/docker/compose.yml.exemple` is the same with Docker Compose.
@@ -1011,8 +1124,8 @@ docker run -d --name exporter_proxy --restart unless-stopped \
 | File routes, Unix socket upstreams | Mount their directories (read-only for files; the socket's directory for Unix sockets, with the socket file writable by the container's uid or gid). |
 | Reload | `docker kill --signal HUP exporter_proxy` (`systemctl reload` equivalent): same all-or-nothing rules, see "Configuration reload". |
 | Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
-| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.1.0 --log.format=json`. |
-| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.1.0 --check` |
+| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.4.0 --log.format=json`. |
+| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.4.0 --check` |
 | Health | No shell in the image, so no `HEALTHCHECK`. Orchestrators probe `/-/healthy` and `/-/ready` on the metrics endpoint (see "Health endpoints"); Prometheus scraping the metrics endpoint (`up`) remains the main health check. |
 | Not available | systemd socket activation (`listen: "systemd:<name>"`). |
 
@@ -1032,6 +1145,7 @@ exporter_proxy --version
 | `--log.level` | Minimum log level: `debug`, `info`, `warn`, `error` (default `info`). |
 | `--log.format` | Log format: `logfmt` or `json` (default `logfmt`).              |
 | `--log.access` | Log one line per served request (default off).                  |
+| `--probe`      | With `--check`: also read every source once (see below).        |
 | `--version` | Print version, revision and Go version on one line, then exit 0.   |
 
 The version is injected at build time (`-ldflags -X`) from the git tag; a
@@ -1108,6 +1222,8 @@ otherwise; warnings do not fail the check:
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
 - an `authorize` list that cannot match on its listener is a warning;
+- each `client_crl_file` parses and is within its dates (a warning 7 days
+  before its next update);
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times
   would tell users apart);
@@ -1115,6 +1231,14 @@ otherwise; warnings do not fail the check:
   not older than `max_age` nor more than `max_age` in the future;
 - each `unix_socket` route: the path exists, is a socket and is writable by
   the current user (required by `connect()`).
+
+With `--probe`, `--check` also reads every route's source once, with the
+same code, timeout and limits as the proxy, and validates its content: an
+unreachable exporter, a TLS failure, a page that is not metrics or too many
+samples is a problem, more than 80% of `max_samples` a warning. Run it as
+the service user, before a reload or in a deployment pipeline. Routes that
+need a query parameter (`required` in `forward_params`) are not read, with
+a warning.
 
 Example output:
 
@@ -1330,9 +1454,10 @@ scrape_configs:
   (`exporter_proxy_source_errors_total`) before the scraper gives up. The
   route `timeout` remains the upper bound: if it is shorter than
   `scrape_timeout`, it is the one that applies.
-- Each scraper and each route counts against `max_concurrent_requests` of
-  the listener (default 2) when their scrapes overlap: with several scrapers
-  (high availability pairs) or many routes on one listener, raise it.
+- Each route counts against `max_concurrent_requests` of the listener
+  (default 2) when their scrapes overlap; several scrapers of the same
+  route (high availability pairs) share one read and take one slot. With
+  many routes on one listener, raise it.
 
 These files were validated with `promtool check config` (Prometheus 3.7)
 and `vmagent -dryRun` (vmagent 1.128), then used to scrape a running

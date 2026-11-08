@@ -51,6 +51,9 @@ func validate(fc *fileConfig) error {
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)
 	v.checkNetworks("metrics", fc.Metrics.AllowedNetworks)
+	if fc.Metrics.ClientCRLFile != "" {
+		v.checkAbsPath("metrics", "client_crl_file", fc.Metrics.ClientCRLFile)
+	}
 	v.checkServiceDiscovery(fc.Metrics.ServiceDiscovery)
 
 	// defaults section: every value set must be positive.
@@ -83,10 +86,15 @@ func validate(fc *fileConfig) error {
 		v.checkWebConfigFile(where, l.WebConfigFile)
 		v.checkPositiveInt(where, "max_concurrent_requests", l.MaxConcurrentRequests)
 		v.checkNetworks(where, l.AllowedNetworks)
+		if l.ClientCRLFile != "" {
+			v.checkAbsPath(where, "client_crl_file", l.ClientCRLFile)
+		}
 
 		if len(l.Routes) == 0 {
 			v.addf(where, "at least one route is required")
 		}
+		// The listener's limit, as resolved: a route cannot exceed it.
+		listenerMax := valueOr(l.MaxConcurrentRequests, valueOr(fc.Defaults.MaxConcurrentRequests, DefaultMaxConcurrentRequests))
 		paths := map[string]bool{}
 		for j, r := range l.Routes {
 			rwhere := fmt.Sprintf("%s routes[%d]", where, j)
@@ -94,6 +102,10 @@ func validate(fc *fileConfig) error {
 				rwhere = fmt.Sprintf("%s route %q", where, r.Path)
 			}
 			v.checkRoute(rwhere, r)
+			v.checkPositiveInt(rwhere, "max_concurrent_requests", r.MaxConcurrentRequests)
+			if n := r.MaxConcurrentRequests; n != nil && *n > listenerMax {
+				v.addf(rwhere, "max_concurrent_requests (%d) is above the listener's (%d): it would have no effect", *n, listenerMax)
+			}
 			if r.Path != "" && paths[r.Path] {
 				v.addf(rwhere, "duplicate path in this listener")
 			}
@@ -173,6 +185,30 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	v.checkAuthorize(where, r.Authorize)
 	v.checkForwardParams(where, r)
 	v.checkCacheTTL(where, r)
+	v.checkMetricsFilter(where, r.MetricsFilter)
+}
+
+// checkMetricsFilter requires patterns, each valid on its own (so that it
+// cannot close the anchoring group) and once anchored.
+func (v *validator) checkMetricsFilter(where string, f *fileMetricsFilter) {
+	if f == nil {
+		return
+	}
+	if len(f.Allow) == 0 && len(f.Deny) == 0 {
+		v.addf(where, "metrics_filter must list allow or deny patterns")
+	}
+	for _, list := range []struct {
+		key      string
+		patterns []string
+	}{{"allow", f.Allow}, {"deny", f.Deny}} {
+		for _, pat := range list.patterns {
+			if _, err := regexp.Compile(pat); err != nil {
+				v.addf(where, "metrics_filter %s: invalid pattern %q: %v", list.key, pat, err)
+			} else if _, err := regexp.Compile(AnchorPattern(pat)); err != nil {
+				v.addf(where, "metrics_filter %s: invalid pattern %q: %v", list.key, pat, err)
+			}
+		}
+	}
 }
 
 // checkCacheTTL allows a cache on upstream routes only, without

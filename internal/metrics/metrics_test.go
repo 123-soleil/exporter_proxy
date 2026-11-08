@@ -355,3 +355,18 @@ func TestInvalidContentNotInSamples(t *testing.T) {
 		t.Errorf("parse duration not observed for invalid content (%d series, %v)", n, err)
 	}
 }
+
+// A reload removing cache_ttl from a route deletes its cache hit count.
+func TestCacheHitsSeriesFollowCacheTTL(t *testing.T) {
+	m := New()
+	cached := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/m", CacheTTL: time.Minute}}}}}
+	m.ConfigLoaded(cached, time.Now())
+	m.CacheHit("node", "/m")
+	if n := testutil.CollectAndCount(m.cacheHits); n != 1 {
+		t.Fatalf("%d cache hit series, want 1", n)
+	}
+	m.ConfigLoaded(&config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{{Path: "/m"}}}}}, time.Now())
+	if n := testutil.CollectAndCount(m.cacheHits); n != 0 {
+		t.Errorf("%d cache hit series after cache_ttl was removed, want 0", n)
+	}
+}

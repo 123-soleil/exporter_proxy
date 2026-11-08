@@ -150,6 +150,9 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	// their work with it.
 	if d, ok := ctx.Deadline(); ok {
 		if left := time.Until(d); left > 0 {
+			if r.Timeout > 0 && r.Timeout < left {
+				left = r.Timeout
+			}
 			req.Header.Set(ScrapeTimeoutHeader, strconv.FormatFloat(left.Seconds(), 'f', 3, 64))
 		}
 	}

@@ -125,7 +125,7 @@ func New() *Metrics {
 		}, lr),
 		authFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "auth_failures_total",
-			Help: "Connections or requests refused before routing, by reason: tls_handshake, missing_credentials, invalid_credentials, rate_limited.",
+			Help: "Connections or requests refused by authentication or access control, by reason: tls_handshake, missing_credentials, invalid_credentials, rate_limited, network_not_allowed, forbidden, certificate_revoked.",
 		}, []string{"listener", "reason"}),
 		fileModified: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "file_modified_timestamp_seconds",
@@ -212,6 +212,9 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 			m.shared.WithLabelValues(l.Name, r.Path)
 			if r.CacheTTL > 0 {
 				m.cacheHits.WithLabelValues(l.Name, r.Path)
+			} else {
+				// cache_ttl removed by a reload: its count is gone.
+				m.cacheHits.DeleteLabelValues(l.Name, r.Path)
 			}
 			for _, reason := range reasons {
 				m.sourceErrors.WithLabelValues(l.Name, r.Path, string(reason))

@@ -61,6 +61,8 @@ type MetricsEndpoint struct {
 	Listen          string
 	WebConfigFile   string
 	AllowedNetworks []netip.Prefix // nil: every client address
+	// ClientCRLFile lists revoked client certificates; empty: none.
+	ClientCRLFile string
 	// ServiceDiscovery enables the Prometheus HTTP service discovery
 	// endpoint; nil: disabled.
 	ServiceDiscovery *ServiceDiscovery
@@ -83,7 +85,9 @@ type Listener struct {
 	// AllowedNetworks are the client networks allowed to connect; nil:
 	// every client address.
 	AllowedNetworks []netip.Prefix
-	Routes          []Route
+	// ClientCRLFile lists revoked client certificates; empty: none.
+	ClientCRLFile string
+	Routes        []Route
 }
 
 // Route maps an exact request path to one metrics source.
@@ -108,6 +112,13 @@ type Route struct {
 	// CacheTTL keeps a validated result that long; 0: no cache.
 	CacheTTL time.Duration
 
+	// MaxConcurrentRequests bounds the source reads of this route, within
+	// the listener's limit; 0: only the listener's limit.
+	MaxConcurrentRequests int
+
+	// MetricsFilter keeps some metric families only; nil: all of them.
+	MetricsFilter *MetricsFilter
+
 	Limits Limits
 }
 
@@ -126,6 +137,32 @@ type ForwardParam struct {
 	Values   []string
 	Patterns []*regexp.Regexp // anchored: they match the whole value
 	Required bool
+}
+
+// MetricsFilter selects metric families by name: kept when Allow is
+// empty or one of its patterns matches, and none of Deny matches.
+// Patterns match whole names.
+type MetricsFilter struct {
+	Allow []*regexp.Regexp
+	Deny  []*regexp.Regexp
+}
+
+// Keep reports whether the family name is served.
+func (f *MetricsFilter) Keep(name string) bool {
+	for _, re := range f.Deny {
+		if re.MatchString(name) {
+			return false
+		}
+	}
+	if len(f.Allow) == 0 {
+		return true
+	}
+	for _, re := range f.Allow {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxCacheTTL bounds cache_ttl: a cached answer older than that would
@@ -162,6 +199,7 @@ type fileConfig struct {
 type fileMetrics struct {
 	Listen           string                `yaml:"listen"`
 	WebConfigFile    string                `yaml:"web_config_file"`
+	ClientCRLFile    string                `yaml:"client_crl_file"`
 	AllowedNetworks  []string              `yaml:"allowed_networks"`
 	ServiceDiscovery *fileServiceDiscovery `yaml:"service_discovery"`
 }
@@ -187,6 +225,7 @@ type fileListener struct {
 	Listen                string      `yaml:"listen"`
 	WebConfigFile         string      `yaml:"web_config_file"`
 	MaxConcurrentRequests *int        `yaml:"max_concurrent_requests"`
+	ClientCRLFile         string      `yaml:"client_crl_file"`
 	AllowedNetworks       []string    `yaml:"allowed_networks"`
 	Routes                []fileRoute `yaml:"routes"`
 }
@@ -200,9 +239,16 @@ type fileRoute struct {
 	MaxAge     *time.Duration `yaml:"max_age"`
 	Authorize  *fileAuthorize `yaml:"authorize"`
 	// UpstreamTLS is decoded as is: no inheritance.
-	UpstreamTLS   *fileUpstreamTLS            `yaml:"upstream_tls"`
-	ForwardParams map[string]fileForwardParam `yaml:"forward_params"`
-	CacheTTL      *time.Duration              `yaml:"cache_ttl"`
+	UpstreamTLS           *fileUpstreamTLS            `yaml:"upstream_tls"`
+	ForwardParams         map[string]fileForwardParam `yaml:"forward_params"`
+	CacheTTL              *time.Duration              `yaml:"cache_ttl"`
+	MaxConcurrentRequests *int                        `yaml:"max_concurrent_requests"`
+	MetricsFilter         *fileMetricsFilter          `yaml:"metrics_filter"`
+}
+
+type fileMetricsFilter struct {
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
 }
 
 type fileForwardParam struct {
@@ -280,6 +326,7 @@ func resolve(fc *fileConfig) *Config {
 			Listen:           fc.Metrics.Listen,
 			WebConfigFile:    fc.Metrics.WebConfigFile,
 			AllowedNetworks:  networks(fc.Metrics.AllowedNetworks),
+			ClientCRLFile:    fc.Metrics.ClientCRLFile,
 			ServiceDiscovery: sd,
 		},
 		Listeners: make([]Listener, 0, len(fc.Listeners)),
@@ -291,19 +338,22 @@ func resolve(fc *fileConfig) *Config {
 			WebConfigFile:         fl.WebConfigFile,
 			MaxConcurrentRequests: valueOr(fl.MaxConcurrentRequests, baseConcurrency),
 			AllowedNetworks:       networks(fl.AllowedNetworks),
+			ClientCRLFile:         fl.ClientCRLFile,
 			Routes:                make([]Route, 0, len(fl.Routes)),
 		}
 		for _, fr := range fl.Routes {
 			l.Routes = append(l.Routes, Route{
-				Path:          fr.Path,
-				Upstream:      fr.Upstream,
-				UpstreamTLS:   upstreamTLSOf(fr.UpstreamTLS),
-				UnixSocket:    fr.UnixSocket,
-				File:          fr.File,
-				MaxAge:        valueOr(fr.MaxAge, 0),
-				Authorize:     authorizeOf(fr.Authorize),
-				ForwardParams: forwardParamsOf(fr.ForwardParams),
-				CacheTTL:      valueOr(fr.CacheTTL, 0),
+				Path:                  fr.Path,
+				Upstream:              fr.Upstream,
+				UpstreamTLS:           upstreamTLSOf(fr.UpstreamTLS),
+				UnixSocket:            fr.UnixSocket,
+				File:                  fr.File,
+				MaxAge:                valueOr(fr.MaxAge, 0),
+				Authorize:             authorizeOf(fr.Authorize),
+				ForwardParams:         forwardParamsOf(fr.ForwardParams),
+				CacheTTL:              valueOr(fr.CacheTTL, 0),
+				MaxConcurrentRequests: valueOr(fr.MaxConcurrentRequests, 0),
+				MetricsFilter:         metricsFilterOf(fr.MetricsFilter),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -321,6 +371,20 @@ func upstreamTLSOf(f *fileUpstreamTLS) *UpstreamTLS {
 		return nil
 	}
 	return &UpstreamTLS{CAFile: f.CAFile, CertFile: f.CertFile, KeyFile: f.KeyFile, ServerName: f.ServerName}
+}
+
+func metricsFilterOf(f *fileMetricsFilter) *MetricsFilter {
+	if f == nil {
+		return nil
+	}
+	compile := func(patterns []string) []*regexp.Regexp {
+		var res []*regexp.Regexp
+		for _, p := range patterns {
+			res = append(res, regexp.MustCompile(AnchorPattern(p))) // validated before
+		}
+		return res
+	}
+	return &MetricsFilter{Allow: compile(f.Allow), Deny: compile(f.Deny)}
 }
 
 func forwardParamsOf(f map[string]fileForwardParam) map[string]ForwardParam {
