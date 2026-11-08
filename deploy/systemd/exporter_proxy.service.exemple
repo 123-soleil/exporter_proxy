@@ -8,7 +8,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify: started (and reloadable) only once every listener serves; a
+# SIGHUP sent by systemctl reload while starting would otherwise kill it.
+Type=notify
+NotifyAccess=main
 User=exporter_proxy
 Group=exporter_proxy
 # Optional ARGS (log format, level, access log).

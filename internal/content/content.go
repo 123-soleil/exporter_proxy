@@ -156,7 +156,9 @@ func isNative(h *dto.Histogram) bool {
 }
 
 // quoted matches quoted values in parser messages.
-var quoted = regexp.MustCompile(`"[^"]*"`)
+// Escapes are part of the quoted text: a value holding \" is hidden
+// whole, not up to its first escaped quote.
+var quoted = regexp.MustCompile(`"(?:[^"\\]|\\.)*"?`)
 
 // safeMessage keeps the line number and the kind of error but drops the
 // offending content: a misconfigured source could point to sensitive data,

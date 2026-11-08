@@ -76,3 +76,43 @@ listeners:
 		t.Errorf("code %d body %q", w.Code, w.Body.String())
 	}
 }
+
+// slowWriter blocks the body write until released, like a client reading
+// slowly.
+type slowWriter struct {
+	*httptest.ResponseRecorder
+	writing chan struct{}
+	release chan struct{}
+}
+
+func (w *slowWriter) Write(b []byte) (int, error) {
+	close(w.writing)
+	<-w.release
+	return w.ResponseRecorder.Write(b)
+}
+
+// A read keeps its slot until its answer is written: slow clients cannot
+// make the proxy hold more answers in memory than max_concurrent_requests.
+func TestSlotHeldWhileTheAnswerIsWritten(t *testing.T) {
+	src := fakeSource{res: &source.Result{Body: []byte(metrics)}}
+	rec := &recorder{}
+	h := newTestHandler(src, 1, rec, &bytes.Buffer{}, false)
+	slow := &slowWriter{ResponseRecorder: httptest.NewRecorder(), writing: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(slow, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		close(done)
+	}()
+	<-slow.writing
+	if w := get(h); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("while an answer is being written: code %d, want 503", w.Code)
+	}
+	close(slow.release)
+	<-done
+	if w := get(h); w.Code != http.StatusOK {
+		t.Errorf("after: code %d, want 200", w.Code)
+	}
+	if rec.inFlight != 0 {
+		t.Errorf("in flight %d, want 0", rec.inFlight)
+	}
+}

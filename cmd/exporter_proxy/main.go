@@ -18,6 +18,7 @@ import (
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/metrics"
 	"github.com/123-soleil/exporter_proxy/internal/server"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
 )
@@ -136,6 +137,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// After the metrics were initialized: listeners whose TLS settings
 	// fail from the start show it at once.
 	srv.ReportTLSHealth()
+	// Type=notify: systemd considers the service started, and passes on
+	// reloads, only once every listener serves.
+	notifySystemd(daemon.SdNotifyReady, logger)
 
 	code := exitOK
 loop:
@@ -155,6 +159,7 @@ loop:
 		}
 	}
 
+	notifySystemd(daemon.SdNotifyStopping, logger)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -163,6 +168,15 @@ loop:
 	}
 	logger.Info("stopped")
 	return code
+}
+
+// notifySystemd sends a state to systemd (Type=notify). Without
+// NOTIFY_SOCKET (not under systemd, or another service type) it does
+// nothing.
+func notifySystemd(state string, logger *slog.Logger) {
+	if _, err := daemon.SdNotify(false, state); err != nil {
+		logger.Warn("cannot notify systemd", "state", state, "err", err)
+	}
 }
 
 // reload loads the configuration again and applies it, returning the new

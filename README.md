@@ -389,12 +389,16 @@ page) from being exposed through the proxy.
   label values are still free text chosen by the source.
 - Each listener serves at most `max_concurrent_requests` requests at the same
   time (default 2, set in `defaults` or per listener). Extra requests are answered immediately with
-  `503 Service Unavailable` instead of queuing.
+  `503 Service Unavailable` instead of queuing. A read keeps its slot until
+  every request that got its result has written it, so clients reading
+  slowly cannot make the proxy hold more answers than that.
 - Parsing is linear in the response size, but the parser allocates about
   **10 times the body size** while it runs. Peak memory is therefore bounded
   by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
   all listeners: with the defaults (2 MiB, 2 requests) and one listener,
-  about 45 MiB in the worst case. The defaults fit common exporters; raise
+  about 45 MiB in the worst case. Routes with `cache_ttl` add up to two
+  kept answers each (text and protobuf, with their gzip copies). The
+  defaults fit common exporters; raise
   `max_body_bytes` (and `max_concurrent_requests`) only on the routes or
   listeners that need it (see `exporter_proxy_response_size_bytes`), and
   size `MemoryMax=` in the systemd unit accordingly.
@@ -1052,6 +1056,12 @@ sudo systemctl enable --now exporter_proxy
 ```
 
 ### systemd hardening
+
+The unit is `Type=notify`: exporter_proxy tells systemd it is ready once
+every listener serves, so `systemctl start` waits for it (and fails if a
+listener cannot start), and a `systemctl reload` sent right after a start
+waits too, instead of killing a process that has not set up its `SIGHUP`
+handling yet.
 
 The unit follows a least-privilege profile: dedicated user, no capability
 (`CapabilityBoundingSet=` empty), read-only file system

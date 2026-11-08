@@ -186,3 +186,19 @@ func BenchmarkValidate(b *testing.B) {
 		})
 	}
 }
+
+// Quoted content holding escaped quotes is hidden whole.
+func TestSafeMessageHidesEscapedQuotes(t *testing.T) {
+	for _, body := range []string{
+		"m{l=\"abc\\\"SECRET-PASSWORD-123\\xff\"} 1\n",
+		"m 1 2 \"SECRET-PASSWORD-123\n",
+	} {
+		_, err := Validate([]byte(body), 100)
+		if err == nil {
+			t.Fatalf("%q: accepted", body)
+		}
+		if strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("%q: message leaks content: %v", body, err)
+		}
+	}
+}
