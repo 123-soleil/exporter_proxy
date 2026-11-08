@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SECURITY.md`: private vulnerability reporting through GitHub.
+- Release archives come with a build provenance attestation
+  (`gh attestation verify`).
+- CodeQL analysis on pull requests, on `main` and every week.
+- Integration test under a real systemd (`test/systemd/run.sh`): hardened
+  unit, socket activation, TLS and basic auth, reload, stop.
+
 ## [0.1.0] - 2026-11-08
 
 ### Added

@@ -118,6 +118,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # upload sha256sums.txt to the release
+      id-token: write # sign the provenance attestation (Sigstore)
+      attestations: write # store the attestation
     steps:
       - name: Download all per-archive checksums
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -128,6 +130,14 @@ jobs:
 
       - name: Combine into sha256sums.txt
         run: cat checksums/*.sha256 | sort -k2 > sha256sums.txt
+
+      # Build provenance for every archive listed in sha256sums.txt: proves
+      # it was built by this workflow from the release commit. Check with
+      # gh attestation verify <archive> --repo <owner>/<repo>.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: sha256sums.txt
 
       - name: Upload sha256sums.txt to the release
         env:

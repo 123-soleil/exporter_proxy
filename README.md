@@ -583,6 +583,8 @@ BASE=https://github.com/123-soleil/exporter_proxy/releases/download/$VERSION
 curl -fsSLO "$BASE/exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/sha256sums.txt"
 sha256sum -c --ignore-missing sha256sums.txt   # must print "OK"
+# From 0.2.0: proves the archive was built by this repository's CI
+gh attestation verify "exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz" --repo 123-soleil/exporter_proxy
 mkdir exporter_proxy && tar -xzf "exporter_proxy_${VERSION}_linux_${ARCH}.tar.gz" -C exporter_proxy
 cd exporter_proxy && ./exporter_proxy --version
 ```
@@ -1021,8 +1023,10 @@ GitHub Actions (`.github/workflows/`):
 | Workflow | When | What |
 |----------|------|------|
 | `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`. |
+| `integration.yml` | Pull requests to `main`, pushes to `main` | `test/systemd/run.sh` under the runner's real systemd: installation from `deploy/` as described above, the hardened unit, socket activation on port 443 (no capability), TLS and basic auth, `--check`, reload (successful and failed) without restarting the process, clean stop. |
+| `codeql.yml` | Pull requests to `main`, pushes to `main`, every Monday | CodeQL static analysis of the code (`security-and-quality` queries), results in the Security tab. |
 | `security.yml` | Every Monday, or by hand | `go mod verify` and `govulncheck` on `main`, for vulnerabilities published after a merge. |
-| `release.yml` | A GitHub release is published | Tests and `govulncheck`, then `make build` for Linux, macOS, FreeBSD, NetBSD and OpenBSD (386, amd64, arm64, armv5/6/7 where supported), each packaged as `exporter_proxy_<tag>_<os>_<arch>.tar.gz` (binary, README, CHANGELOG, LICENSE, `deploy/`) and uploaded to the release with `sha256sums.txt`. |
+| `release.yml` | A GitHub release is published | Tests and `govulncheck`, then `make build` for Linux, macOS, FreeBSD, NetBSD and OpenBSD (386, amd64, arm64, armv5/6/7 where supported), each packaged as `exporter_proxy_<tag>_<os>_<arch>.tar.gz` (binary, README, CHANGELOG, LICENSE, `deploy/`) and uploaded to the release with `sha256sums.txt` and a build provenance attestation. |
 
 Dependabot proposes Go module and GitHub Actions updates every week, a
 week after their release. Actions are pinned by commit SHA.
