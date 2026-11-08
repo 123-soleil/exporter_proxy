@@ -7,9 +7,12 @@
 package webconfig
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -317,6 +320,81 @@ func validateAllowedSANs(tc *web.TLSConfig) error {
 	if _, verified := ClientCertPolicy(tc.ClientAuth); !verified {
 		return fmt.Errorf("client_allowed_sans needs client_auth_type RequireAndVerifyClientCert or VerifyClientCertIfGiven "+
 			"(with %s, certificates are not verified and the names could be forged)", NormalizeClientAuth(tc.ClientAuth))
+	}
+	return nil
+}
+
+// ReadCRLs reads a client_crl_file: one or more CRLs, PEM ("X509 CRL") or a
+// single DER one.
+func ReadCRLs(path string) ([]*x509.RevocationList, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCRLs(data)
+}
+
+// ParseCRLs parses the content of a client_crl_file.
+func ParseCRLs(data []byte) ([]*x509.RevocationList, error) {
+	if !bytes.Contains(data, []byte("-----BEGIN")) {
+		l, err := x509.ParseRevocationList(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := supportedCRL(l); err != nil {
+			return nil, err
+		}
+		return []*x509.RevocationList{l}, nil
+	}
+	var lists []*x509.RevocationList
+	for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
+		if block.Type != "X509 CRL" {
+			continue
+		}
+		l, err := x509.ParseRevocationList(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("CRL %d: %w", len(lists)+1, err)
+		}
+		if err := supportedCRL(l); err != nil {
+			return nil, fmt.Errorf("CRL %d: %w", len(lists)+1, err)
+		}
+		lists = append(lists, l)
+	}
+	if len(lists) == 0 {
+		return nil, errors.New("no X509 CRL found")
+	}
+	return lists, nil
+}
+
+// CRL extensions that limit what a CRL covers: Go parses them without
+// applying them, so such a CRL would be taken as complete.
+var (
+	oidDeltaCRLIndicator        = asn1.ObjectIdentifier{2, 5, 29, 27}
+	oidIssuingDistributionPoint = asn1.ObjectIdentifier{2, 5, 29, 28}
+)
+
+// supportedCRL refuses a CRL exporter_proxy cannot apply as written: a
+// delta CRL, a partitioned CRL or authority revocation list (issuing
+// distribution point), or any critical extension of the CRL or of an
+// entry (an indirect CRL's certificate issuer, for example). Accepting it
+// as a complete CRL would let revoked certificates through.
+func supportedCRL(l *x509.RevocationList) error {
+	for _, e := range l.Extensions {
+		switch {
+		case e.Id.Equal(oidDeltaCRLIndicator):
+			return errors.New("delta CRLs are not supported: use complete CRLs")
+		case e.Id.Equal(oidIssuingDistributionPoint):
+			return errors.New("CRLs with an issuing distribution point (partitioned CRLs, authority revocation lists) are not supported: use complete CRLs")
+		case e.Critical:
+			return fmt.Errorf("unsupported critical CRL extension %s", e.Id)
+		}
+	}
+	for _, entry := range l.RevokedCertificateEntries {
+		for _, e := range entry.Extensions {
+			if e.Critical {
+				return fmt.Errorf("unsupported critical extension %s on the entry of serial %s", e.Id, entry.SerialNumber)
+			}
+		}
 	}
 	return nil
 }

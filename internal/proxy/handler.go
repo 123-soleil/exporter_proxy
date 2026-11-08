@@ -82,11 +82,12 @@ const (
 	AuthRateLimited        AuthReason = "rate_limited"        // too many attempts, answered 429
 	AuthNetworkNotAllowed  AuthReason = "network_not_allowed" // client address outside allowed_networks
 	AuthForbidden          AuthReason = "forbidden"           // authenticated, but not in the route's authorize
+	AuthCertificateRevoked AuthReason = "certificate_revoked" // client certificate in the client_crl_file
 )
 
 // AuthReasons lists every AuthReason, to initialize metric series.
 var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited,
-	AuthNetworkNotAllowed, AuthForbidden}
+	AuthNetworkNotAllowed, AuthForbidden, AuthCertificateRevoked}
 
 // Options configures a handler.
 type Options struct {

@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional per-route cache, `cache_ttl` (upstream routes, at most `1h`, not
   with `forward_params`): validated results only, `Age` header, counter
   `exporter_proxy_cache_hits_total{listener,route}`.
+- Client certificate revocation: `client_crl_file` on listeners and
+  `metrics`, checked on every handshake and request; fail closed (CRL past
+  its next update, issuer without CRL); `--check` warns 7 days before a
+  CRL's next update; a reload cannot remove it.
 
 ## [0.1.0] - 2026-11-08
 

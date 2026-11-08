@@ -51,6 +51,9 @@ func validate(fc *fileConfig) error {
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)
 	v.checkNetworks("metrics", fc.Metrics.AllowedNetworks)
+	if fc.Metrics.ClientCRLFile != "" {
+		v.checkAbsPath("metrics", "client_crl_file", fc.Metrics.ClientCRLFile)
+	}
 	v.checkServiceDiscovery(fc.Metrics.ServiceDiscovery)
 
 	// defaults section: every value set must be positive.
@@ -83,6 +86,9 @@ func validate(fc *fileConfig) error {
 		v.checkWebConfigFile(where, l.WebConfigFile)
 		v.checkPositiveInt(where, "max_concurrent_requests", l.MaxConcurrentRequests)
 		v.checkNetworks(where, l.AllowedNetworks)
+		if l.ClientCRLFile != "" {
+			v.checkAbsPath(where, "client_crl_file", l.ClientCRLFile)
+		}
 
 		if len(l.Routes) == 0 {
 			v.addf(where, "at least one route is required")

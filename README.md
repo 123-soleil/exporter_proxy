@@ -391,6 +391,7 @@ net/http errors clients can cause, never hides them.
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
 | `forbidden` | Authenticated, but neither the basic auth user nor a name of the verified client certificate is in the route's `authorize` list | `403` | `warn` `msg="request forbidden: not in the authorize list of the route"` with `route`, `user` and `remote` |
+| `certificate_revoked` | Client certificate of an open connection revoked by the `client_crl_file` since (or its revocation no longer checkable: CRL outside its dates) | `403`, connection closed | `warn` `msg="request refused: client certificate revoked or not checkable, closing the connection"` |
 | `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
 
@@ -424,6 +425,45 @@ routes:
   verified client certificates) is reported as a warning at startup, at
   reload and by `--check`; such a route then refuses every request.
 - A reload applies changed lists without restarting the listener.
+
+### Client certificate revocation
+
+To cut off one client certificate without replacing the client CA (a
+compromised key, a decommissioned scraper), list it in a certificate
+revocation list:
+
+```yaml
+listeners:
+  - name: node
+    listen: ":9100"
+    web_config_file: /etc/exporter_proxy/web-mtls.yml
+    client_crl_file: /etc/exporter_proxy/tls/clients.crl   # PEM or DER, several CRLs allowed
+```
+
+- The file is read on every new connection and every request (parsed only
+  when it changes): publishing a new CRL applies without reload, and a
+  certificate revoked while its connection is open gets `403` at its next
+  request, the connection being closed.
+- Checked on every handshake, TLS 1.3 session resumption included. A
+  revoked certificate fails the handshake (`tls_handshake`); on an open
+  connection, the refusal is counted as `certificate_revoked`.
+- Fail closed: every certificate of the client's chain except the root
+  must be covered by a CRL from its issuer, signed by it. A certificate
+  whose issuer has no CRL in the file is refused, and so is every client
+  certificate while a CRL is past its `nextUpdate` (or not yet valid):
+  republish the CRL in time. `--check` warns 7 days before.
+- Every CRL of an issuer in the file counts: a certificate listed by any
+  of them is revoked. Only complete CRLs are supported: delta CRLs, CRLs
+  with an issuing distribution point (partitioned CRLs, authority
+  revocation lists) and CRLs or entries with an unsupported critical
+  extension are refused (Go would read them as complete CRLs).
+- Requires a web configuration verifying client certificates
+  (`RequireAndVerifyClientCert` or `VerifyClientCertIfGiven`). A file that
+  does not parse fails the startup or the reload; a CRL outside its dates
+  is logged at `error` level and refuses that listener's client
+  certificates, the others keep running.
+- Like other protections, a reload cannot remove `client_crl_file`:
+  restart the service to do so.
 
 ### Allowed networks
 
@@ -688,6 +728,7 @@ together on one log line (each prefixed with its location, e.g.
 | `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
 | `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
+| `client_crl_file` | Optional, on listeners and `metrics`: absolute path; needs a web configuration verifying client certificates. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
 
@@ -1108,6 +1149,8 @@ otherwise; warnings do not fail the check:
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
 - an `authorize` list that cannot match on its listener is a warning;
+- each `client_crl_file` parses and is within its dates (a warning 7 days
+  before its next update);
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times
   would tell users apart);

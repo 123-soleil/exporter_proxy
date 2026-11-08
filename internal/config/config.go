@@ -61,6 +61,8 @@ type MetricsEndpoint struct {
 	Listen          string
 	WebConfigFile   string
 	AllowedNetworks []netip.Prefix // nil: every client address
+	// ClientCRLFile lists revoked client certificates; empty: none.
+	ClientCRLFile string
 	// ServiceDiscovery enables the Prometheus HTTP service discovery
 	// endpoint; nil: disabled.
 	ServiceDiscovery *ServiceDiscovery
@@ -83,7 +85,9 @@ type Listener struct {
 	// AllowedNetworks are the client networks allowed to connect; nil:
 	// every client address.
 	AllowedNetworks []netip.Prefix
-	Routes          []Route
+	// ClientCRLFile lists revoked client certificates; empty: none.
+	ClientCRLFile string
+	Routes        []Route
 }
 
 // Route maps an exact request path to one metrics source.
@@ -162,6 +166,7 @@ type fileConfig struct {
 type fileMetrics struct {
 	Listen           string                `yaml:"listen"`
 	WebConfigFile    string                `yaml:"web_config_file"`
+	ClientCRLFile    string                `yaml:"client_crl_file"`
 	AllowedNetworks  []string              `yaml:"allowed_networks"`
 	ServiceDiscovery *fileServiceDiscovery `yaml:"service_discovery"`
 }
@@ -187,6 +192,7 @@ type fileListener struct {
 	Listen                string      `yaml:"listen"`
 	WebConfigFile         string      `yaml:"web_config_file"`
 	MaxConcurrentRequests *int        `yaml:"max_concurrent_requests"`
+	ClientCRLFile         string      `yaml:"client_crl_file"`
 	AllowedNetworks       []string    `yaml:"allowed_networks"`
 	Routes                []fileRoute `yaml:"routes"`
 }
@@ -280,6 +286,7 @@ func resolve(fc *fileConfig) *Config {
 			Listen:           fc.Metrics.Listen,
 			WebConfigFile:    fc.Metrics.WebConfigFile,
 			AllowedNetworks:  networks(fc.Metrics.AllowedNetworks),
+			ClientCRLFile:    fc.Metrics.ClientCRLFile,
 			ServiceDiscovery: sd,
 		},
 		Listeners: make([]Listener, 0, len(fc.Listeners)),
@@ -291,6 +298,7 @@ func resolve(fc *fileConfig) *Config {
 			WebConfigFile:         fl.WebConfigFile,
 			MaxConcurrentRequests: valueOr(fl.MaxConcurrentRequests, baseConcurrency),
 			AllowedNetworks:       networks(fl.AllowedNetworks),
+			ClientCRLFile:         fl.ClientCRLFile,
 			Routes:                make([]Route, 0, len(fl.Routes)),
 		}
 		for _, fr := range fl.Routes {
