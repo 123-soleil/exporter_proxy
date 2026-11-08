@@ -989,8 +989,13 @@ for log pipelines that prefer JSON.
   (rejected sources, refused requests, reload results) are always logged at
   `warn` or `error`.
 - `--log.access` adds one `info` line per request (listener, route, status
-  code, duration, size, client address), useful for debugging but noisy at
-  normal scrape rates.
+  code, duration, size, client address), useful for debugging and as an
+  audit of who read what, but noisy at normal scrape rates. Verified
+  identities are added: `user` (basic authentication, once its password is
+  checked) and `client_cert` (common name, else first subject alternative
+  name, of a client certificate verified against the client CA), each
+  truncated to 64 characters; an unverified header or certificate never
+  appears.
 - Context is always in separate fields, never concatenated into `msg`. No
   colors are used.
 

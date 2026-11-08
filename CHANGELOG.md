@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the read may take, computed by the proxy.
 - Health endpoints `/-/healthy` and `/-/ready` on the metrics endpoint,
   protected like `/metrics`; not ready from the start of the shutdown.
+- The access log (`--log.access`) names verified identities: `user` and
+  `client_cert`.
 
 ## [0.1.0] - 2026-11-08
 

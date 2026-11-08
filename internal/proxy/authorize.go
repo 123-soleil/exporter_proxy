@@ -93,6 +93,26 @@ func verified(cs *tls.ConnectionState) bool {
 	return cs != nil && len(cs.VerifiedChains) > 0 && len(cs.PeerCertificates) > 0
 }
 
+// certName names a verified client certificate for logs: its subject
+// common name, else its first subject alternative name; empty without a
+// verified certificate.
+func certName(cs *tls.ConnectionState) string {
+	if !verified(cs) {
+		return ""
+	}
+	leaf := cs.PeerCertificates[0]
+	if leaf.Subject.CommonName != "" {
+		return leaf.Subject.CommonName
+	}
+	if len(leaf.DNSNames) > 0 {
+		return leaf.DNSNames[0]
+	}
+	if others := otherSANs(leaf); len(others) > 0 {
+		return others[0]
+	}
+	return ""
+}
+
 // otherSANs returns the IP address, email address and URI names of a
 // certificate, compared exactly.
 func otherSANs(leaf *x509.Certificate) []string {

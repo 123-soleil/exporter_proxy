@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
@@ -134,5 +136,40 @@ func TestHandlerAuthorize(t *testing.T) {
 	}
 	if c := do("/open", "bob"); c != http.StatusOK {
 		t.Errorf("bob on /open: %d, want 200", c)
+	}
+}
+
+// The access log names verified identities only.
+func TestAccessLogIdentity(t *testing.T) {
+	var logs bytes.Buffer
+	src := fakeSource{res: &source.Result{Body: []byte(metrics)}}
+	h := newTestHandler(src, 2, &recorder{}, &logs, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req = req.WithContext(WithUser(req.Context(), "alice"))
+	req.TLS = tlsState(true)
+	req.TLS.PeerCertificates[0].Subject.CommonName = "prometheus-1"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(logs.String(), "user=alice") || !strings.Contains(logs.String(), "client_cert=prometheus-1") {
+		t.Errorf("identities not logged: %s", logs.String())
+	}
+
+	logs.Reset()
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.SetBasicAuth("mallory", "unverified") // not verified by the authentication layer
+	req.TLS = tlsState(false)                 // unverified certificate
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if strings.Contains(logs.String(), "user=") || strings.Contains(logs.String(), "client_cert=") {
+		t.Errorf("unverified identity logged: %s", logs.String())
+	}
+}
+
+func TestTruncateKeepsUTF8(t *testing.T) {
+	s := strings.Repeat("a", 63) + "é" // é is 2 bytes: bytes 63 and 64
+	if got := truncate(s, 64); got != strings.Repeat("a", 63) {
+		t.Errorf("truncate = %q", got)
+	}
+	if got := truncate("short", 64); got != "short" {
+		t.Errorf("truncate = %q", got)
 	}
 }
