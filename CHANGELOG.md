@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - `SECURITY.md`: private vulnerability reporting through GitHub.
@@ -333,5 +335,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
 
-[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/123-soleil/exporter_proxy/releases/tag/0.1.0
