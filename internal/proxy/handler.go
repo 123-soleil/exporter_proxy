@@ -205,16 +205,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		d := time.Since(start)
 		h.rec.RequestServed(h.listener, routeLabel, rw.status(), d)
 		if h.accessLog {
-			attrs := []any{"route", routeLabel, "method", req.Method,
-				"path", req.URL.Path, "code", rw.status(), "size", rw.size,
+			// Client-supplied text (method, path) is cleaned like the
+			// identities below.
+			attrs := []any{"route", routeLabel, "method", logSafe(req.Method, 16),
+				"path", logSafe(req.URL.Path, 256), "code", rw.status(), "size", rw.size,
 				"duration_ms", d.Milliseconds(), "remote", req.RemoteAddr}
 			// Verified identities only: they cannot be forged by the
 			// client.
 			if user, ok := userOf(req.Context()); ok {
-				attrs = append(attrs, "user", logSafe(user))
+				attrs = append(attrs, "user", logSafe(user, 64))
 			}
 			if name := certName(req.TLS); name != "" {
-				attrs = append(attrs, "client_cert", logSafe(name))
+				attrs = append(attrs, "client_cert", logSafe(name, 64))
 			}
 			h.logger.Info("request", attrs...)
 		}
@@ -315,10 +317,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// logSafe prepares a name for logs: line breaks and other control
-// characters removed (the log handlers escape them too), then cut to 64
+// logSafe prepares text for logs: line breaks and other control
+// characters removed (the log handlers escape them too), then cut to n
 // bytes.
-func logSafe(s string) string {
+func logSafe(s string, n int) string {
 	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", ""), "\r", "")
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
@@ -326,7 +328,7 @@ func logSafe(s string) string {
 		}
 		return r
 	}, s)
-	return truncate(s, 64)
+	return truncate(s, n)
 }
 
 // truncate cuts s to at most n bytes, for logs.

@@ -175,7 +175,7 @@ func TestTruncateKeepsUTF8(t *testing.T) {
 }
 
 func TestLogSafe(t *testing.T) {
-	if got := logSafe("alice\nlevel=ERROR msg=forged\r\x00"); got != "alicelevel=ERROR msg=forged" {
+	if got := logSafe("alice\nlevel=ERROR msg=forged\r\x00", 64); got != "alicelevel=ERROR msg=forged" {
 		t.Errorf("logSafe = %q", got)
 	}
 }
