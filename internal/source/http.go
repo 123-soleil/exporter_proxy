@@ -2,19 +2,28 @@ package source
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/version"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 )
 
-// acceptHeader requests the Prometheus text exposition format, the only
-// format the proxy validates and serves.
+// acceptHeader requests the Prometheus text exposition format.
 const acceptHeader = "text/plain;version=0.0.4;q=1,*/*;q=0.1"
+
+// acceptProtobuf requests the delimited protobuf format first (native
+// histograms), the text format as fallback. Both are validated.
+const acceptProtobuf = "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;escaping=allow-utf-8;q=1," +
+	"text/plain;version=0.0.4;q=0.5,*/*;q=0.1"
 
 // httpSource fetches an HTTP exporter over TCP or over a Unix socket.
 type httpSource struct {
@@ -37,6 +46,14 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 		IdleConnTimeout:     90 * time.Second,
 		// Compression stays enabled: the transport decompresses gzip
 		// transparently and readLimited bounds the decompressed size.
+	}
+	if strings.HasPrefix(r.Upstream, "https://") {
+		tlsCfg, err := upstreamTLSConfig(r.UpstreamTLS)
+		if err != nil {
+			return nil, err
+		}
+		transport.TLSClientConfig = tlsCfg
+		transport.TLSHandshakeTimeout = r.Limits.Timeout
 	}
 	if r.UnixSocket != "" {
 		socket := r.UnixSocket
@@ -63,10 +80,40 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 	}, nil
 }
 
+// upstreamTLSConfig builds the TLS settings of an https:// upstream. Its
+// files are read now: at startup and on every reload, which fails if they
+// cannot be used. The upstream certificate is always verified.
+func upstreamTLSConfig(t *config.UpstreamTLS) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if t == nil {
+		return cfg, nil // system roots, server name from the URL
+	}
+	cfg.ServerName = t.ServerName
+	if t.CAFile != "" {
+		data, err := os.ReadFile(t.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream_tls ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("upstream_tls ca_file %s: no certificate found", t.CAFile)
+		}
+		cfg.RootCAs = pool
+	}
+	if t.CertFile != "" {
+		pair, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream_tls cert_file and key_file: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+	return cfg, nil
+}
+
 // CloseIdleConnections closes the idle connections to the upstream.
 func (s *httpSource) CloseIdleConnections() { s.client.CloseIdleConnections() }
 
-func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
+func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	limit := timeLimit(parent, time.Now(), s.timeout)
 	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
@@ -77,7 +124,11 @@ func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
 	}
 	// Only these headers are sent: nothing from the client request
 	// (Authorization in particular) is forwarded.
-	req.Header.Set("Accept", acceptHeader)
+	accept := acceptHeader
+	if r.Protobuf {
+		accept = acceptProtobuf
+	}
+	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", version.ComponentUserAgent("exporter_proxy"))
 
 	resp, err := s.client.Do(req)
@@ -100,5 +151,7 @@ func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
 	if err != nil {
 		return nil, classify(ctx, fmt.Errorf("read upstream body: %w", err), limit)
 	}
-	return &Result{Body: body}, nil
+	// Anything but delimited protobuf is validated as text.
+	proto := r.Protobuf && expfmt.ResponseFormat(resp.Header).FormatType() == expfmt.TypeProtoDelim
+	return &Result{Body: body, Protobuf: proto}, nil
 }

@@ -19,6 +19,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (uid 65532), cross-compiled for amd64, arm64 and arm/v7, base images
   pinned by digest; `deploy/docker/compose.yml.exemple` and a "Docker"
   section in the README; CI builds the image and runs it as documented.
+- Responses are compressed with gzip when the scraper accepts it
+  (`Accept-Encoding`) and the body is 1 KiB or more.
+- Shared reads: requests for a route arriving while its source is being
+  read get the result of that read instead of reading again (scrapers in
+  high availability), without taking a `max_concurrent_requests` slot;
+  new counter `exporter_proxy_requests_shared_total{listener,route}`.
+- `allowed_networks` on listeners and on `metrics`: connections from other
+  client addresses are closed as soon as they are accepted, before the TLS
+  handshake, and counted as `network_not_allowed` in
+  `exporter_proxy_auth_failures_total`. Applied by a reload without
+  restart; connections opened before a reload that removed their address
+  get `403` at their next request and are closed.
+- Route authorization: `authorize` (`users`, `client_sans`) restricts a
+  route to some of the clients its listener authenticates; others get
+  `403`, counted as `forbidden` in `exporter_proxy_auth_failures_total`.
+  Only verified identities count (checked password, client certificate
+  verified against the client CA).
+- Delimited protobuf format, so native histograms pass through the proxy:
+  when the scraper prefers it, HTTP upstreams are asked for protobuf first;
+  protobuf answers are decoded and validated (names, label values,
+  `max_samples` counting a native histogram as one sample) and served as
+  protobuf. Text stays the default and the only format of file routes.
+- HTTPS upstreams: `upstream: https://...`, with `upstream_tls` (`ca_file`,
+  client certificate for mTLS, `server_name`). The upstream certificate is
+  always verified; files are loaded at startup and reload, and checked by
+  `--check`.
+- Service discovery: with `metrics.service_discovery` (`host`, optional
+  `labels`), the metrics endpoint serves `/sd`, the routes in the
+  Prometheus HTTP service discovery format, with their listener's actual
+  port and scheme.
 
 ## [0.1.0] - 2026-11-08
 

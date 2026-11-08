@@ -71,13 +71,25 @@ type Result struct {
 	// ModTime is the modification time of a file source; zero for HTTP
 	// sources. It is also set alongside a ReasonStale error.
 	ModTime time.Time
+
+	// Protobuf: Body is in the delimited protobuf format; otherwise in the
+	// text format.
+	Protobuf bool
+}
+
+// Request describes what a read asks for.
+type Request struct {
+	// Protobuf asks an HTTP upstream for the delimited protobuf format
+	// (needed for native histograms), with the text format as fallback.
+	// Files are always read as text.
+	Protobuf bool
 }
 
 // Source reads the metrics of one route.
 type Source interface {
 	// Fetch reads the whole content. On error, the returned Result may still
 	// carry metadata (ModTime) but no Body.
-	Fetch(ctx context.Context) (*Result, error)
+	Fetch(ctx context.Context, req Request) (*Result, error)
 }
 
 // New returns the source described by a validated route.

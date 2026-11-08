@@ -4,14 +4,19 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/prometheus/common/expfmt"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/content"
@@ -20,6 +25,12 @@ import (
 
 // contentType is the media type of the validated text exposition format.
 const contentType = "text/plain; version=0.0.4; charset=utf-8"
+
+// servedFormats are the formats the proxy validates, for negotiation.
+var servedFormats = []expfmt.Format{expfmt.NewFormat(expfmt.TypeProtoDelim), expfmt.NewFormat(expfmt.TypeTextPlain)}
+
+// protobufContentType is the media type of the delimited protobuf format.
+const protobufContentType = "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited"
 
 // Recorder receives the events used for the proxy's own metrics. Route
 // labels are configured paths only; unmatched requests use route "".
@@ -38,6 +49,9 @@ type Recorder interface {
 	// ContentParsed is called after parsing, successful or not; samples is
 	// only meaningful when valid.
 	ContentParsed(listener, route string, samples int, duration time.Duration, valid bool)
+	// RequestShared is called for a request answered with the result of a
+	// read started by a concurrent request of the same route.
+	RequestShared(listener, route string)
 	// SourceFailed is called for every rejected scrape.
 	SourceFailed(listener, route string, reason source.Reason)
 	// AuthFailed is called for every request or connection refused before
@@ -60,10 +74,13 @@ const (
 	AuthMissingCredentials AuthReason = "missing_credentials" // basic auth required, none sent
 	AuthInvalidCredentials AuthReason = "invalid_credentials" // unknown user or wrong password
 	AuthRateLimited        AuthReason = "rate_limited"        // too many attempts, answered 429
+	AuthNetworkNotAllowed  AuthReason = "network_not_allowed" // client address outside allowed_networks
+	AuthForbidden          AuthReason = "forbidden"           // authenticated, but not in the route's authorize
 )
 
 // AuthReasons lists every AuthReason, to initialize metric series.
-var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited}
+var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited,
+	AuthNetworkNotAllowed, AuthForbidden}
 
 // Options configures a handler.
 type Options struct {
@@ -76,6 +93,7 @@ type route struct {
 	path       string
 	src        source.Source
 	maxSamples int
+	authz      *authorization // nil: every authenticated client
 }
 
 // Handler serves the routes of one listener.
@@ -86,6 +104,9 @@ type Handler struct {
 	logger    *slog.Logger
 	rec       Recorder
 	accessLog bool
+	// mu protects reads: the source reads running, by route.
+	mu    sync.Mutex
+	reads map[string]*sharedRead
 	// logs bounds the warn lines a client can trigger on this listener
 	// (rejections, source failures): beyond, they are logged at debug
 	// level. They are all counted in the metrics.
@@ -114,7 +135,8 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 		if err != nil {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
-		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples})
+		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
+			authz: newAuthorization(r.Authorize)})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -128,6 +150,7 @@ func newHandler(listener string, routes []route, maxConcurrent int, opts Options
 		rec:       opts.Recorder,
 		accessLog: opts.AccessLog,
 		logs:      rate.NewLimiter(logRate, logBurst),
+		reads:     map[string]*sharedRead{},
 	}
 	if h.logger == nil {
 		h.logger = slog.New(slog.DiscardHandler)
@@ -187,43 +210,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Never queue: a full listener answers immediately.
-	select {
-	case h.slots <- struct{}{}:
-	default:
+	if rt.authz != nil {
+		if ok, who := rt.authz.allows(req); !ok {
+			h.rec.AuthFailed(h.listener, AuthForbidden)
+			h.logger.Log(req.Context(), h.warnLevel(), "request forbidden: not in the authorize list of the route",
+				"route", rt.path, "user", truncate(who, 64), "remote", req.RemoteAddr)
+			http.Error(rw, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+
+	// Answer before the scraper gives up: its timeout can only shorten the
+	// route timeout, which the source still applies.
+	budget, hasBudget := scrapeBudget(req.Header)
+
+	// The delimited protobuf format (native histograms) when the scraper
+	// prefers it; files and upstreams without it answer in text.
+	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto}, budget, hasBudget)
+	if errors.Is(err, errNoSlot) {
 		h.rec.RequestRejected(h.listener)
 		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
 			"route", rt.path, "max_concurrent_requests", cap(h.slots))
 		http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
-	h.rec.InFlight(h.listener, 1)
-	defer func() {
-		<-h.slots
-		h.rec.InFlight(h.listener, -1)
-	}()
-
-	// Answer before the scraper gives up: its timeout can only shorten the
-	// route timeout, which the source still applies.
-	ctx := req.Context()
-	budget, hasBudget := scrapeBudget(req.Header)
-	if hasBudget {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, budget)
-		defer cancel()
+	if req.Context().Err() != nil {
+		// The client went away: not a source failure. Recorded as 499,
+		// but a 502 is still written: a client that only half-closed its
+		// connection may still read, and must not get an empty 200.
+		h.logger.Debug("client canceled the request", "route", rt.path, "err", err)
+		rw.code = statusClientClosedRequest
+		rw.ResponseWriter.WriteHeader(http.StatusBadGateway)
+		return
 	}
-
-	body, err := h.fetch(ctx, rt)
 	if err != nil {
-		if req.Context().Err() != nil {
-			// The client went away: not a source failure. Recorded as 499,
-			// but a 502 is still written: a client that only half-closed
-			// its connection may still read, and must not get an empty 200.
-			h.logger.Debug("client canceled the request", "route", rt.path, "err", err)
-			rw.code = statusClientClosedRequest
-			rw.ResponseWriter.WriteHeader(http.StatusBadGateway)
-			return
-		}
 		reason := source.ReasonOf(err)
 		h.rec.SourceFailed(h.listener, rt.path, reason)
 		attrs := []any{"route", rt.path, "reason", string(reason),
@@ -238,8 +259,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	body := rd.body
 	hdr := rw.Header()
 	hdr.Set("Content-Type", contentType)
+	if rd.protobuf {
+		hdr.Set("Content-Type", protobufContentType)
+	}
+	// The response depends on these request headers: caches must key on
+	// them.
+	hdr.Set("Vary", "Accept, Accept-Encoding")
+	if len(body) >= gzipMinSize && acceptsGzip(req.Header.Get("Accept-Encoding")) {
+		body = rd.gzipped()
+		hdr.Set("Content-Encoding", "gzip")
+	}
 	hdr.Set("Content-Length", strconv.Itoa(len(body)))
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Content-Type-Options", "nosniff")
@@ -250,6 +282,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// truncate cuts s to at most n bytes, for logs.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // scrapeTimeoutHeader is sent by Prometheus and vmagent with the scrape
@@ -290,23 +330,155 @@ func scrapeBudget(h http.Header) (time.Duration, bool) {
 	return max(budget, minScrapeBudget), true
 }
 
+// errNoSlot is returned by read when max_concurrent_requests is reached.
+var errNoSlot = errors.New("max_concurrent_requests reached")
+
+// sharedRead is one read of a route's source, whose result every request
+// for that route arriving meanwhile gets.
+type sharedRead struct {
+	done     chan struct{} // closed once body, protobuf and err are set
+	body     []byte
+	protobuf bool // body is in the delimited protobuf format
+	err      error
+
+	gzipOnce sync.Once
+	gzip     []byte
+
+	// Protected by Handler.mu.
+	clients int                // requests waiting for the result
+	cancel  context.CancelFunc // cancels the read
+}
+
+// gzipped returns the body compressed, computed once for all the requests
+// sharing the read.
+func (r *sharedRead) gzipped() []byte {
+	r.gzipOnce.Do(func() { r.gzip = gzipBytes(r.body) })
+	return r.gzip
+}
+
+// read returns the validated content of rt. A request arriving while a
+// read of the same route is running gets its result instead of reading
+// again (two scrapers in high availability, for example): only that first
+// read takes a concurrency slot. The read runs on its own, as long as one
+// request waits for it: it is canceled once none does, and every request
+// stops waiting when its client leaves or its scrape budget is spent.
+func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budget time.Duration, hasBudget bool) (*sharedRead, error) {
+	// Requests asking for different formats do not share reads.
+	key := rt.path
+	if sreq.Protobuf {
+		key += "\x00protobuf"
+	}
+	h.mu.Lock()
+	rd, ok := h.reads[key]
+	if ok {
+		rd.clients++
+		h.mu.Unlock()
+		h.rec.RequestShared(h.listener, rt.path)
+	} else {
+		// Never queue: a full listener answers immediately.
+		select {
+		case h.slots <- struct{}{}:
+		default:
+			h.mu.Unlock()
+			return nil, errNoSlot
+		}
+		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		rd = &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel}
+		h.reads[key] = rd
+		h.mu.Unlock()
+		h.rec.InFlight(h.listener, 1)
+		// No scrape budget on the read itself, only the route timeout
+		// (applied by the source): the request starting it must not cut it
+		// short for those joining it with a longer budget. Each request
+		// waits at most its own budget, and the read is canceled once none
+		// waits.
+		go func() {
+			defer cancel()
+			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
+			h.mu.Lock()
+			if h.reads[key] == rd {
+				delete(h.reads, key)
+			}
+			h.mu.Unlock()
+			// The slot is free before anyone gets the result: a scraper's
+			// next request finds it available.
+			<-h.slots
+			h.rec.InFlight(h.listener, -1)
+			close(rd.done)
+		}()
+	}
+
+	wait := ctx
+	if hasBudget {
+		var cancel context.CancelFunc
+		wait, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	select {
+	case <-rd.done:
+		return rd, rd.err
+	case <-wait.Done():
+	}
+	select {
+	case <-rd.done: // finished at the same time: use it
+		return rd, rd.err
+	default:
+	}
+	h.leave(key, rd)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, source.NewError(source.ReasonTimeout,
+		"no complete answer within %s (left by the scraper's timeout)", budget.Round(time.Millisecond))
+}
+
+// safeFetch is fetch for a read running on its own goroutine, where a
+// panic (a bug in a source or a parser fed by an upstream) would stop the
+// whole process instead of failing one request: it becomes a source
+// error.
+func (h *Handler) safeFetch(ctx context.Context, rt route, req source.Request) (body []byte, protobuf bool, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			h.logger.Error("panic while reading the source", "route", rt.path, "panic", fmt.Sprint(p),
+				"stack", string(debug.Stack()))
+			body, protobuf, err = nil, false, source.NewError(source.ReasonUnavailable, "internal error while reading the source")
+		}
+	}()
+	return h.fetch(ctx, rt, req)
+}
+
+// leave records that a request no longer waits for rd: the last one
+// leaving cancels the read, and later requests start a new one.
+func (h *Handler) leave(key string, rd *sharedRead) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rd.clients--
+	if rd.clients > 0 {
+		return
+	}
+	if h.reads[key] == rd {
+		delete(h.reads, key)
+	}
+	rd.cancel()
+}
+
 // fetch reads the source and validates its content.
-func (h *Handler) fetch(ctx context.Context, rt route) ([]byte, error) {
-	res, err := rt.src.Fetch(ctx)
+func (h *Handler) fetch(ctx context.Context, rt route, req source.Request) (body []byte, protobuf bool, err error) {
+	res, err := rt.src.Fetch(ctx, req)
 	if res != nil && !res.ModTime.IsZero() {
 		h.rec.FileModified(h.listener, rt.path, res.ModTime)
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	h.rec.SourceRead(h.listener, rt.path, len(res.Body))
 
-	parsed, err := content.Validate(res.Body, rt.maxSamples)
+	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
 	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return res.Body, nil
+	return res.Body, res.Protobuf, nil
 }
 
 // statusWriter records the status code and body size of a response.
@@ -353,4 +525,5 @@ func (NopRecorder) FileModified(string, string, time.Time)                 {}
 func (NopRecorder) ContentParsed(string, string, int, time.Duration, bool) {}
 func (NopRecorder) AuthFailed(string, AuthReason)                          {}
 func (NopRecorder) SourceFailed(string, string, source.Reason)             {}
+func (NopRecorder) RequestShared(string, string)                           {}
 func (NopRecorder) WebConfigRead(string, bool, bool)                       {}

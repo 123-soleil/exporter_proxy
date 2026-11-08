@@ -366,3 +366,36 @@ func TestCertFileIntermediateDates(t *testing.T) {
 	c.certificates("here", "cert_file", chain, false)
 	expect(t, c.findings, want{Warning, `"CN=intermediate" expired on`})
 }
+
+// An authorize list that cannot match on its listener is a warning.
+func TestAuthorizeWarnings(t *testing.T) {
+	web := filepath.Join(t.TempDir(), "web.yml")
+	writeFile(t, web, "{}\n") // no users, no TLS
+	cfg := onlyWebConfig(web)
+	cfg.Listeners[0].Routes[0].Authorize = &config.Authorize{Users: []string{"alice"}, ClientSANs: []string{"app"}}
+	expect(t, Run(cfg, now),
+		want{Warning, `route "/metrics": authorize users: the web configuration has no basic_auth_users`},
+		want{Warning, "authorize client_sans: the web configuration does not verify client certificates"})
+}
+
+func TestUpstreamTLSFiles(t *testing.T) {
+	dir := t.TempDir()
+	day := 24 * time.Hour
+	goodCert, goodKey := writeCert(t, dir, "good", now.Add(-day), now.Add(365*day))
+	expiredCert, expiredKey := writeCert(t, dir, "expired", now.Add(-365*day), now.Add(-day))
+	web := filepath.Join(dir, "web.yml")
+	writeFile(t, web, "{}\n")
+	run := func(ut *config.UpstreamTLS) []Finding {
+		cfg := onlyWebConfig(web)
+		cfg.Listeners[0].Routes[0].Upstream = "https://127.0.0.1:1/metrics"
+		cfg.Listeners[0].Routes[0].UpstreamTLS = ut
+		return Run(cfg, now)
+	}
+	expect(t, run(&config.UpstreamTLS{CAFile: goodCert, CertFile: goodCert, KeyFile: goodKey}))
+	expect(t, run(&config.UpstreamTLS{CertFile: expiredCert, KeyFile: expiredKey}),
+		want{Problem, "upstream_tls cert_file"})
+	expect(t, run(&config.UpstreamTLS{CertFile: goodCert, KeyFile: expiredKey}),
+		want{Problem, "upstream_tls cert_file and key_file"})
+	expect(t, run(&config.UpstreamTLS{CAFile: filepath.Join(dir, "missing.pem")}),
+		want{Problem, "upstream_tls ca_file"})
+}

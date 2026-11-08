@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -89,6 +90,11 @@ type listener struct {
 	// served is closed when srv stops serving: every connection it
 	// accepted is then tracked by fresh.
 	served chan struct{}
+	// allowed holds the allowed_networks of the listener, nil for every
+	// address. A reload keeping the listener replaces it.
+	allowed atomic.Pointer[[]netip.Prefix]
+	// refused reports a connection refused by allowed_networks.
+	refused func(remote string)
 }
 
 // listenerSettings are the parts of a web configuration that apply when a
@@ -315,6 +321,7 @@ type spec struct {
 	webConfig    string
 	handler      http.Handler
 	writeTimeout time.Duration
+	allowed      []netip.Prefix // allowed_networks, nil for every address
 }
 
 // swapHandler serves through a handler that a reload can replace
@@ -457,6 +464,14 @@ func (s *Server) Reload(cfg *config.Config) error {
 	var swaps []swap
 	var started []*listener
 	var weakened []string // listeners whose protection the reload would lower
+	// replaced maps a listener stopped by this reload to the listener
+	// taking its place: on the same address, or else with the same name
+	// elsewhere (an address match wins).
+	type replacement struct {
+		l      *listener
+		byAddr bool
+	}
+	replaced := map[*listener]replacement{}
 	kept := map[string]bool{}
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
@@ -480,6 +495,10 @@ func (s *Server) Reload(cfg *config.Config) error {
 			running, next := cur.running(), settingsOf(wc)
 			running.basicAuth = running.basicAuth || next.basicAuth
 			if next == running {
+				if sp.allowed != nil && cur.ln.Addr().Network() == "unix" {
+					s.abortReload(started)
+					return fmt.Errorf("listener %q: allowed_networks does not apply to a Unix socket (%s)", sp.name, cur.ln.Addr())
+				}
 				var tlsErr error
 				if next.tls {
 					_, tlsErr = cur.tlsConfigFor(wc)
@@ -525,6 +544,10 @@ func (s *Server) Reload(cfg *config.Config) error {
 			if lost := prev.weakens(l.settings); len(lost) > 0 {
 				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
+			byAddr := byListen[sp.listen] == prev
+			if r, ok := replaced[prev]; !ok || byAddr || !r.byAddr {
+				replaced[prev] = replacement{l, byAddr}
+			}
 		}
 		started = append(started, l)
 	}
@@ -540,6 +563,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 	// Commit: nothing below can fail.
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
+		sw.l.allowed.Store(&sw.sp.allowed)
 		retire(sw.l.handler.store(sw.sp))
 		if sw.basicAuth {
 			// Users found by the reload are required from now on, like
@@ -568,6 +592,20 @@ func (s *Server) Reload(cfg *config.Config) error {
 	for name, l := range s.listeners {
 		if !kept[name] {
 			s.logger.Info("listener stopping", "listener", name, "address", l.ln.Addr().String())
+			// Until it is shut down, the stopped server may still answer
+			// requests on connections opened before, behind its own
+			// authentication layer. It serves the routes, authorize lists
+			// and allowed_networks of its replacement only when that layer
+			// enforces what the replacement does (same web configuration
+			// file, same TLS and client certificate settings); otherwise it
+			// answers 503, never the routes this reload removed nor new
+			// routes under the previous authentication.
+			if r, ok := replaced[l]; ok && sameAuthentication(l, r.l) {
+				l.allowed.Store(&r.l.spec.allowed)
+				retire(l.handler.store(r.l.spec))
+			} else {
+				retire(l.handler.store(spec{handler: removedListener{}, writeTimeout: writeMargin}))
+			}
 			s.drain(l)
 		}
 	}
@@ -611,12 +649,17 @@ func (s *Server) pruneSuccesses() {
 func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	var specs []spec
 	if s.opts.MetricsHandler != nil {
+		handler := s.opts.MetricsHandler
+		if cfg.Metrics.ServiceDiscovery != nil {
+			handler = &sdHandler{s: s, cfg: cfg, next: handler}
+		}
 		specs = append(specs, spec{
 			name:         MetricsListener,
 			listen:       cfg.Metrics.Listen,
 			webConfig:    cfg.Metrics.WebConfigFile,
-			handler:      s.opts.MetricsHandler,
+			handler:      handler,
 			writeTimeout: metricsWriteTimeout,
+			allowed:      cfg.Metrics.AllowedNetworks,
 		})
 	}
 	for _, l := range cfg.Listeners {
@@ -638,6 +681,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			webConfig:    l.WebConfigFile,
 			handler:      h,
 			writeTimeout: maxTimeout + writeMargin,
+			allowed:      l.AllowedNetworks,
 		})
 	}
 
@@ -676,6 +720,20 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 				"listener", sp.name, "web_config_file", sp.webConfig)
 		}
 	}
+	for _, l := range cfg.Listeners {
+		wc, err := webconfig.Read(l.WebConfigFile)
+		if err != nil {
+			continue
+		}
+		for _, r := range l.Routes {
+			if r.Authorize == nil {
+				continue
+			}
+			for _, w := range wc.AuthorizeWarnings(len(r.Authorize.Users), len(r.Authorize.ClientSANs)) {
+				s.logger.Warn(w, "listener", l.Name, "route", r.Path, "web_config_file", l.WebConfigFile)
+			}
+		}
+	}
 	return specs, nil
 }
 
@@ -683,6 +741,11 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 // authentication layer come from its web configuration file. It does not
 // serve yet.
 func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
+	if sp.allowed != nil && ln.Addr().Network() == "unix" {
+		// Unix socket clients have no address to check: refuse rather
+		// than silently allow them all.
+		return nil, fmt.Errorf("listener %q: allowed_networks does not apply to a Unix socket (%s)", sp.name, ln.Addr())
+	}
 	wc, err := webconfig.Load(sp.webConfig)
 	if err != nil {
 		return nil, fmt.Errorf("listener %q: %w", sp.name, err)
@@ -726,6 +789,14 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	srv.ConnState = fresh.track
 	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh,
 		accept: &handoffListener{Listener: ln}, fresh: fresh, served: make(chan struct{})}
+	l.allowed.Store(&sp.allowed)
+	auth.allows = func(remote string) bool { return l.allowsRemote(remote) }
+	logger := s.logger.With("listener", sp.name)
+	l.refused = func(remote string) {
+		s.recorder().AuthFailed(sp.name, proxy.AuthNetworkNotAllowed)
+		logger.Log(context.Background(), clientLogs.level(slog.LevelWarn),
+			"connection refused: client address not in allowed_networks", "remote", remote)
+	}
 	if !settings.tls {
 		return l, nil
 	}
@@ -807,7 +878,7 @@ func (s *Server) recorder() proxy.Recorder {
 // update l.spec meanwhile.
 func (s *Server) serve(l *listener) {
 	name, tlsEnabled, srv, ln := l.spec.name, l.settings.tls, l.srv, l.ln
-	var served net.Listener = l.accept
+	var served net.Listener = networkFilter{l.accept, l}
 	if ln.Addr().Network() == "unix" {
 		served = unixClientsListener{l.accept}
 	}
@@ -864,6 +935,78 @@ func (s *Server) drain(l *listener) {
 		}
 		closeIdle(handler.cur.Load().h)
 	}()
+}
+
+// networkFilter refuses, as soon as they are accepted, the connections
+// whose client address is outside the listener's allowed_networks: before
+// any TLS handshake or request. An address that cannot be parsed is
+// refused.
+type networkFilter struct {
+	net.Listener
+	l *listener
+}
+
+func (f networkFilter) Accept() (net.Conn, error) {
+	for {
+		c, err := f.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if f.l.allows(c.RemoteAddr()) {
+			return c, nil
+		}
+		_ = c.Close()
+		f.l.refused(remoteIP(c.RemoteAddr()))
+	}
+}
+
+// allows reports whether addr is in the listener's allowed_networks.
+func (l *listener) allows(addr net.Addr) bool { return l.allowsRemote(addr.String()) }
+
+// allowsRemote is allows for the RemoteAddr of a request.
+func (l *listener) allowsRemote(remote string) bool {
+	allowed := l.allowed.Load()
+	if allowed == nil || *allowed == nil {
+		return true
+	}
+	ap, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return false
+	}
+	ip := ap.Addr().Unmap().WithZone("")
+	for _, p := range *allowed {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteIP returns the address of a client without its port, for logs.
+func remoteIP(addr net.Addr) string {
+	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return ap.Addr().Unmap().String()
+	}
+	return addr.String()
+}
+
+// sameAuthentication reports whether the authentication layer of old
+// enforces what that of next does: the same web configuration file (read
+// on every request: users added since apply), the same TLS and client
+// certificate settings and the same client CA content (connections were
+// verified against it).
+func sameAuthentication(old, next *listener) bool {
+	return old.spec.webConfig == next.spec.webConfig && old.settings.tls == next.settings.tls &&
+		old.settings.mtls == next.settings.mtls && old.settings.clientCA == next.settings.clientCA
+}
+
+// removedListener answers the requests a removed listener still gets on
+// connections opened before the reload, while it shuts down.
+type removedListener struct{}
+
+func (removedListener) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Connection", "close")
+	http.Error(w, "listener removed by a configuration reload", http.StatusServiceUnavailable)
 }
 
 // handoffListener is a listener whose server can stop accepting before

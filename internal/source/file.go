@@ -34,7 +34,7 @@ func newFileSource(r config.Route) *fileSource {
 //
 // Local file reads cannot be interrupted: the timeout is checked once the
 // read is done, so a file on a hung network mount can still block.
-func (s *fileSource) Fetch(ctx context.Context) (*Result, error) {
+func (s *fileSource) Fetch(ctx context.Context, _ Request) (*Result, error) {
 	start := s.now()
 	// Wall clock, like the context deadline (s.now is for file ages).
 	limit := timeLimit(ctx, time.Now(), s.timeout)

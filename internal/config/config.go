@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -56,8 +57,20 @@ func hash48(data []byte) uint64 {
 
 // MetricsEndpoint is where exporter_proxy exposes its own metrics.
 type MetricsEndpoint struct {
-	Listen        string
-	WebConfigFile string
+	Listen          string
+	WebConfigFile   string
+	AllowedNetworks []netip.Prefix // nil: every client address
+	// ServiceDiscovery enables the Prometheus HTTP service discovery
+	// endpoint; nil: disabled.
+	ServiceDiscovery *ServiceDiscovery
+}
+
+// ServiceDiscovery describes the targets the discovery endpoint lists.
+type ServiceDiscovery struct {
+	// Host is the name or address Prometheus reaches the listeners at.
+	Host string
+	// Labels are added to every target.
+	Labels map[string]string
 }
 
 // Listener is one listening address with its authentication and routes.
@@ -66,20 +79,45 @@ type Listener struct {
 	Listen                string
 	WebConfigFile         string
 	MaxConcurrentRequests int
-	Routes                []Route
+	// AllowedNetworks are the client networks allowed to connect; nil:
+	// every client address.
+	AllowedNetworks []netip.Prefix
+	Routes          []Route
 }
 
 // Route maps an exact request path to one metrics source.
 type Route struct {
 	Path string
 
-	// Source: Upstream (optionally with UnixSocket) or File.
-	Upstream   string
-	UnixSocket string
-	File       string
-	MaxAge     time.Duration // file routes only
+	// Source: Upstream (optionally with UnixSocket or UpstreamTLS) or File.
+	Upstream    string
+	UpstreamTLS *UpstreamTLS // https:// upstreams only; nil: system roots
+	UnixSocket  string
+	File        string
+	MaxAge      time.Duration // file routes only
+
+	// Authorize restricts the route to some of the listener's clients;
+	// nil: every client the listener authenticates.
+	Authorize *Authorize
 
 	Limits Limits
+}
+
+// UpstreamTLS configures the TLS connection to an https:// upstream. The
+// upstream certificate is always verified.
+type UpstreamTLS struct {
+	CAFile     string // CA bundle verifying the upstream; empty: system roots
+	CertFile   string // client certificate (mTLS), with KeyFile
+	KeyFile    string
+	ServerName string // name verified in the upstream certificate; empty: the URL host
+}
+
+// Authorize lists who may read a route: a request is allowed when its
+// basic authentication user is in Users, or when its verified client
+// certificate has a subject alternative name in ClientSANs.
+type Authorize struct {
+	Users      []string
+	ClientSANs []string
 }
 
 // Limits bound the work done for one request on a route.
@@ -99,8 +137,15 @@ type fileConfig struct {
 }
 
 type fileMetrics struct {
-	Listen        string `yaml:"listen"`
-	WebConfigFile string `yaml:"web_config_file"`
+	Listen           string                `yaml:"listen"`
+	WebConfigFile    string                `yaml:"web_config_file"`
+	AllowedNetworks  []string              `yaml:"allowed_networks"`
+	ServiceDiscovery *fileServiceDiscovery `yaml:"service_discovery"`
+}
+
+type fileServiceDiscovery struct {
+	Host   string            `yaml:"host"`
+	Labels map[string]string `yaml:"labels"`
 }
 
 type fileLimits struct {
@@ -119,6 +164,7 @@ type fileListener struct {
 	Listen                string      `yaml:"listen"`
 	WebConfigFile         string      `yaml:"web_config_file"`
 	MaxConcurrentRequests *int        `yaml:"max_concurrent_requests"`
+	AllowedNetworks       []string    `yaml:"allowed_networks"`
 	Routes                []fileRoute `yaml:"routes"`
 }
 
@@ -129,6 +175,21 @@ type fileRoute struct {
 	UnixSocket string         `yaml:"unix_socket"`
 	File       string         `yaml:"file"`
 	MaxAge     *time.Duration `yaml:"max_age"`
+	Authorize  *fileAuthorize `yaml:"authorize"`
+	// UpstreamTLS is decoded as is: no inheritance.
+	UpstreamTLS *fileUpstreamTLS `yaml:"upstream_tls"`
+}
+
+type fileUpstreamTLS struct {
+	CAFile     string `yaml:"ca_file"`
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	ServerName string `yaml:"server_name"`
+}
+
+type fileAuthorize struct {
+	Users      []string `yaml:"users"`
+	ClientSANs []string `yaml:"client_sans"`
 }
 
 // Load reads and decodes the configuration file at path.
@@ -179,10 +240,16 @@ func resolve(fc *fileConfig) *Config {
 	}
 	baseConcurrency := valueOr(fc.Defaults.MaxConcurrentRequests, DefaultMaxConcurrentRequests)
 
+	var sd *ServiceDiscovery
+	if f := fc.Metrics.ServiceDiscovery; f != nil {
+		sd = &ServiceDiscovery{Host: f.Host, Labels: f.Labels}
+	}
 	cfg := &Config{
 		Metrics: MetricsEndpoint{
-			Listen:        fc.Metrics.Listen,
-			WebConfigFile: fc.Metrics.WebConfigFile,
+			Listen:           fc.Metrics.Listen,
+			WebConfigFile:    fc.Metrics.WebConfigFile,
+			AllowedNetworks:  networks(fc.Metrics.AllowedNetworks),
+			ServiceDiscovery: sd,
 		},
 		Listeners: make([]Listener, 0, len(fc.Listeners)),
 	}
@@ -192,15 +259,18 @@ func resolve(fc *fileConfig) *Config {
 			Listen:                fl.Listen,
 			WebConfigFile:         fl.WebConfigFile,
 			MaxConcurrentRequests: valueOr(fl.MaxConcurrentRequests, baseConcurrency),
+			AllowedNetworks:       networks(fl.AllowedNetworks),
 			Routes:                make([]Route, 0, len(fl.Routes)),
 		}
 		for _, fr := range fl.Routes {
 			l.Routes = append(l.Routes, Route{
-				Path:       fr.Path,
-				Upstream:   fr.Upstream,
-				UnixSocket: fr.UnixSocket,
-				File:       fr.File,
-				MaxAge:     valueOr(fr.MaxAge, 0),
+				Path:        fr.Path,
+				Upstream:    fr.Upstream,
+				UpstreamTLS: upstreamTLSOf(fr.UpstreamTLS),
+				UnixSocket:  fr.UnixSocket,
+				File:        fr.File,
+				MaxAge:      valueOr(fr.MaxAge, 0),
+				Authorize:   authorizeOf(fr.Authorize),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -211,6 +281,66 @@ func resolve(fc *fileConfig) *Config {
 		cfg.Listeners = append(cfg.Listeners, l)
 	}
 	return cfg
+}
+
+func upstreamTLSOf(f *fileUpstreamTLS) *UpstreamTLS {
+	if f == nil {
+		return nil
+	}
+	return &UpstreamTLS{CAFile: f.CAFile, CertFile: f.CertFile, KeyFile: f.KeyFile, ServerName: f.ServerName}
+}
+
+func authorizeOf(fa *fileAuthorize) *Authorize {
+	if fa == nil {
+		return nil
+	}
+	return &Authorize{Users: fa.Users, ClientSANs: fa.ClientSANs}
+}
+
+// networks returns validated allowed_networks entries as prefixes, nil when
+// unset.
+func networks(entries []string) []netip.Prefix {
+	if entries == nil {
+		return nil
+	}
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for _, e := range entries {
+		p, err := ParseNetwork(e)
+		if err != nil {
+			panic(fmt.Sprintf("allowed_networks entry %q passed validation: %v", e, err)) // validated before
+		}
+		prefixes = append(prefixes, p)
+	}
+	return prefixes
+}
+
+// ParseNetwork parses an allowed_networks entry: a network in CIDR
+// notation, written with its host bits cleared (192.0.2.0/24), or a single
+// address. IPv4-mapped IPv6 forms are converted to IPv4, like client
+// addresses are.
+func ParseNetwork(s string) (netip.Prefix, error) {
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		if p != p.Masked() {
+			return netip.Prefix{}, fmt.Errorf("host bits set, use %q", p.Masked().String())
+		}
+		if p.Addr().Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		return p, nil
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	if a.Zone() != "" {
+		return netip.Prefix{}, errors.New("an IPv6 zone is not allowed")
+	}
+	a = a.Unmap()
+	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
 func valueOr[T any](p *T, def T) T {

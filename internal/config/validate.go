@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"path"
 	"path/filepath"
@@ -47,6 +48,8 @@ func validate(fc *fileConfig) error {
 	// metrics section: mandatory.
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)
+	v.checkNetworks("metrics", fc.Metrics.AllowedNetworks)
+	v.checkServiceDiscovery(fc.Metrics.ServiceDiscovery)
 
 	// defaults section: every value set must be positive.
 	v.checkLimits("defaults", fc.Defaults.fileLimits)
@@ -77,6 +80,7 @@ func validate(fc *fileConfig) error {
 		v.checkListen(where, l.Listen, listens)
 		v.checkWebConfigFile(where, l.WebConfigFile)
 		v.checkPositiveInt(where, "max_concurrent_requests", l.MaxConcurrentRequests)
+		v.checkNetworks(where, l.AllowedNetworks)
 
 		if len(l.Routes) == 0 {
 			v.addf(where, "at least one route is required")
@@ -128,6 +132,28 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	if hasUpstream {
 		v.checkUpstream(where, r.Upstream)
 	}
+	https := strings.HasPrefix(r.Upstream, "https://")
+	if https && r.UnixSocket != "" {
+		v.addf(where, "unix_socket requires an http:// upstream")
+	}
+	if t := r.UpstreamTLS; t != nil {
+		if !https {
+			v.addf(where, "upstream_tls requires an https:// upstream")
+		}
+		if (t.CertFile == "") != (t.KeyFile == "") {
+			v.addf(where, "upstream_tls: cert_file and key_file go together")
+		}
+		for _, f := range []struct{ key, path string }{
+			{"upstream_tls ca_file", t.CAFile}, {"upstream_tls cert_file", t.CertFile}, {"upstream_tls key_file", t.KeyFile},
+		} {
+			if f.path != "" {
+				v.checkAbsPath(where, f.key, f.path)
+			}
+		}
+		if *t == (fileUpstreamTLS{}) {
+			v.addf(where, "upstream_tls is empty: remove it (the system roots verify the upstream) or set its fields")
+		}
+	}
 	if r.UnixSocket != "" {
 		v.checkAbsPath(where, "unix_socket", r.UnixSocket)
 	}
@@ -142,6 +168,33 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	v.checkPositiveDuration(where, "max_age", r.MaxAge)
 
 	v.checkLimits(where, r.fileLimits)
+	v.checkAuthorize(where, r.Authorize)
+}
+
+// checkAuthorize rejects an authorize block that would refuse every
+// request, or that holds empty names.
+func (v *validator) checkAuthorize(where string, a *fileAuthorize) {
+	if a == nil {
+		return
+	}
+	if len(a.Users) == 0 && len(a.ClientSANs) == 0 {
+		v.addf(where, "authorize must list users or client_sans (an empty authorize would refuse every request)")
+	}
+	for _, list := range []struct {
+		key   string
+		names []string
+	}{{"users", a.Users}, {"client_sans", a.ClientSANs}} {
+		seen := map[string]bool{}
+		for _, n := range list.names {
+			switch {
+			case strings.TrimSpace(n) == "":
+				v.addf(where, "authorize %s: empty name", list.key)
+			case seen[n]:
+				v.addf(where, "authorize %s: duplicate %q", list.key, n)
+			}
+			seen[n] = true
+		}
+	}
 }
 
 func (v *validator) checkUpstream(where, raw string) {
@@ -151,8 +204,8 @@ func (v *validator) checkUpstream(where, raw string) {
 		return
 	}
 	switch {
-	case u.Scheme != "http":
-		v.addf(where, "upstream must use http:// (got %q)", u.Scheme)
+	case u.Scheme != "http" && u.Scheme != "https":
+		v.addf(where, "upstream must use http:// or https:// (got %q)", u.Scheme)
 	case u.Host == "":
 		v.addf(where, "upstream must have a host")
 	case u.User != nil:
@@ -203,6 +256,55 @@ func (v *validator) checkListen(where, addr string, seen map[string]string) {
 		return
 	}
 	seen[addr] = where
+}
+
+// labelNamePattern restricts service discovery label names to classic
+// Prometheus label names; names starting with "__" are reserved.
+var labelNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// checkServiceDiscovery checks the service_discovery block of metrics.
+func (v *validator) checkServiceDiscovery(sd *fileServiceDiscovery) {
+	if sd == nil {
+		return
+	}
+	const where = "metrics service_discovery"
+	switch {
+	case sd.Host == "":
+		v.addf(where, "host is required: the name or address Prometheus reaches the listeners at")
+	case strings.ContainsAny(sd.Host, "/[]@ ") || strings.Count(sd.Host, ":") == 1:
+		v.addf(where, "host %q must be a name or an address, without scheme, port or brackets", sd.Host)
+	case strings.Contains(sd.Host, ":"):
+		if _, err := netip.ParseAddr(sd.Host); err != nil {
+			v.addf(where, "host %q is not a valid IPv6 address", sd.Host)
+		}
+	}
+	for name := range sd.Labels {
+		switch {
+		case !labelNamePattern.MatchString(name):
+			v.addf(where, "label name %q is not a valid Prometheus label name", name)
+		case strings.HasPrefix(name, "__"):
+			v.addf(where, "label name %q is reserved (names starting with \"__\")", name)
+		case name == "exporter_proxy_listener" || name == "exporter_proxy_route":
+			v.addf(where, "label name %q is set by exporter_proxy", name)
+		}
+	}
+}
+
+// checkNetworks checks allowed_networks: unset allows every address, an
+// empty list would refuse every client.
+func (v *validator) checkNetworks(where string, entries []string) {
+	if entries == nil {
+		return
+	}
+	if len(entries) == 0 {
+		v.addf(where, "allowed_networks is empty: remove it or list the allowed networks")
+		return
+	}
+	for _, e := range entries {
+		if _, err := ParseNetwork(e); err != nil {
+			v.addf(where, "allowed_networks %q is not an address or a network in CIDR notation: %v", e, err)
+		}
+	}
 }
 
 func (v *validator) checkWebConfigFile(where, p string) {

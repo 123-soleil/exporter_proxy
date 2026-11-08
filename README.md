@@ -11,7 +11,8 @@ A single `exporter_proxy` process serves **several listeners**. Each listener
 has its own address, its own authentication settings and one or more routes.
 A route serves metrics from one source:
 
-- an HTTP exporter over TCP (`http://127.0.0.1:19100/metrics`);
+- an HTTP exporter over TCP (`http://127.0.0.1:19100/metrics`), or over
+  HTTPS with optional mTLS for an exporter on another machine;
 - an HTTP exporter over a Unix domain socket (UDS);
 - a static file in the Prometheus text exposition format (`.prom`).
 
@@ -51,17 +52,19 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
   to one source. Only `GET` (and `HEAD`) requests are accepted.
 - Authentication is **per listener**: all routes of a listener share the same
   TLS/mTLS/basic auth settings. Routes needing different authentication must
-  go on different listeners.
+  go on different listeners. Within a listener, a route can be restricted to
+  some of its authenticated clients (`authorize`, see "Route authorization").
 - Request credentials (`Authorization` header) are never forwarded upstream.
 
 ### HTTP responses
 
 | Situation | Status | Notes |
 |-----------|--------|-------|
-| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`. `HEAD` returns the headers only. |
+| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
+| Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
-| `max_concurrent_requests` reached | `503` | Immediate, never queued. |
+| `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
@@ -96,8 +99,9 @@ Each route has exactly one source:
   (`reason="stale"`), so a writer that stopped running cannot go unnoticed
   behind old values. Choose it as a few times the writer's period (for
   example `max_age: 15m` for a file written every 5 minutes).
-- Upstream requests are sent with `Accept: text/plain;version=0.0.4` and a
-  `User-Agent: exporter_proxy/<version>`; no client header is forwarded
+- Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
+  the delimited protobuf format first, when the scraper prefers it: see
+  "Formats") and a `User-Agent: exporter_proxy/<version>`; no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
@@ -115,6 +119,80 @@ Each route has exactly one source:
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
 
+### HTTPS upstreams
+
+An exporter on another machine, or one serving TLS itself, is read over
+`https://`. The upstream certificate is always verified: against the
+system roots by default, or against `ca_file`. `cert_file` and `key_file`
+add a client certificate, for an exporter requiring mTLS (an exporter-toolkit
+web configuration with `client_auth_type`):
+
+```yaml
+routes:
+  - path: /remote/metrics
+    upstream: https://db1.internal:9187/metrics
+    upstream_tls:
+      ca_file: /etc/exporter_proxy/tls/exporters-ca.pem
+      cert_file: /etc/exporter_proxy/tls/proxy-client.crt
+      key_file: /etc/exporter_proxy/tls/proxy-client.key
+      server_name: db1.internal        # optional, defaults to the URL host
+```
+
+- TLS 1.2 at least. There is no `insecure_skip_verify`: a proxy that
+  protects metrics does not read them over an unverified connection.
+- The files are read at startup and on every reload: an unreadable file or
+  a key that does not match its certificate fails the startup or the
+  reload, which then keeps the running configuration. After renewing them,
+  reload (`systemctl reload exporter_proxy`); `--check` checks them and
+  their dates.
+- Handshake and certificate failures count as `unavailable` source errors.
+
+### Formats
+
+The proxy serves the text exposition format, and the delimited protobuf
+format that native histograms need:
+
+- When the scraper prefers protobuf in its `Accept` header (Prometheus does
+  when native histograms are enabled, `scrape_protocols` starting with
+  `PrometheusProto`), an HTTP upstream is asked for protobuf first, then
+  text. An upstream answering protobuf (its `Content-Type`) is decoded and
+  validated as protobuf, and served with `Content-Type:
+  application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily;
+  encoding=delimited`; anything else is validated and served as text.
+- Other scrapers, and `file` routes (always text), get the text format.
+- Protobuf validation decodes every metric family and checks metric names,
+  label names and values, like the text parser (UTF-8 names allowed). The
+  length each message announces is checked against the body before
+  anything is decoded, so a malicious upstream cannot make the proxy
+  allocate more than `max_body_bytes`. Error messages only give the
+  position of the failing family, never content.
+- `max_samples` counts a native histogram as one sample, like Prometheus'
+  `sample_limit`; classic buckets still count one each, plus `_sum` and
+  `_count`.
+- Requests asking for different formats do not share reads.
+
+### Shared reads
+
+Requests for a route that arrive while its source is already being read
+(two Prometheus servers in high availability, several scrapers of the same
+target) do not read it again: they get the result of the read in progress,
+validated once and compressed once.
+
+- Only the first read takes a `max_concurrent_requests` slot: the others
+  are neither refused with `503` nor counted in
+  `exporter_proxy_requests_in_flight`. They are counted in
+  `exporter_proxy_requests_shared_total`.
+- Nothing is cached: a request arriving after the read finished reads the
+  source again, so no answer is ever older than the scrape that asked.
+- The read runs with the route timeout only: the request that started it
+  does not cut it short for others with a longer scrape timeout. Every
+  request waits at most its own scrape budget; the read goes on while at
+  least one request waits for it, and is canceled once none does.
+- Every request is counted in `exporter_proxy_requests_total` with its own
+  status; source events (`exporter_proxy_samples`,
+  `exporter_proxy_source_errors_total`, ...) count reads, once per read,
+  except failures, counted for every request that got them.
+
 ### Response validation and limits
 
 Content validation is **mandatory and cannot be disabled**: the proxy only
@@ -126,9 +204,9 @@ page) from being exposed through the proxy.
   parsed with the official Prometheus text parser
   ([`prometheus/common/expfmt`](https://pkg.go.dev/github.com/prometheus/common/expfmt)),
   not with regular expressions.
-- Only the text exposition format (`version=0.0.4`) is accepted. Protobuf and
-  OpenMetrics are not supported, so native histograms are not available
-  through the proxy.
+- The text exposition format (`version=0.0.4`) and the delimited protobuf
+  format are accepted, see "Formats". OpenMetrics is not: it has no parser
+  in `prometheus/common`, and content is never served unvalidated.
 - The parser runs in UTF-8 mode, like Prometheus 3: classic names and quoted
   UTF-8 names (`{"my.metric", zone="a"} 1`) are both accepted.
 - The format requires the last line to end with a newline: a body without
@@ -227,7 +305,66 @@ net/http errors clients can cause, never hides them.
 | `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA, or a server certificate outside its validity dates) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
+| `forbidden` | Authenticated, but neither the basic auth user nor a name of the verified client certificate is in the route's `authorize` list | `403` | `warn` `msg="request forbidden: not in the authorize list of the route"` with `route`, `user` and `remote` |
+| `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
+
+### Route authorization
+
+By default, every client a listener authenticates may read all its routes.
+`authorize` restricts a route to some of them, so that teams can share a
+listener (one port, one certificate) without reading each other's metrics:
+
+```yaml
+routes:
+  - path: /app/metrics
+    upstream: http://127.0.0.1:9000/metrics
+    authorize:
+      users: [app-team]                     # basic_auth_users names
+      client_sans: [prometheus-app.example.com]  # client certificate names
+```
+
+- A request is allowed when its basic authentication user is in `users`,
+  or when its client certificate has a subject alternative name (DNS name,
+  IP address, email address or URI; DNS names compared without case) in
+  `client_sans`. Otherwise it gets `403`.
+- Only identities the listener verified count: the user once its password
+  is checked, the certificate only when the web configuration verifies it
+  against the client CA (`RequireAndVerifyClientCert` or
+  `VerifyClientCertIfGiven`). A self-signed certificate accepted by
+  `RequireAnyClientCert` matches nothing.
+- Authentication comes first: a wrong password still gets `401`.
+- `authorize` must list at least one name. A list that cannot match on its
+  listener (`users` without `basic_auth_users`, `client_sans` without
+  verified client certificates) is reported as a warning at startup, at
+  reload and by `--check`; such a route then refuses every request.
+- A reload applies changed lists without restarting the listener.
+
+### Allowed networks
+
+`allowed_networks` (on a listener or on `metrics`) lists the client
+addresses allowed to connect, as single addresses (`192.0.2.10`) or networks
+in CIDR notation written with their host bits cleared (`10.0.0.0/8`,
+`2001:db8::/32`). A connection from any other address is closed as soon as
+it is accepted: before the TLS handshake and before any request, so it
+costs no TLS or bcrypt work. Without `allowed_networks`, every address may
+connect.
+
+- It adds to the web configuration's authentication, it does not replace
+  it: a client in an allowed network still needs its certificate or
+  password.
+- IPv4 clients of a dual-stack socket (`::ffff:10.1.2.3`) are matched as
+  IPv4 addresses.
+- A reload applies a new list without restarting the listener. The list
+  is also checked on every request: a connection opened before a reload
+  that removed its address gets `403` at its next request and is closed
+  (counted and logged like a refused connection).
+- An empty list is invalid (it would refuse every client), and so is a
+  listener on a Unix socket (`systemd:` socket unit with `ListenStream=`
+  a path) with `allowed_networks`: its clients have no address. Such a
+  listener does not start.
+- With systemd, `IPAddressAllow=` and `IPAddressDeny=` filter for the whole
+  service; `allowed_networks` filters per listener, also in a container.
 
 ### Rate limiting of password checks
 
@@ -339,6 +476,9 @@ Besides the standard `go_*`, `process_*` and
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
+- `exporter_proxy_requests_shared_total{listener,route}`: requests answered
+  with the result of a source read started by a concurrent request of the
+  same route (shared reads, below).
 - `exporter_proxy_web_config_read_error{listener}` (gauge, 0 or 1): 1 while
   the listener's web configuration cannot be applied: the last request
   could not read the file (answered `518`), or the last new TLS connection
@@ -402,6 +542,9 @@ listeners:
     listen: ":9100"
     web_config_file: /etc/exporter_proxy/web-mtls.yml
     max_concurrent_requests: 20   # per-listener override
+    allowed_networks:             # optional: only these clients may connect
+      - 10.0.0.0/8
+      - 192.0.2.10
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics
@@ -444,15 +587,19 @@ together on one log line (each prefixed with its location, e.g.
 | Scope      | Rule |
 |------------|------|
 | `metrics`  | Required, with `listen` and `web_config_file`. |
+| `service_discovery` | Optional, in `metrics`: `host` required (a name or an address, without scheme, port or brackets); `labels` with classic label names, not starting with `__` nor named `exporter_proxy_listener` or `exporter_proxy_route`. |
 | Listeners  | At least one. `name` required, unique, made of letters, digits, `_`, `.`, `-` (it is used as a metric label); `metrics` is reserved for the metrics endpoint. |
 | `listen`   | Required, `host:port` with a port from 1 to 65535, or `systemd:<name>` (socket activation, see below); not shared with another listener or with `metrics`. |
 | `web_config_file` | Required on every listener and on `metrics`. |
 | Routes     | At least one per listener. |
 | `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
 | Source     | Exactly one: `upstream` or `file`. `unix_socket` only together with `upstream`. |
-| `upstream` | `http://` only, with a host, without credentials (`user:password@`) or fragment. |
+| `upstream` | `http://` or `https://`, with a host, without credentials (`user:password@`) or fragment. `unix_socket` requires `http://`. |
+| `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
+| `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
 
 Once valid, the configuration is identified by a hash: the first 48 bits of
@@ -485,6 +632,48 @@ Other built-in defaults:
 | `--log.level`     | `info`                            |
 | `--log.format`    | `logfmt`                          |
 | `--log.access`    | off                               |
+
+### Service discovery
+
+With `metrics.service_discovery`, the metrics endpoint also serves
+`/sd`: the routes of the listeners, in the
+[Prometheus HTTP service discovery](https://prometheus.io/docs/prometheus/latest/http_sd/)
+format, so that Prometheus finds every route without listing them by hand.
+
+```yaml
+metrics:
+  listen: ":9999"
+  web_config_file: /etc/exporter_proxy/web-metrics.yml
+  service_discovery:
+    host: node1.example.com      # how Prometheus reaches this machine
+    labels:                      # optional, added to every target
+      dc: par1
+```
+
+Each route is one target, `host:port` with the port its listener actually
+serves (a `systemd:` TCP socket included), and the labels
+`__metrics_path__` (the route path), `__scheme__` (`https` when the
+listener serves TLS), `exporter_proxy_listener` and
+`exporter_proxy_route`. Listeners on a Unix socket are left out. The list
+follows reloads.
+
+The endpoint is protected like `/metrics` (same web configuration and
+`allowed_networks`). Credentials are not part of service discovery: set
+them in the Prometheus job, and use one job per kind of authentication,
+selected with the `exporter_proxy_listener` label:
+
+```yaml
+scrape_configs:
+  - job_name: exporter_proxy-mtls
+    http_sd_configs:
+      - url: https://node1.example.com:9999/sd
+        tls_config: { ca_file: ca.pem, cert_file: prom.crt, key_file: prom.key }
+    tls_config: { ca_file: ca.pem, cert_file: prom.crt, key_file: prom.key }
+    relabel_configs:
+      - source_labels: [exporter_proxy_listener]
+        regex: node
+        action: keep
+```
 
 ### systemd socket activation
 
@@ -809,6 +998,7 @@ otherwise; warnings do not fail the check:
   then be refused): run `--check` after changing certificates;
 - the rules exporter_proxy adds to exporter-toolkit's (see "Configuration
   reload" and "Refused authentications") are checked too, like at startup;
+- an `authorize` list that cannot match on its listener is a warning;
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times
   would tell users apart);
@@ -860,10 +1050,10 @@ the `listen` value as written):
 | Change | Effect |
 |--------|--------|
 | Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2, `rate_limit` and client certificate settings (`client_auth_type`, client CA content, `client_allowed_sans`) in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
-| Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. |
+| Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. Until then, requests on those connections get the new routes and `allowed_networks` if the new listener has the same web configuration file, TLS and client certificate settings (the previous server's authentication then enforces the same), `503` otherwise. |
 | New `listen` address | Bound at reload. |
 | New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
-| Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. |
+| Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. New requests on connections still open get `503`. |
 
 During a reload, requests already running on the previous handler still
 count against its `max_concurrent_requests`, while new requests use the new

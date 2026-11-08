@@ -7,6 +7,7 @@
 package check
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -55,6 +56,16 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 				c.metricsFile(rwhere, r.File, r.MaxAge)
 			case r.UnixSocket != "":
 				c.socket(rwhere, r.UnixSocket)
+			}
+			if t := r.UpstreamTLS; t != nil {
+				c.upstreamTLS(rwhere, t)
+			}
+			if r.Authorize != nil {
+				if wc, err := webconfig.Read(l.WebConfigFile); err == nil {
+					for _, w := range wc.AuthorizeWarnings(len(r.Authorize.Users), len(r.Authorize.ClientSANs)) {
+						c.add(Warning, rwhere, "%s", w)
+					}
+				}
 			}
 		}
 	}
@@ -113,6 +124,21 @@ func (c *checker) webConfig(where, path string) {
 		c.certificates(where, "client_ca_file", wc.ClientCAFile, true)
 	case wc.ClientCAPEM != "":
 		c.certificatesPEM(where, "client_ca (inline)", []byte(wc.ClientCAPEM), true)
+	}
+}
+
+// upstreamTLS checks the files of an https:// upstream like the proxy
+// loads them, and their certificates' dates.
+func (c *checker) upstreamTLS(where string, t *config.UpstreamTLS) {
+	if t.CAFile != "" {
+		c.certificates(where, "upstream_tls ca_file", t.CAFile, true)
+	}
+	if t.CertFile != "" {
+		if _, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile); err != nil {
+			c.add(Problem, where, "upstream_tls cert_file and key_file: %v", err)
+			return
+		}
+		c.certificates(where, "upstream_tls cert_file", t.CertFile, false)
 	}
 }
 

@@ -216,9 +216,9 @@ func TestValidateRejects(t *testing.T) {
 			wantErr: "unix_socket requires upstream",
 		},
 		{
-			name:    "https upstream",
-			yaml:    withRoutes("      - path: /m\n        upstream: https://h/m\n"),
-			wantErr: `upstream must use http:// (got "https")`,
+			name:    "unsupported upstream scheme",
+			yaml:    withRoutes("      - path: /m\n        upstream: ftp://h/m\n"),
+			wantErr: `upstream must use http:// or https:// (got "ftp")`,
 		},
 		{
 			name:    "upstream without scheme",
@@ -349,7 +349,7 @@ func TestValidateReportsAllProblems(t *testing.T) {
     listen: ":9100"
     routes:
       - path: metrics
-        upstream: https://h/m
+        upstream: ftp://h/m
       - path: /f
         file: relative.prom
 `)
@@ -362,7 +362,7 @@ func TestValidateReportsAllProblems(t *testing.T) {
 	want := []string{
 		"web_config_file is required",
 		"path must start with '/'",
-		"upstream must use http://",
+		"upstream must use http:// or https://",
 		"file must be an absolute path",
 		"max_age is required for file routes",
 	}
