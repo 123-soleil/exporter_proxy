@@ -221,6 +221,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--check` warns when `basic_auth_users` hashes have different bcrypt
   costs (response times would tell users apart), and numbers unparseable
   certificates of a bundle by their position.
+- A reload restarting a listener on its socket no longer drops requests:
+  a connection the previous server had just accepted was closed without
+  a response (`EOF` for the scraper) once its shutdown started. The
+  previous server now stops accepting, lets its new connections send
+  their request, then shuts down.
 - Passwords longer than 72 bytes are remembered by their first 72 bytes,
   the only ones bcrypt uses: suffixes added to a valid long password no
   longer fill the cache of verified credentials.
