@@ -411,7 +411,7 @@ page) from being exposed through the proxy.
   parsing, bodies with more sample lines (text) or series (protobuf) than
   `max_samples` are refused (`too_many_samples`), and so are text lines
   with more than 256 labels and bodies whose lines hold many tiny labels
-  (the sum over lines of labels² above 4 × the body size + 65536,
+  (the sum over lines of labels² above 8 × the body size + 65536,
   `invalid`): the text parser's cost grows with the square of a line's
   labels, and one line with thousands of them would take minutes of CPU
   while holding the listener's slots. Real exporters, which spend tens of
@@ -1409,8 +1409,8 @@ lower a protection (basic authentication removed, a client certificate no
 longer required or no longer verified, client CA or `client_allowed_sans`
 removed, TLS lost; in the main configuration, `client_crl_file` or
 `allowed_networks` removed from a listener, or, on a route that remains,
-`authorize` removed or `metrics_filter` removed, with a `deny` pattern
-removed or changed, or without its `allow` list), including for the previous listener of a port when
+`authorize` removed or `metrics_filter` removed, with a `deny` or `allow`
+pattern removed or changed, or without its `allow` list), including for the previous listener of a port when
 listeners are renamed or swap addresses, is refused as a whole: the error
 names the listeners, the running configuration is kept and
 `exporter_proxy_config_last_reload_successful` is set to 0. A web

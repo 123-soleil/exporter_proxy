@@ -34,15 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name written the same way.
 - Text bodies whose label count makes parsing costly are refused before
   parsing: lines with more than 256 labels, or a sum over lines of
-  labels² above 4 × the body size + 65536. The parser is quadratic in a
+  labels² above 8 × the body size + 65536. The parser is quadratic in a
   line's labels: one line with thousands of them took minutes of CPU
   while holding the listener's slots. With `metrics_filter`, the text is
   parsed once.
 - Upstream answers may carry at most 64 KiB of headers (Go's default,
   10 MiB, let one read allocate about 150 MiB).
 - A reload removing a route's `metrics_filter`, removing or changing one
-  of its `deny` patterns or emptying its `allow` list is refused as
-  weakening.
+  of its `deny` or `allow` patterns or emptying its `allow` list is
+  refused as weakening.
+- Protobuf content with a `__name__` label or duplicate label names is
+  refused, like text.
 
 ## [0.4.0] - 2026-11-08
 

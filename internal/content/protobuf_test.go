@@ -179,3 +179,18 @@ func TestCheapSampleFloodsRefusedBeforeParsing(t *testing.T) {
 		}
 	}
 }
+
+// Like the text parser, protobuf content may not carry __name__ or
+// duplicate label names.
+func TestValidateProtobufLabelRules(t *testing.T) {
+	for name, labels := range map[string][]*dto.LabelPair{
+		"__name__":  {{Name: proto.String("__name__"), Value: proto.String("other")}},
+		"duplicate": {{Name: proto.String("a"), Value: proto.String("1")}, {Name: proto.String("a"), Value: proto.String("2")}},
+	} {
+		body := encodeProto(t, &dto.MetricFamily{Name: proto.String("m"), Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{{Label: labels, Gauge: &dto.Gauge{Value: proto.Float64(1)}}}})
+		if _, err := ValidateFormat(body, 100, true); source.ReasonOf(err) != source.ReasonInvalid {
+			t.Errorf("%s: err = %v, want invalid", name, err)
+		}
+	}
+}

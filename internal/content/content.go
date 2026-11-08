@@ -163,7 +163,7 @@ const MaxLabelsPerLine = 256
 // cost, for a body of size bytes: real lines spend tens of bytes per
 // label, so they stay far below; lines of tiny labels made to burn CPU do
 // not.
-func labelBudget(size int) int { return 4*size + 1<<16 }
+func labelBudget(size int) int { return 8*size + 1<<16 }
 
 // textScan is what scanText found.
 type textScan struct {
@@ -261,10 +261,15 @@ func validFamily(mf *dto.MetricFamily) bool {
 		return false
 	}
 	for _, m := range mf.GetMetric() {
+		seen := make(map[string]bool, len(m.GetLabel()))
 		for _, l := range m.GetLabel() {
-			if !model.UTF8Validation.IsValidLabelName(l.GetName()) || !model.LabelValue(l.GetValue()).IsValid() {
+			name := l.GetName()
+			// Like the text parser: no __name__ label, no duplicate.
+			if name == model.MetricNameLabel || seen[name] ||
+				!model.UTF8Validation.IsValidLabelName(name) || !model.LabelValue(l.GetValue()).IsValid() {
 				return false
 			}
+			seen[name] = true
 		}
 	}
 	return true

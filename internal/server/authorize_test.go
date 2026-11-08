@@ -162,3 +162,30 @@ func TestReloadWeakeningMetricsFilterRefused(t *testing.T) {
 		t.Errorf("longer deny list: %v", err)
 	}
 }
+
+// A reload changing an allow pattern of metrics_filter (a file cut inside
+// it may widen it) is refused; adding allow patterns applies.
+func TestReloadChangingAllowPatternRefused(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	allow := func(patterns ...string) *config.MetricsFilter {
+		f := &config.MetricsFilter{}
+		for _, p := range patterns {
+			f.Allow = append(f.Allow, regexp.MustCompile(config.AnchorPattern(p)))
+		}
+		return f
+	}
+	l.Routes[0].MetricsFilter = allow("node_.*_total")
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	l.Routes[0].MetricsFilter = allow("node_.*")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil {
+		t.Error("cut allow pattern applied")
+	}
+	l.Routes[0].MetricsFilter = allow("node_.*_total", "up")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Errorf("adding an allow pattern: %v", err)
+	}
+}

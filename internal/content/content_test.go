@@ -267,3 +267,19 @@ func TestLabelCostBudget(t *testing.T) {
 		t.Logf("2 MiB of 20-label lines: %s", d)
 	}
 }
+
+// Real long labels (Node Feature Discovery node labels, about 57 bytes
+// each) on many lines stay within the budget.
+func TestNodeFeatureDiscoveryLabelsAccepted(t *testing.T) {
+	var b strings.Builder
+	for node := range 100 {
+		b.WriteString("kube_node_labels{")
+		for i := range MaxLabelsPerLine - 1 {
+			fmt.Fprintf(&b, "label_feature_node_kubernetes_io_cpu_cpuid_flag_%03d=\"true\",", i)
+		}
+		fmt.Fprintf(&b, "node=\"node-%d\"} 1\n", node)
+	}
+	if _, err := Validate([]byte(b.String()), 24000); err != nil {
+		t.Errorf("NFD-labelled nodes refused: %v", err)
+	}
+}

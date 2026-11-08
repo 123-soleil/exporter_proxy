@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -237,14 +238,13 @@ func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, er
 	return cfg, nil
 }
 
-// keepsDenies reports whether next keeps every deny pattern of old, as
-// written.
-func keepsDenies(old, next *config.MetricsFilter) bool {
+// keeps reports whether next holds every pattern of old, as written.
+func keeps(old, next []*regexp.Regexp) bool {
 	kept := map[string]bool{}
-	for _, re := range next.Deny {
+	for _, re := range next {
 		kept[re.String()] = true
 	}
-	for _, re := range old.Deny {
+	for _, re := range old {
 		if !kept[re.String()] {
 			return false
 		}
@@ -453,10 +453,11 @@ func specWeakens(old, next spec) []string {
 			lost = append(lost, fmt.Sprintf("authorize of route %q", path))
 		}
 		if f, g := was.filter, now.filter; f != nil &&
-			(g == nil || !keepsDenies(f, g) || (len(f.Allow) > 0 && len(g.Allow) == 0)) {
-			// Removed, a deny pattern removed or changed (a file cut in
-			// the middle of one keeps the count), or no allow list any
-			// more: families hidden before could be served.
+			(g == nil || !keeps(f.Deny, g.Deny) || (len(f.Allow) > 0 && (len(g.Allow) == 0 || !keeps(f.Allow, g.Allow)))) {
+			// Removed, a deny or allow pattern removed or changed (a file
+			// cut in the middle of one keeps the count and may widen it),
+			// or no allow list any more: families hidden before could be
+			// served. Adding patterns applies.
 			lost = append(lost, fmt.Sprintf("metrics_filter of route %q", path))
 		}
 	}
