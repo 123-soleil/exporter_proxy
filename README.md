@@ -65,7 +65,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
 | Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
-| `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
+| `max_concurrent_requests` reached (listener, or route when set) | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
@@ -254,6 +254,28 @@ format that native histograms need:
   `sample_limit`; classic buckets still count one each, plus `_sum` and
   `_count`.
 - Requests asking for different formats do not share reads.
+
+### Route concurrency limit
+
+`max_concurrent_requests` on a route bounds its source reads within the
+listener's limit: a read takes a slot of the listener and one of the
+route. Concurrent requests of a route already share one read (below), so
+this matters for routes reading several things at once: `forward_params`
+routes (each target is a read) and requests in both formats. Without it,
+slow probes of many targets can take every slot of the listener and get
+its other routes refused with `503`:
+
+```yaml
+routes:
+  - path: /probe
+    upstream: http://127.0.0.1:9115/probe
+    max_concurrent_requests: 4     # leaves the other slots to the other routes
+    forward_params: { ... }
+```
+
+A refused read gives its listener slot back at once; the rejection is
+counted in `exporter_proxy_requests_rejected_total{listener}` and logged
+with `limit_of=route`.
 
 ### Shared reads
 
@@ -725,6 +747,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| route `max_concurrent_requests` | Optional, greater than 0 and at most the listener's resolved `max_concurrent_requests`. |
 | `cache_ttl` | Optional, on `upstream` routes without `forward_params`: greater than 0, at most `1h`. |
 | `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |

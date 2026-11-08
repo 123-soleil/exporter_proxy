@@ -27,3 +27,21 @@ func TestCacheTTL(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteMaxConcurrentRequests(t *testing.T) {
+	cfg, err := Parse([]byte(withRoutes("      - path: /m\n        upstream: http://h/m\n        max_concurrent_requests: 1\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Listeners[0].Routes[0].MaxConcurrentRequests; got != 1 {
+		t.Errorf("MaxConcurrentRequests = %d", got)
+	}
+	for route, want := range map[string]string{
+		"      - path: /m\n        upstream: http://h/m\n        max_concurrent_requests: 0\n": "max_concurrent_requests must be greater than 0",
+		"      - path: /m\n        upstream: http://h/m\n        max_concurrent_requests: 3\n": "is above the listener's (2)",
+	} {
+		if _, err := Parse([]byte(withRoutes(route))); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+	}
+}

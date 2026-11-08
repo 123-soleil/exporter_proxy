@@ -112,6 +112,10 @@ type Route struct {
 	// CacheTTL keeps a validated result that long; 0: no cache.
 	CacheTTL time.Duration
 
+	// MaxConcurrentRequests bounds the source reads of this route, within
+	// the listener's limit; 0: only the listener's limit.
+	MaxConcurrentRequests int
+
 	Limits Limits
 }
 
@@ -206,9 +210,10 @@ type fileRoute struct {
 	MaxAge     *time.Duration `yaml:"max_age"`
 	Authorize  *fileAuthorize `yaml:"authorize"`
 	// UpstreamTLS is decoded as is: no inheritance.
-	UpstreamTLS   *fileUpstreamTLS            `yaml:"upstream_tls"`
-	ForwardParams map[string]fileForwardParam `yaml:"forward_params"`
-	CacheTTL      *time.Duration              `yaml:"cache_ttl"`
+	UpstreamTLS           *fileUpstreamTLS            `yaml:"upstream_tls"`
+	ForwardParams         map[string]fileForwardParam `yaml:"forward_params"`
+	CacheTTL              *time.Duration              `yaml:"cache_ttl"`
+	MaxConcurrentRequests *int                        `yaml:"max_concurrent_requests"`
 }
 
 type fileForwardParam struct {
@@ -303,15 +308,16 @@ func resolve(fc *fileConfig) *Config {
 		}
 		for _, fr := range fl.Routes {
 			l.Routes = append(l.Routes, Route{
-				Path:          fr.Path,
-				Upstream:      fr.Upstream,
-				UpstreamTLS:   upstreamTLSOf(fr.UpstreamTLS),
-				UnixSocket:    fr.UnixSocket,
-				File:          fr.File,
-				MaxAge:        valueOr(fr.MaxAge, 0),
-				Authorize:     authorizeOf(fr.Authorize),
-				ForwardParams: forwardParamsOf(fr.ForwardParams),
-				CacheTTL:      valueOr(fr.CacheTTL, 0),
+				Path:                  fr.Path,
+				Upstream:              fr.Upstream,
+				UpstreamTLS:           upstreamTLSOf(fr.UpstreamTLS),
+				UnixSocket:            fr.UnixSocket,
+				File:                  fr.File,
+				MaxAge:                valueOr(fr.MaxAge, 0),
+				Authorize:             authorizeOf(fr.Authorize),
+				ForwardParams:         forwardParamsOf(fr.ForwardParams),
+				CacheTTL:              valueOr(fr.CacheTTL, 0),
+				MaxConcurrentRequests: valueOr(fr.MaxConcurrentRequests, 0),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),

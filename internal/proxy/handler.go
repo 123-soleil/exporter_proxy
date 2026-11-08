@@ -103,6 +103,9 @@ type route struct {
 	authz      *authorization                 // nil: every authenticated client
 	params     map[string]config.ForwardParam // nil: the query string is ignored
 	cacheTTL   time.Duration                  // 0: no cache
+	// slots bounds the reads of this route (max_concurrent_requests of
+	// the route), within the listener's; nil: no route limit.
+	slots chan struct{}
 }
 
 // Handler serves the routes of one listener.
@@ -147,7 +150,8 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
-			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL})
+			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL,
+			slots: routeSlots(r.MaxConcurrentRequests)})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -258,10 +262,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
 	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query}, budget, hasBudget)
-	if errors.Is(err, errNoSlot) {
+	if errors.Is(err, errNoSlot) || errors.Is(err, errNoRouteSlot) {
 		h.rec.RequestRejected(h.listener)
+		limit, scope := cap(h.slots), "listener"
+		if errors.Is(err, errNoRouteSlot) {
+			limit, scope = cap(rt.slots), "route"
+		}
 		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
-			"route", rt.path, "max_concurrent_requests", cap(h.slots))
+			"route", rt.path, "max_concurrent_requests", limit, "limit_of", scope)
 		http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
@@ -382,8 +390,20 @@ func scrapeBudget(h http.Header) (time.Duration, bool) {
 	return max(budget, minScrapeBudget), true
 }
 
-// errNoSlot is returned by read when max_concurrent_requests is reached.
-var errNoSlot = errors.New("max_concurrent_requests reached")
+// errNoSlot and errNoRouteSlot are returned by read when the
+// max_concurrent_requests of the listener or of the route is reached.
+var (
+	errNoSlot      = errors.New("max_concurrent_requests reached")
+	errNoRouteSlot = errors.New("max_concurrent_requests of the route reached")
+)
+
+// routeSlots returns the slots of a route limit, nil without one.
+func routeSlots(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
 
 // sharedRead is one read of a route's source, whose result every request
 // for that route arriving meanwhile gets.
@@ -440,12 +460,21 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		h.mu.Unlock()
 		h.rec.RequestShared(h.listener, rt.path)
 	} else {
-		// Never queue: a full listener answers immediately.
+		// Never queue: a full listener or route answers immediately.
 		select {
 		case h.slots <- struct{}{}:
 		default:
 			h.mu.Unlock()
 			return nil, errNoSlot
+		}
+		if rt.slots != nil {
+			select {
+			case rt.slots <- struct{}{}:
+			default:
+				<-h.slots
+				h.mu.Unlock()
+				return nil, errNoRouteSlot
+			}
 		}
 		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		rd = &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel}
@@ -471,8 +500,11 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 				h.cache[key] = rd
 			}
 			h.mu.Unlock()
-			// The slot is free before anyone gets the result: a scraper's
-			// next request finds it available.
+			// The slots are free before anyone gets the result: a
+			// scraper's next request finds them available.
+			if rt.slots != nil {
+				<-rt.slots
+			}
 			<-h.slots
 			h.rec.InFlight(h.listener, -1)
 			close(rd.done)

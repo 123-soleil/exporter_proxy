@@ -93,6 +93,8 @@ func validate(fc *fileConfig) error {
 		if len(l.Routes) == 0 {
 			v.addf(where, "at least one route is required")
 		}
+		// The listener's limit, as resolved: a route cannot exceed it.
+		listenerMax := valueOr(l.MaxConcurrentRequests, valueOr(fc.Defaults.MaxConcurrentRequests, DefaultMaxConcurrentRequests))
 		paths := map[string]bool{}
 		for j, r := range l.Routes {
 			rwhere := fmt.Sprintf("%s routes[%d]", where, j)
@@ -100,6 +102,10 @@ func validate(fc *fileConfig) error {
 				rwhere = fmt.Sprintf("%s route %q", where, r.Path)
 			}
 			v.checkRoute(rwhere, r)
+			v.checkPositiveInt(rwhere, "max_concurrent_requests", r.MaxConcurrentRequests)
+			if n := r.MaxConcurrentRequests; n != nil && *n > listenerMax {
+				v.addf(rwhere, "max_concurrent_requests (%d) is above the listener's (%d): it would have no effect", *n, listenerMax)
+			}
 			if r.Path != "" && paths[r.Path] {
 				v.addf(rwhere, "duplicate path in this listener")
 			}
