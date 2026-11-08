@@ -7,14 +7,19 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/version"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 )
 
-// acceptHeader requests the Prometheus text exposition format, the only
-// format the proxy validates and serves.
+// acceptHeader requests the Prometheus text exposition format.
 const acceptHeader = "text/plain;version=0.0.4;q=1,*/*;q=0.1"
+
+// acceptProtobuf requests the delimited protobuf format first (native
+// histograms), the text format as fallback. Both are validated.
+const acceptProtobuf = "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;escaping=allow-utf-8;q=1," +
+	"text/plain;version=0.0.4;q=0.5,*/*;q=0.1"
 
 // httpSource fetches an HTTP exporter over TCP or over a Unix socket.
 type httpSource struct {
@@ -66,7 +71,7 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 // CloseIdleConnections closes the idle connections to the upstream.
 func (s *httpSource) CloseIdleConnections() { s.client.CloseIdleConnections() }
 
-func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
+func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	limit := timeLimit(parent, time.Now(), s.timeout)
 	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
@@ -77,7 +82,11 @@ func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
 	}
 	// Only these headers are sent: nothing from the client request
 	// (Authorization in particular) is forwarded.
-	req.Header.Set("Accept", acceptHeader)
+	accept := acceptHeader
+	if r.Protobuf {
+		accept = acceptProtobuf
+	}
+	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", version.ComponentUserAgent("exporter_proxy"))
 
 	resp, err := s.client.Do(req)
@@ -100,5 +109,7 @@ func (s *httpSource) Fetch(parent context.Context) (*Result, error) {
 	if err != nil {
 		return nil, classify(ctx, fmt.Errorf("read upstream body: %w", err), limit)
 	}
-	return &Result{Body: body}, nil
+	// Anything but delimited protobuf is validated as text.
+	proto := r.Protobuf && expfmt.ResponseFormat(resp.Header).FormatType() == expfmt.TypeProtoDelim
+	return &Result{Body: body, Protobuf: proto}, nil
 }

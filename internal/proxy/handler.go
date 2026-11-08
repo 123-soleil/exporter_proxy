@@ -16,6 +16,8 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"github.com/prometheus/common/expfmt"
+
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/content"
 	"github.com/123-soleil/exporter_proxy/internal/source"
@@ -23,6 +25,12 @@ import (
 
 // contentType is the media type of the validated text exposition format.
 const contentType = "text/plain; version=0.0.4; charset=utf-8"
+
+// servedFormats are the formats the proxy validates, for negotiation.
+var servedFormats = []expfmt.Format{expfmt.NewFormat(expfmt.TypeProtoDelim), expfmt.NewFormat(expfmt.TypeTextPlain)}
+
+// protobufContentType is the media type of the delimited protobuf format.
+const protobufContentType = "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited"
 
 // Recorder receives the events used for the proxy's own metrics. Route
 // labels are configured paths only; unmatched requests use route "".
@@ -216,7 +224,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// route timeout, which the source still applies.
 	budget, hasBudget := scrapeBudget(req.Header)
 
-	rd, err := h.read(req.Context(), rt, budget, hasBudget)
+	// The delimited protobuf format (native histograms) when the scraper
+	// prefers it; files and upstreams without it answer in text.
+	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto}, budget, hasBudget)
 	if errors.Is(err, errNoSlot) {
 		h.rec.RequestRejected(h.listener)
 		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
@@ -251,8 +262,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	body := rd.body
 	hdr := rw.Header()
 	hdr.Set("Content-Type", contentType)
-	// The response depends on Accept-Encoding: caches must key on it.
-	hdr.Set("Vary", "Accept-Encoding")
+	if rd.protobuf {
+		hdr.Set("Content-Type", protobufContentType)
+	}
+	// The response depends on these request headers: caches must key on
+	// them.
+	hdr.Set("Vary", "Accept, Accept-Encoding")
 	if len(body) >= gzipMinSize && acceptsGzip(req.Header.Get("Accept-Encoding")) {
 		body = rd.gzipped()
 		hdr.Set("Content-Encoding", "gzip")
@@ -321,9 +336,10 @@ var errNoSlot = errors.New("max_concurrent_requests reached")
 // sharedRead is one read of a route's source, whose result every request
 // for that route arriving meanwhile gets.
 type sharedRead struct {
-	done chan struct{} // closed once body and err are set
-	body []byte
-	err  error
+	done     chan struct{} // closed once body, protobuf and err are set
+	body     []byte
+	protobuf bool // body is in the delimited protobuf format
+	err      error
 
 	gzipOnce sync.Once
 	gzip     []byte
@@ -346,8 +362,12 @@ func (r *sharedRead) gzipped() []byte {
 // read takes a concurrency slot. The read runs on its own, as long as one
 // request waits for it: it is canceled once none does, and every request
 // stops waiting when its client leaves or its scrape budget is spent.
-func (h *Handler) read(ctx context.Context, rt route, budget time.Duration, hasBudget bool) (*sharedRead, error) {
+func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budget time.Duration, hasBudget bool) (*sharedRead, error) {
+	// Requests asking for different formats do not share reads.
 	key := rt.path
+	if sreq.Protobuf {
+		key += "\x00protobuf"
+	}
 	h.mu.Lock()
 	rd, ok := h.reads[key]
 	if ok {
@@ -374,7 +394,7 @@ func (h *Handler) read(ctx context.Context, rt route, budget time.Duration, hasB
 		// waits.
 		go func() {
 			defer cancel()
-			rd.body, rd.err = h.safeFetch(fetchCtx, rt)
+			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
 			h.mu.Lock()
 			if h.reads[key] == rd {
 				delete(h.reads, key)
@@ -416,15 +436,15 @@ func (h *Handler) read(ctx context.Context, rt route, budget time.Duration, hasB
 // panic (a bug in a source or a parser fed by an upstream) would stop the
 // whole process instead of failing one request: it becomes a source
 // error.
-func (h *Handler) safeFetch(ctx context.Context, rt route) (body []byte, err error) {
+func (h *Handler) safeFetch(ctx context.Context, rt route, req source.Request) (body []byte, protobuf bool, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			h.logger.Error("panic while reading the source", "route", rt.path, "panic", fmt.Sprint(p),
 				"stack", string(debug.Stack()))
-			body, err = nil, source.NewError(source.ReasonUnavailable, "internal error while reading the source")
+			body, protobuf, err = nil, false, source.NewError(source.ReasonUnavailable, "internal error while reading the source")
 		}
 	}()
-	return h.fetch(ctx, rt)
+	return h.fetch(ctx, rt, req)
 }
 
 // leave records that a request no longer waits for rd: the last one
@@ -443,22 +463,22 @@ func (h *Handler) leave(key string, rd *sharedRead) {
 }
 
 // fetch reads the source and validates its content.
-func (h *Handler) fetch(ctx context.Context, rt route) ([]byte, error) {
-	res, err := rt.src.Fetch(ctx)
+func (h *Handler) fetch(ctx context.Context, rt route, req source.Request) (body []byte, protobuf bool, err error) {
+	res, err := rt.src.Fetch(ctx, req)
 	if res != nil && !res.ModTime.IsZero() {
 		h.rec.FileModified(h.listener, rt.path, res.ModTime)
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	h.rec.SourceRead(h.listener, rt.path, len(res.Body))
 
-	parsed, err := content.Validate(res.Body, rt.maxSamples)
+	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
 	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return res.Body, nil
+	return res.Body, res.Protobuf, nil
 }
 
 // statusWriter records the status code and body size of a response.

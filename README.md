@@ -59,7 +59,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 
 | Situation | Status | Notes |
 |-----------|--------|-------|
-| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
+| Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
@@ -98,8 +98,9 @@ Each route has exactly one source:
   (`reason="stale"`), so a writer that stopped running cannot go unnoticed
   behind old values. Choose it as a few times the writer's period (for
   example `max_age: 15m` for a file written every 5 minutes).
-- Upstream requests are sent with `Accept: text/plain;version=0.0.4` and a
-  `User-Agent: exporter_proxy/<version>`; no client header is forwarded
+- Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
+  the delimited protobuf format first, when the scraper prefers it: see
+  "Formats") and a `User-Agent: exporter_proxy/<version>`; no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
@@ -116,6 +117,30 @@ Each route has exactly one source:
   data.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
+
+### Formats
+
+The proxy serves the text exposition format, and the delimited protobuf
+format that native histograms need:
+
+- When the scraper prefers protobuf in its `Accept` header (Prometheus does
+  when native histograms are enabled, `scrape_protocols` starting with
+  `PrometheusProto`), an HTTP upstream is asked for protobuf first, then
+  text. An upstream answering protobuf (its `Content-Type`) is decoded and
+  validated as protobuf, and served with `Content-Type:
+  application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily;
+  encoding=delimited`; anything else is validated and served as text.
+- Other scrapers, and `file` routes (always text), get the text format.
+- Protobuf validation decodes every metric family and checks metric names,
+  label names and values, like the text parser (UTF-8 names allowed). The
+  length each message announces is checked against the body before
+  anything is decoded, so a malicious upstream cannot make the proxy
+  allocate more than `max_body_bytes`. Error messages only give the
+  position of the failing family, never content.
+- `max_samples` counts a native histogram as one sample, like Prometheus'
+  `sample_limit`; classic buckets still count one each, plus `_sum` and
+  `_count`.
+- Requests asking for different formats do not share reads.
 
 ### Shared reads
 
@@ -150,9 +175,9 @@ page) from being exposed through the proxy.
   parsed with the official Prometheus text parser
   ([`prometheus/common/expfmt`](https://pkg.go.dev/github.com/prometheus/common/expfmt)),
   not with regular expressions.
-- Only the text exposition format (`version=0.0.4`) is accepted. Protobuf and
-  OpenMetrics are not supported, so native histograms are not available
-  through the proxy.
+- The text exposition format (`version=0.0.4`) and the delimited protobuf
+  format are accepted, see "Formats". OpenMetrics is not: it has no parser
+  in `prometheus/common`, and content is never served unvalidated.
 - The parser runs in UTF-8 mode, like Prometheus 3: classic names and quoted
   UTF-8 names (`{"my.metric", zone="a"} 1`) are both accepted.
 - The format requires the last line to end with a newline: a body without

@@ -27,7 +27,9 @@ type fakeSource struct {
 	err error
 }
 
-func (f fakeSource) Fetch(context.Context) (*source.Result, error) { return f.res, f.err }
+func (f fakeSource) Fetch(context.Context, source.Request) (*source.Result, error) {
+	return f.res, f.err
+}
 
 // blockingSource waits until released, to hold concurrency slots.
 type blockingSource struct {
@@ -35,7 +37,7 @@ type blockingSource struct {
 	release chan struct{}
 }
 
-func (b *blockingSource) Fetch(ctx context.Context) (*source.Result, error) {
+func (b *blockingSource) Fetch(ctx context.Context, _ source.Request) (*source.Result, error) {
 	b.started <- struct{}{}
 	select {
 	case <-b.release:
@@ -497,7 +499,7 @@ type deadlineSource struct {
 	has      bool
 }
 
-func (d *deadlineSource) Fetch(ctx context.Context) (*source.Result, error) {
+func (d *deadlineSource) Fetch(ctx context.Context, _ source.Request) (*source.Result, error) {
 	d.deadline, d.has = ctx.Deadline()
 	return &source.Result{Body: []byte(metrics)}, nil
 }

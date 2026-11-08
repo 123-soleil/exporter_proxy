@@ -26,7 +26,7 @@ func newCountingSource() *countingSource {
 	return &countingSource{started: make(chan struct{}, 10), release: make(chan struct{})}
 }
 
-func (c *countingSource) Fetch(ctx context.Context) (*source.Result, error) {
+func (c *countingSource) Fetch(ctx context.Context, _ source.Request) (*source.Result, error) {
 	c.reads.Add(1)
 	c.started <- struct{}{}
 	select {
@@ -222,7 +222,7 @@ func TestSharedReadOutlivesTheStarterBudget(t *testing.T) {
 // panicSource panics while reading.
 type panicSource struct{}
 
-func (panicSource) Fetch(context.Context) (*source.Result, error) { panic("boom") }
+func (panicSource) Fetch(context.Context, source.Request) (*source.Result, error) { panic("boom") }
 
 // A panic while reading fails the request instead of the process.
 func TestSharedReadRecoversFromPanics(t *testing.T) {

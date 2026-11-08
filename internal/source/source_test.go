@@ -156,7 +156,7 @@ func TestHTTPSource(t *testing.T) {
 			}
 			s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics", Limits: limits(timeout, maxBody)})
 
-			res, err := s.Fetch(context.Background())
+			res, err := s.Fetch(context.Background(), Request{})
 			checkErr(t, err, tt.want)
 			if tt.want == "" && string(res.Body) != tt.wantBody {
 				t.Errorf("body = %q, want %q", res.Body, tt.wantBody)
@@ -181,7 +181,7 @@ func TestHTTPSourceRequest(t *testing.T) {
 
 	s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics?collect=a", Limits: limits(2*time.Second, 1<<20)})
 	ctx := context.Background()
-	if _, err := s.Fetch(ctx); err != nil {
+	if _, err := s.Fetch(ctx, Request{}); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestHTTPSourceRedirectTargetNotHit(t *testing.T) {
 	defer srv.Close()
 
 	s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics", Limits: limits(time.Second, 1<<20)})
-	_, err := s.Fetch(context.Background())
+	_, err := s.Fetch(context.Background(), Request{})
 	checkErr(t, err, ReasonUnavailable)
 	if targetHits.Load() != 0 {
 		t.Error("redirect was followed")
@@ -232,7 +232,7 @@ func TestHTTPSourceConnectionRefused(t *testing.T) {
 	srv.Close()
 
 	s := mustNew(t, config.Route{Upstream: url + "/metrics", Limits: limits(time.Second, 1<<20)})
-	_, err := s.Fetch(context.Background())
+	_, err := s.Fetch(context.Background(), Request{})
 	checkErr(t, err, ReasonUnavailable)
 }
 
@@ -268,7 +268,7 @@ func TestUnixSocketSource(t *testing.T) {
 		UnixSocket: sock,
 		Limits:     limits(2*time.Second, 1<<20),
 	})
-	res, err := s.Fetch(context.Background())
+	res, err := s.Fetch(context.Background(), Request{})
 	checkErr(t, err, "")
 	if string(res.Body) != metrics {
 		t.Errorf("body = %q", res.Body)
@@ -282,7 +282,7 @@ func TestUnixSocketSource(t *testing.T) {
 		UnixSocket: filepath.Join(filepath.Dir(sock), "missing.sock"),
 		Limits:     limits(time.Second, 1<<20),
 	})
-	_, err = missing.Fetch(context.Background())
+	_, err = missing.Fetch(context.Background(), Request{})
 	checkErr(t, err, ReasonUnavailable)
 }
 
@@ -336,7 +336,7 @@ func TestFileSource(t *testing.T) {
 			var err error
 			go func() {
 				defer close(done)
-				res, err = s.Fetch(context.Background())
+				res, err = s.Fetch(context.Background(), Request{})
 			}()
 			select {
 			case <-done:
@@ -375,7 +375,7 @@ func TestFileSourceTimeout(t *testing.T) {
 		}
 		return base.Add(5 * time.Second)
 	}
-	_, err := s.Fetch(context.Background())
+	_, err := s.Fetch(context.Background(), Request{})
 	checkErr(t, err, ReasonTimeout)
 }
 
@@ -433,7 +433,7 @@ func TestFileSourceFutureModTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = src.Fetch(context.Background())
+	_, err = src.Fetch(context.Background(), Request{})
 	if ReasonOf(err) != ReasonStale || !strings.Contains(err.Error(), "in the future") {
 		t.Errorf("err = %v, want stale, modified in the future", err)
 	}
@@ -443,7 +443,7 @@ func TestFileSourceFutureModTime(t *testing.T) {
 	if err := os.Chtimes(p, soon, soon); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := src.Fetch(context.Background()); err != nil {
+	if _, err := src.Fetch(context.Background(), Request{}); err != nil {
 		t.Errorf("small skew rejected: %v", err)
 	}
 }
@@ -458,5 +458,47 @@ func TestTimeLimit(t *testing.T) {
 	defer cancel()
 	if got := timeLimit(ctx, start, 10*time.Second); got != "4.5s (left by the scraper's timeout, route timeout 10s)" {
 		t.Errorf("with an earlier deadline: %q", got)
+	}
+}
+
+// A protobuf request asks the upstream for protobuf first; the answer's
+// format comes from its Content-Type.
+func TestHTTPSourceProtobuf(t *testing.T) {
+	const protoType = "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited"
+	tests := []struct {
+		name        string
+		protobuf    bool
+		contentType string
+		wantAccept  string
+		wantProto   bool
+	}{
+		{"text requested", false, protoType, "text/plain;version=0.0.4;q=1", false},
+		{"protobuf answered", true, protoType, "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited", true},
+		{"text answered", true, "text/plain; version=0.0.4", "application/vnd.google.protobuf", false},
+		{"no content type", true, "", "application/vnd.google.protobuf", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var accept string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				accept = r.Header.Get("Accept")
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				_, _ = fmt.Fprint(w, metrics)
+			}))
+			defer srv.Close()
+			s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics", Limits: limits(2*time.Second, 1<<20)})
+			res, err := s.Fetch(context.Background(), Request{Protobuf: tt.protobuf})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(accept, tt.wantAccept) {
+				t.Errorf("Accept = %q, want prefix %q", accept, tt.wantAccept)
+			}
+			if res.Protobuf != tt.wantProto {
+				t.Errorf("Protobuf = %v, want %v", res.Protobuf, tt.wantProto)
+			}
+		})
 	}
 }

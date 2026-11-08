@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `403`, counted as `forbidden` in `exporter_proxy_auth_failures_total`.
   Only verified identities count (checked password, client certificate
   verified against the client CA).
+- Delimited protobuf format, so native histograms pass through the proxy:
+  when the scraper prefers it, HTTP upstreams are asked for protobuf first;
+  protobuf answers are decoded and validated (names, label values,
+  `max_samples` counting a native histogram as one sample) and served as
+  protobuf. Text stays the default and the only format of file routes.
 
 ## [0.1.0] - 2026-11-08
 

@@ -80,8 +80,8 @@ func TestHandlerCompressesWithGzip(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("code %d", w.Code)
 			}
-			if got := w.Header().Get("Vary"); got != "Accept-Encoding" {
-				t.Errorf("Vary = %q, want Accept-Encoding", got)
+			if got := w.Header().Get("Vary"); got != "Accept, Accept-Encoding" {
+				t.Errorf("Vary = %q, want Accept, Accept-Encoding", got)
 			}
 			gzipped := w.Header().Get("Content-Encoding") == "gzip"
 			if gzipped != tt.wantGzip {

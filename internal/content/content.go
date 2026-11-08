@@ -17,6 +17,8 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/123-soleil/exporter_proxy/internal/source"
 )
@@ -35,6 +37,15 @@ type Result struct {
 // Failures are *source.Error with ReasonInvalid or ReasonTooManySamples. The
 // Result is filled even on error, as far as parsing went.
 func Validate(body []byte, maxSamples int) (Result, error) {
+	return ValidateFormat(body, maxSamples, false)
+}
+
+// ValidateFormat is Validate for body in the delimited protobuf format
+// when protobuf is set, in the text format otherwise.
+func ValidateFormat(body []byte, maxSamples int, protobuf bool) (Result, error) {
+	if protobuf {
+		return validateProtobuf(body, maxSamples)
+	}
 	start := time.Now()
 	// UTF-8 validation accepts classic names and quoted UTF-8 names, like
 	// Prometheus 3. A parser is not safe for concurrent use: one per call.
@@ -53,21 +64,95 @@ func Validate(body []byte, maxSamples int) (Result, error) {
 	return res, nil
 }
 
-func countSamples(families map[string]*dto.MetricFamily) int {
-	n := 0
-	for _, f := range families {
-		for _, m := range f.GetMetric() {
-			switch {
-			case m.GetHistogram() != nil:
-				n += len(m.GetHistogram().GetBucket()) + 2 // + _sum and _count
-			case m.GetSummary() != nil:
-				n += len(m.GetSummary().GetQuantile()) + 2 // + _sum and _count
-			default:
-				n++
+// validateProtobuf decodes every metric family of a delimited protobuf
+// body (each message prefixed with its length as a varint), and checks
+// metric names, label names and label values like the text parser.
+//
+// The body is cut by hand rather than with expfmt's decoder, which
+// allocates whatever length a prefix announces: a few bytes from a
+// malicious upstream would make it allocate gigabytes, or panic. Here a
+// length larger than what is left of the body is invalid before anything
+// is allocated.
+func validateProtobuf(body []byte, maxSamples int) (Result, error) {
+	start := time.Now()
+	n, families := 0, 0
+	invalid := func() (Result, error) {
+		// Only the position: names or values could be sensitive.
+		return Result{Samples: n, Duration: time.Since(start)},
+			source.NewError(source.ReasonInvalid, "not in delimited protobuf format: metric family %d", families+1)
+	}
+	for rest := body; len(rest) > 0; {
+		size, prefix := protowire.ConsumeVarint(rest)
+		if prefix < 0 || size > uint64(len(rest)-prefix) {
+			return invalid()
+		}
+		msg := rest[prefix : prefix+int(size)]
+		rest = rest[prefix+int(size):]
+		var mf dto.MetricFamily
+		if err := proto.Unmarshal(msg, &mf); err != nil || !validFamily(&mf) {
+			return invalid()
+		}
+		families++
+		n += familySamples(&mf)
+	}
+	res := Result{Samples: n, Duration: time.Since(start)}
+	if n > maxSamples {
+		return res, source.NewError(source.ReasonTooManySamples, "%d samples exceed max_samples (%d)", n, maxSamples)
+	}
+	return res, nil
+}
+
+// validFamily checks the names and label values of a decoded family, like
+// the text parser in UTF-8 mode.
+func validFamily(mf *dto.MetricFamily) bool {
+	if !model.UTF8Validation.IsValidMetricName(mf.GetName()) {
+		return false
+	}
+	for _, m := range mf.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if !model.UTF8Validation.IsValidLabelName(l.GetName()) || !model.LabelValue(l.GetValue()).IsValid() {
+				return false
 			}
 		}
 	}
+	return true
+}
+
+func countSamples(families map[string]*dto.MetricFamily) int {
+	n := 0
+	for _, f := range families {
+		n += familySamples(f)
+	}
 	return n
+}
+
+// familySamples counts samples like Prometheus' sample_limit: a native
+// histogram counts as one sample, classic buckets and quantiles one each,
+// plus _sum and _count.
+func familySamples(f *dto.MetricFamily) int {
+	n := 0
+	for _, m := range f.GetMetric() {
+		switch h := m.GetHistogram(); {
+		case h != nil:
+			if len(h.GetBucket()) > 0 || !isNative(h) {
+				n += len(h.GetBucket()) + 2 // + _sum and _count
+			}
+			if isNative(h) {
+				n++
+			}
+		case m.GetSummary() != nil:
+			n += len(m.GetSummary().GetQuantile()) + 2 // + _sum and _count
+		default:
+			n++
+		}
+	}
+	return n
+}
+
+// isNative reports whether a histogram carries a native histogram.
+func isNative(h *dto.Histogram) bool {
+	return h.Schema != nil || h.ZeroThreshold != nil || len(h.GetPositiveSpan()) > 0 ||
+		len(h.GetNegativeSpan()) > 0 || h.ZeroCount != nil || h.ZeroCountFloat != nil
 }
 
 // quoted matches quoted values in parser messages.
