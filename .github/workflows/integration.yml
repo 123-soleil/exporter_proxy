@@ -1,0 +1,41 @@
+name: Integration
+
+# The binary under a real systemd (the Ubuntu runner runs systemd as PID 1):
+# installation from deploy/, hardened unit, socket activation on port 443,
+# TLS and basic auth, reload, stop. See test/systemd/run.sh.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  systemd:
+    name: Integration (systemd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Build the release binary
+        run: make build
+
+      - name: Install test tools (htpasswd)
+        run: sudo apt-get install -y --no-install-recommends apache2-utils
+
+      - name: Run the systemd integration test
+        run: sudo test/systemd/run.sh bin/exporter_proxy

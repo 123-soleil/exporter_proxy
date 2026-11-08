@@ -1,0 +1,40 @@
+# exporter_proxy with Docker Compose (see "Docker" in README.md).
+#
+# Host network: the proxy reaches the exporters listening on 127.0.0.1 of
+# the host, as with the systemd unit, and binds the listen addresses of
+# config.yml on the host. For exporters running as containers, see the
+# README instead.
+#
+#   docker compose up -d
+#   docker compose kill -s HUP exporter_proxy   # reload the configuration
+
+services:
+  exporter_proxy:
+    image: exporter_proxy:CHANGE_ME          # docker build -t exporter_proxy:<version> .
+    container_name: exporter_proxy
+    restart: unless-stopped
+    network_mode: host
+    # uid 65532 of the image; the group must be able to read the
+    # configuration (files root:<gid>, mode 0640).
+    user: "65532:CHANGE_ME_GID"
+    volumes:
+      # The directory, not single files: a file replaced atomically
+      # (editors, configuration management) would otherwise stay the old
+      # one inside the container, and reloads would not see the change.
+      - /etc/exporter_proxy:/etc/exporter_proxy:ro
+      # File routes and Unix sockets of upstreams, read in place.
+      # - /var/lib/CHANGE_ME:/var/lib/CHANGE_ME:ro
+      # - /run/CHANGE_ME:/run/CHANGE_ME
+    # Hardening: same spirit as the systemd unit.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # exporter_proxy waits up to 15 s for in-flight requests on SIGTERM;
+    # Docker's default is 10 s before SIGKILL.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

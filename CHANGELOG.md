@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SECURITY.md`: private vulnerability reporting through GitHub.
+- Release archives come with a build provenance attestation
+  (`gh attestation verify`).
+- CodeQL analysis on pull requests, on `main` and every week.
+- Integration test under a real systemd (`test/systemd/run.sh`): hardened
+  unit, socket activation, TLS and basic auth, reload, stop.
+- `Dockerfile`: static binary on distroless `static-debian13:nonroot`
+  (uid 65532), cross-compiled for amd64, arm64 and arm/v7, base images
+  pinned by digest; `deploy/docker/compose.yml.exemple` and a "Docker"
+  section in the README; CI builds the image and runs it as documented.
+
 ## [0.1.0] - 2026-11-08
 
 ### Added
