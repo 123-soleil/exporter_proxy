@@ -130,6 +130,28 @@ func (v *validator) checkRoute(where string, r fileRoute) {
 	if hasUpstream {
 		v.checkUpstream(where, r.Upstream)
 	}
+	https := strings.HasPrefix(r.Upstream, "https://")
+	if https && r.UnixSocket != "" {
+		v.addf(where, "unix_socket requires an http:// upstream")
+	}
+	if t := r.UpstreamTLS; t != nil {
+		if !https {
+			v.addf(where, "upstream_tls requires an https:// upstream")
+		}
+		if (t.CertFile == "") != (t.KeyFile == "") {
+			v.addf(where, "upstream_tls: cert_file and key_file go together")
+		}
+		for _, f := range []struct{ key, path string }{
+			{"upstream_tls ca_file", t.CAFile}, {"upstream_tls cert_file", t.CertFile}, {"upstream_tls key_file", t.KeyFile},
+		} {
+			if f.path != "" {
+				v.checkAbsPath(where, f.key, f.path)
+			}
+		}
+		if *t == (fileUpstreamTLS{}) {
+			v.addf(where, "upstream_tls is empty: remove it (the system roots verify the upstream) or set its fields")
+		}
+	}
 	if r.UnixSocket != "" {
 		v.checkAbsPath(where, "unix_socket", r.UnixSocket)
 	}
@@ -180,8 +202,8 @@ func (v *validator) checkUpstream(where, raw string) {
 		return
 	}
 	switch {
-	case u.Scheme != "http":
-		v.addf(where, "upstream must use http:// (got %q)", u.Scheme)
+	case u.Scheme != "http" && u.Scheme != "https":
+		v.addf(where, "upstream must use http:// or https:// (got %q)", u.Scheme)
 	case u.Host == "":
 		v.addf(where, "upstream must have a host")
 	case u.User != nil:

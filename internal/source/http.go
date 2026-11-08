@@ -2,9 +2,13 @@ package source
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/prometheus/common/expfmt"
@@ -43,6 +47,14 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 		// Compression stays enabled: the transport decompresses gzip
 		// transparently and readLimited bounds the decompressed size.
 	}
+	if strings.HasPrefix(r.Upstream, "https://") {
+		tlsCfg, err := upstreamTLSConfig(r.UpstreamTLS)
+		if err != nil {
+			return nil, err
+		}
+		transport.TLSClientConfig = tlsCfg
+		transport.TLSHandshakeTimeout = r.Limits.Timeout
+	}
 	if r.UnixSocket != "" {
 		socket := r.UnixSocket
 		// The URL host is ignored: every connection goes to the socket,
@@ -66,6 +78,36 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 		maxBodyBytes: r.Limits.MaxBodyBytes,
 		client:       client,
 	}, nil
+}
+
+// upstreamTLSConfig builds the TLS settings of an https:// upstream. Its
+// files are read now: at startup and on every reload, which fails if they
+// cannot be used. The upstream certificate is always verified.
+func upstreamTLSConfig(t *config.UpstreamTLS) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if t == nil {
+		return cfg, nil // system roots, server name from the URL
+	}
+	cfg.ServerName = t.ServerName
+	if t.CAFile != "" {
+		data, err := os.ReadFile(t.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream_tls ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("upstream_tls ca_file %s: no certificate found", t.CAFile)
+		}
+		cfg.RootCAs = pool
+	}
+	if t.CertFile != "" {
+		pair, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream_tls cert_file and key_file: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+	return cfg, nil
 }
 
 // CloseIdleConnections closes the idle connections to the upstream.

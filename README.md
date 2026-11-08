@@ -11,7 +11,8 @@ A single `exporter_proxy` process serves **several listeners**. Each listener
 has its own address, its own authentication settings and one or more routes.
 A route serves metrics from one source:
 
-- an HTTP exporter over TCP (`http://127.0.0.1:19100/metrics`);
+- an HTTP exporter over TCP (`http://127.0.0.1:19100/metrics`), or over
+  HTTPS with optional mTLS for an exporter on another machine;
 - an HTTP exporter over a Unix domain socket (UDS);
 - a static file in the Prometheus text exposition format (`.prom`).
 
@@ -117,6 +118,34 @@ Each route has exactly one source:
   data.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
+
+### HTTPS upstreams
+
+An exporter on another machine, or one serving TLS itself, is read over
+`https://`. The upstream certificate is always verified: against the
+system roots by default, or against `ca_file`. `cert_file` and `key_file`
+add a client certificate, for an exporter requiring mTLS (an exporter-toolkit
+web configuration with `client_auth_type`):
+
+```yaml
+routes:
+  - path: /remote/metrics
+    upstream: https://db1.internal:9187/metrics
+    upstream_tls:
+      ca_file: /etc/exporter_proxy/tls/exporters-ca.pem
+      cert_file: /etc/exporter_proxy/tls/proxy-client.crt
+      key_file: /etc/exporter_proxy/tls/proxy-client.key
+      server_name: db1.internal        # optional, defaults to the URL host
+```
+
+- TLS 1.2 at least. There is no `insecure_skip_verify`: a proxy that
+  protects metrics does not read them over an unverified connection.
+- The files are read at startup and on every reload: an unreadable file or
+  a key that does not match its certificate fails the startup or the
+  reload, which then keeps the running configuration. After renewing them,
+  reload (`systemctl reload exporter_proxy`); `--check` checks them and
+  their dates.
+- Handshake and certificate failures count as `unavailable` source errors.
 
 ### Formats
 
@@ -564,7 +593,8 @@ together on one log line (each prefixed with its location, e.g.
 | Routes     | At least one per listener. |
 | `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
 | Source     | Exactly one: `upstream` or `file`. `unix_socket` only together with `upstream`. |
-| `upstream` | `http://` only, with a host, without credentials (`user:password@`) or fragment. |
+| `upstream` | `http://` or `https://`, with a host, without credentials (`user:password@`) or fragment. `unix_socket` requires `http://`. |
+| `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |

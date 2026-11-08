@@ -78,17 +78,27 @@ type Listener struct {
 type Route struct {
 	Path string
 
-	// Source: Upstream (optionally with UnixSocket) or File.
-	Upstream   string
-	UnixSocket string
-	File       string
-	MaxAge     time.Duration // file routes only
+	// Source: Upstream (optionally with UnixSocket or UpstreamTLS) or File.
+	Upstream    string
+	UpstreamTLS *UpstreamTLS // https:// upstreams only; nil: system roots
+	UnixSocket  string
+	File        string
+	MaxAge      time.Duration // file routes only
 
 	// Authorize restricts the route to some of the listener's clients;
 	// nil: every client the listener authenticates.
 	Authorize *Authorize
 
 	Limits Limits
+}
+
+// UpstreamTLS configures the TLS connection to an https:// upstream. The
+// upstream certificate is always verified.
+type UpstreamTLS struct {
+	CAFile     string // CA bundle verifying the upstream; empty: system roots
+	CertFile   string // client certificate (mTLS), with KeyFile
+	KeyFile    string
+	ServerName string // name verified in the upstream certificate; empty: the URL host
 }
 
 // Authorize lists who may read a route: a request is allowed when its
@@ -149,6 +159,15 @@ type fileRoute struct {
 	File       string         `yaml:"file"`
 	MaxAge     *time.Duration `yaml:"max_age"`
 	Authorize  *fileAuthorize `yaml:"authorize"`
+	// UpstreamTLS is decoded as is: no inheritance.
+	UpstreamTLS *fileUpstreamTLS `yaml:"upstream_tls"`
+}
+
+type fileUpstreamTLS struct {
+	CAFile     string `yaml:"ca_file"`
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	ServerName string `yaml:"server_name"`
 }
 
 type fileAuthorize struct {
@@ -223,12 +242,13 @@ func resolve(fc *fileConfig) *Config {
 		}
 		for _, fr := range fl.Routes {
 			l.Routes = append(l.Routes, Route{
-				Path:       fr.Path,
-				Upstream:   fr.Upstream,
-				UnixSocket: fr.UnixSocket,
-				File:       fr.File,
-				MaxAge:     valueOr(fr.MaxAge, 0),
-				Authorize:  authorizeOf(fr.Authorize),
+				Path:        fr.Path,
+				Upstream:    fr.Upstream,
+				UpstreamTLS: upstreamTLSOf(fr.UpstreamTLS),
+				UnixSocket:  fr.UnixSocket,
+				File:        fr.File,
+				MaxAge:      valueOr(fr.MaxAge, 0),
+				Authorize:   authorizeOf(fr.Authorize),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -239,6 +259,13 @@ func resolve(fc *fileConfig) *Config {
 		cfg.Listeners = append(cfg.Listeners, l)
 	}
 	return cfg
+}
+
+func upstreamTLSOf(f *fileUpstreamTLS) *UpstreamTLS {
+	if f == nil {
+		return nil
+	}
+	return &UpstreamTLS{CAFile: f.CAFile, CertFile: f.CertFile, KeyFile: f.KeyFile, ServerName: f.ServerName}
 }
 
 func authorizeOf(fa *fileAuthorize) *Authorize {

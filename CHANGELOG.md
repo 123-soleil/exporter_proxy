@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protobuf answers are decoded and validated (names, label values,
   `max_samples` counting a native histogram as one sample) and served as
   protobuf. Text stays the default and the only format of file routes.
+- HTTPS upstreams: `upstream: https://...`, with `upstream_tls` (`ca_file`,
+  client certificate for mTLS, `server_name`). The upstream certificate is
+  always verified; files are loaded at startup and reload, and checked by
+  `--check`.
 
 ## [0.1.0] - 2026-11-08
 
