@@ -104,6 +104,9 @@ func (h *metricsEndpoint) targets() []sdTargetGroup {
 			scheme = "https"
 		}
 		for _, r := range l.Routes {
+			if requiresParams(r) {
+				continue // one target per parameter value: configured per target
+			}
 			labels := maps.Clone(sd.Labels)
 			if labels == nil {
 				labels = map[string]string{}
@@ -116,4 +119,15 @@ func (h *metricsEndpoint) targets() []sdTargetGroup {
 		}
 	}
 	return groups
+}
+
+// requiresParams reports whether a route cannot be scraped without query
+// parameters (a required forward_params entry).
+func requiresParams(r config.Route) bool {
+	for _, p := range r.ForwardParams {
+		if p.Required {
+			return true
+		}
+	}
+	return false
 }

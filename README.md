@@ -62,7 +62,8 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 |-----------|--------|-------|
 | Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8` (or the protobuf type, see "Formats"), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept, Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Authenticated, but not in the `authorize` list of the route | `403` | Counted as `forbidden` in `exporter_proxy_auth_failures_total`. |
-| Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
+| Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching, and only forwarded as allowed by the route's `forward_params` (see "Forwarded query parameters"). |
+| Query string refused by the route's `forward_params` | `400` | Body naming the problem (parameter not allowed, value not allowed, given twice, too long, required parameter missing); never echoes client values. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
 | `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
@@ -122,6 +123,59 @@ Each route has exactly one source:
   data.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
+
+### Forwarded query parameters
+
+Multi-target exporters (blackbox_exporter, snmp_exporter) take the target
+in the query string (`/probe?target=…&module=…`). By default the proxy
+ignores the query string. `forward_params` forwards some parameters,
+each restricted to listed values or patterns:
+
+```yaml
+routes:
+  - path: /probe
+    upstream: http://127.0.0.1:9115/probe
+    forward_params:
+      target:
+        values: [https://www.example.com]
+        patterns: ['10\.0\.0\.[0-9]{1,3}:443']   # whole value, RE2 syntax
+        required: true
+      module:
+        values: [http_2xx, tcp_connect]
+```
+
+- Only listed parameters are accepted, each once, with a value of at most
+  1024 bytes that is one of `values` or matches one of `patterns` (anchored:
+  the whole value must match). Anything else gets `400` and never reaches
+  the upstream. A `required` parameter must be present.
+- Restrict values as tightly as possible: an exporter probing any target
+  it is given would let the clients of the route probe the internal
+  network (and cloud metadata addresses) through it.
+- Forwarded parameters are appended to the query of the `upstream` URL,
+  which is kept as written and cannot be overridden: a parameter set in
+  the URL cannot be listed, and that query must be plain `name=value`
+  pairs joined by `&` (so that every name in it is seen).
+- Each pattern must be a valid regular expression on its own: one closing
+  the anchoring early (`a)|(.*`) is refused.
+- Requests with different parameters never share a read.
+- Routes with a `required` parameter are left out of `/sd` (service
+  discovery): configure their targets in Prometheus, for example:
+
+```yaml
+scrape_configs:
+  - job_name: blackbox
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: [https://www.example.com]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: node1.example.com:9443   # the proxy listener
+```
 
 ### HTTPS upstreams
 
@@ -602,6 +656,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `forward_params` | Optional, on `upstream` routes: parameter names made of letters, digits, `_`, `.`, `-`, not set in the `upstream` URL; each with `values` and/or `patterns` (valid RE2), optional `required`. |
 | `authorize` | Optional, on routes: `users` and/or `client_sans`, at least one name in all, no empty or duplicate name. |
 | `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |

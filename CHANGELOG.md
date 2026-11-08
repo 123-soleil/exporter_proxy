@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protected like `/metrics`; not ready from the start of the shutdown.
 - The access log (`--log.access`) names verified identities: `user` and
   `client_cert`.
+- `forward_params` forwards query parameters to multi-target exporters
+  (blackbox, snmp), each restricted to listed values or anchored patterns;
+  anything else gets `400`. Routes requiring a parameter are left out of
+  `/sd`.
 
 ## [0.1.0] - 2026-11-08
 

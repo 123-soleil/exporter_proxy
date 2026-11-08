@@ -21,6 +21,9 @@ func TestServiceDiscoveryEndpoint(t *testing.T) {
 	m := newMTLSTest(t, "") // a TLS web configuration
 	plain := withAddr(t, listenerConfig("plain", web, up.URL))
 	plain.Routes = append(plain.Routes, config.Route{Path: "/other/metrics", Upstream: up.URL + "/metrics", Limits: limits()})
+	// Left out: it cannot be scraped without its target parameter.
+	plain.Routes = append(plain.Routes, config.Route{Path: "/probe", Upstream: up.URL + "/metrics", Limits: limits(),
+		ForwardParams: map[string]config.ForwardParam{"target": {Values: []string{"x"}, Required: true}}})
 	secure := withAddr(t, listenerConfig("secure", m.web, up.URL))
 	cfg := &config.Config{
 		Metrics: config.MetricsEndpoint{

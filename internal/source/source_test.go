@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -528,5 +529,28 @@ func TestHTTPSourceSendsScrapeTimeout(t *testing.T) {
 	}
 	if secs, _ := strconv.ParseFloat(got, 64); secs <= 1 || secs > 1.5 {
 		t.Errorf("with a 1.5s deadline: %s = %q", ScrapeTimeoutHeader, got)
+	}
+}
+
+// Forwarded parameters are appended to the upstream URL's query, which is
+// kept as written.
+func TestHTTPSourceAppendsQuery(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.RawQuery
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer srv.Close()
+	for upstream, want := range map[string]string{
+		"/probe?module=a&flag": "module=a&flag&target=t%3A1",
+		"/probe":               "target=t%3A1",
+	} {
+		s := mustNew(t, config.Route{Upstream: srv.URL + upstream, Limits: limits(2*time.Second, 1<<20)})
+		if _, err := s.Fetch(context.Background(), Request{Query: url.Values{"target": {"t:1"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s: upstream query %q, want %q", upstream, got, want)
+		}
 	}
 }

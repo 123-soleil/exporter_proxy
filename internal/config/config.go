@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -100,6 +101,10 @@ type Route struct {
 	// nil: every client the listener authenticates.
 	Authorize *Authorize
 
+	// ForwardParams lists the query parameters forwarded to the upstream,
+	// by name; nil: the query string is ignored.
+	ForwardParams map[string]ForwardParam
+
 	Limits Limits
 }
 
@@ -111,6 +116,17 @@ type UpstreamTLS struct {
 	KeyFile    string
 	ServerName string // name verified in the upstream certificate; empty: the URL host
 }
+
+// ForwardParam is a query parameter a client may pass to the upstream: its
+// value must be one of Values or match one of Patterns (whole value).
+type ForwardParam struct {
+	Values   []string
+	Patterns []*regexp.Regexp // anchored: they match the whole value
+	Required bool
+}
+
+// MaxParamValueLength bounds the value of a forwarded query parameter.
+const MaxParamValueLength = 1024
 
 // Authorize lists who may read a route: a request is allowed when its
 // basic authentication user is in Users, or when its verified client
@@ -177,7 +193,14 @@ type fileRoute struct {
 	MaxAge     *time.Duration `yaml:"max_age"`
 	Authorize  *fileAuthorize `yaml:"authorize"`
 	// UpstreamTLS is decoded as is: no inheritance.
-	UpstreamTLS *fileUpstreamTLS `yaml:"upstream_tls"`
+	UpstreamTLS   *fileUpstreamTLS            `yaml:"upstream_tls"`
+	ForwardParams map[string]fileForwardParam `yaml:"forward_params"`
+}
+
+type fileForwardParam struct {
+	Values   []string `yaml:"values"`
+	Patterns []string `yaml:"patterns"`
+	Required bool     `yaml:"required"`
 }
 
 type fileUpstreamTLS struct {
@@ -264,13 +287,14 @@ func resolve(fc *fileConfig) *Config {
 		}
 		for _, fr := range fl.Routes {
 			l.Routes = append(l.Routes, Route{
-				Path:        fr.Path,
-				Upstream:    fr.Upstream,
-				UpstreamTLS: upstreamTLSOf(fr.UpstreamTLS),
-				UnixSocket:  fr.UnixSocket,
-				File:        fr.File,
-				MaxAge:      valueOr(fr.MaxAge, 0),
-				Authorize:   authorizeOf(fr.Authorize),
+				Path:          fr.Path,
+				Upstream:      fr.Upstream,
+				UpstreamTLS:   upstreamTLSOf(fr.UpstreamTLS),
+				UnixSocket:    fr.UnixSocket,
+				File:          fr.File,
+				MaxAge:        valueOr(fr.MaxAge, 0),
+				Authorize:     authorizeOf(fr.Authorize),
+				ForwardParams: forwardParamsOf(fr.ForwardParams),
 				Limits: Limits{
 					Timeout:      valueOr(fr.Timeout, base.Timeout),
 					MaxBodyBytes: valueOr(fr.MaxBodyBytes, base.MaxBodyBytes),
@@ -289,6 +313,24 @@ func upstreamTLSOf(f *fileUpstreamTLS) *UpstreamTLS {
 	}
 	return &UpstreamTLS{CAFile: f.CAFile, CertFile: f.CertFile, KeyFile: f.KeyFile, ServerName: f.ServerName}
 }
+
+func forwardParamsOf(f map[string]fileForwardParam) map[string]ForwardParam {
+	if f == nil {
+		return nil
+	}
+	params := make(map[string]ForwardParam, len(f))
+	for name, fp := range f {
+		p := ForwardParam{Values: fp.Values, Required: fp.Required}
+		for _, pat := range fp.Patterns {
+			p.Patterns = append(p.Patterns, regexp.MustCompile(AnchorPattern(pat))) // validated before
+		}
+		params[name] = p
+	}
+	return params
+}
+
+// AnchorPattern makes a forward_params pattern match whole values only.
+func AnchorPattern(p string) string { return `^(?:` + p + `)$` }
 
 func authorizeOf(fa *fileAuthorize) *Authorize {
 	if fa == nil {

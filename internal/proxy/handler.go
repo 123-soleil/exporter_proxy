@@ -94,7 +94,8 @@ type route struct {
 	path       string
 	src        source.Source
 	maxSamples int
-	authz      *authorization // nil: every authenticated client
+	authz      *authorization                 // nil: every authenticated client
+	params     map[string]config.ForwardParam // nil: the query string is ignored
 }
 
 // Handler serves the routes of one listener.
@@ -137,7 +138,7 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 			return nil, fmt.Errorf("listener %q route %q: %w", l.Name, r.Path, err)
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
-			authz: newAuthorization(r.Authorize)})
+			authz: newAuthorization(r.Authorize), params: r.ForwardParams})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -230,6 +231,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	query, problem := checkParams(rt.params, req.URL.RawQuery)
+	if problem != "" {
+		h.logger.Log(req.Context(), h.warnLevel(), "request refused: query string", "route", rt.path, "problem", problem)
+		http.Error(rw, problem, http.StatusBadRequest)
+		return
+	}
+
 	// Answer before the scraper gives up: its timeout can only shorten the
 	// route timeout, which the source still applies.
 	budget, hasBudget := scrapeBudget(req.Header)
@@ -237,7 +245,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The delimited protobuf format (native histograms) when the scraper
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
-	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto}, budget, hasBudget)
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query}, budget, hasBudget)
 	if errors.Is(err, errNoSlot) {
 		h.rec.RequestRejected(h.listener)
 		h.logger.Log(req.Context(), h.warnLevel(), "request rejected, max_concurrent_requests reached",
@@ -381,6 +389,10 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 	key := rt.path
 	if sreq.Protobuf {
 		key += "\x00protobuf"
+	}
+	// Nor requests forwarding different parameters (other targets).
+	if len(sreq.Query) > 0 {
+		key += "\x00?" + sreq.Query.Encode()
 	}
 	h.mu.Lock()
 	rd, ok := h.reads[key]

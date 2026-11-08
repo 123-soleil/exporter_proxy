@@ -123,7 +123,17 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
+	target := s.url
+	if len(r.Query) > 0 {
+		// Appended to the upstream URL's query as written, which is never
+		// rewritten (validation ensures the names differ).
+		sep := "?"
+		if strings.Contains(s.url, "?") {
+			sep = "&"
+		}
+		target = s.url + sep + r.Query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, &Error{Reason: ReasonUnavailable, Err: err}
 	}
