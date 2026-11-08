@@ -391,13 +391,20 @@ page) from being exposed through the proxy.
   time (default 2, set in `defaults` or per listener). Extra requests are answered immediately with
   `503 Service Unavailable` instead of queuing. A read keeps its slot until
   every request that got its result has written it, so clients reading
-  slowly cannot make the proxy hold more answers than that.
+  slowly cannot make the proxy hold more answers than that. Once its
+  answer is ready, a client has 5 s plus 2 s per MiB of body to read it
+  (at most the route timeout plus 10 s): an authenticated client that does
+  not read keeps a slot that long, which is the price of the memory bound
+  (restrict who may connect with `allowed_networks` and authentication).
 - Parsing is linear in the response size, but the parser allocates about
   **10 times the body size** while it runs. Peak memory is therefore bounded
   by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over
   all listeners: with the defaults (2 MiB, 2 requests) and one listener,
   about 45 MiB in the worst case. Routes with `cache_ttl` add up to two
-  kept answers each (text and protobuf, with their gzip copies). The
+  kept answers each (text and protobuf, with their gzip copies), and
+  answers served from the cache take no slot: an answer replaced in the
+  cache stays in memory while slow clients are still reading it (at most
+  the write time above). The
   defaults fit common exporters; raise
   `max_body_bytes` (and `max_concurrent_requests`) only on the routes or
   listeners that need it (see `exporter_proxy_response_size_bytes`), and
@@ -669,8 +676,9 @@ Besides the standard `go_*`, `process_*` and
   `missing_credentials`, `invalid_credentials`, `rate_limited`,
   `network_not_allowed`, `forbidden`, `certificate_revoked`); the metrics
   endpoint is reported as `listener="metrics"`.
-- `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
-  concurrency slot (reading a source).
+- `exporter_proxy_requests_in_flight{listener}` (gauge): source reads
+  holding a concurrency slot, while reading the source or while their
+  answer is being written.
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
 - `exporter_proxy_cache_hits_total{listener,route}`: requests answered from

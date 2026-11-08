@@ -328,6 +328,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hdr.Set("Content-Length", strconv.Itoa(len(body)))
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Content-Type-Options", "nosniff")
+	// The answer is ready: the client gets a write time in proportion to
+	// its size, not what is left of the route timeout. A client that does
+	// not read keeps the read's slot that long only.
+	_ = http.NewResponseController(rw).SetWriteDeadline(time.Now().Add(writeTime(len(body), rt.timeout)))
 	rw.WriteHeader(http.StatusOK)
 	if req.Method == http.MethodHead {
 		return
@@ -335,6 +339,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// Write time given to a client once its answer is ready: writeBase plus
+// writePerMiB per MiB of body (a client reading 512 KiB/s), never more
+// than the route timeout plus the write margin it had before.
+const (
+	writeBase   = 5 * time.Second
+	writePerMiB = 2 * time.Second
+	writeMargin = 10 * time.Second
+)
+
+func writeTime(size int, routeTimeout time.Duration) time.Duration {
+	d := writeBase + time.Duration(float64(writePerMiB)*float64(size)/(1<<20))
+	if routeTimeout > 0 {
+		d = min(d, routeTimeout+writeMargin)
+	}
+	return d
 }
 
 // logSafe prepares text for logs: line breaks and other control

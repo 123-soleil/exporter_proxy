@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/source"
@@ -114,5 +115,22 @@ func TestSlotHeldWhileTheAnswerIsWritten(t *testing.T) {
 	}
 	if rec.inFlight != 0 {
 		t.Errorf("in flight %d, want 0", rec.inFlight)
+	}
+}
+
+func TestWriteTime(t *testing.T) {
+	for _, tt := range []struct {
+		size    int
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{0, 10 * time.Second, 5 * time.Second},
+		{1 << 20, 10 * time.Second, 7 * time.Second},
+		{8 << 20, 10 * time.Second, 20 * time.Second}, // capped: route timeout + margin
+		{8 << 20, 0, 21 * time.Second},
+	} {
+		if got := writeTime(tt.size, tt.timeout); got != tt.want {
+			t.Errorf("writeTime(%d, %s) = %s, want %s", tt.size, tt.timeout, got, tt.want)
+		}
 	}
 }
