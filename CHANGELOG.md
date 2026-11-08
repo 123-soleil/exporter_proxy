@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
 ### Changed
 
 - A read keeps its `max_concurrent_requests` slots until every request
@@ -17,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is closed, so one that does not read holds a slot briefly.
 - The systemd unit is `Type=notify`: the service is started, and accepts
   reloads, once every listener serves; a reload right after a start no
-  longer kills it.
+  longer kills it. Upgrade: reinstall the unit from `deploy/systemd/` to
+  get it (an installed `Type=simple` unit keeps working as before).
 
 ### Fixed
 
@@ -405,7 +408,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extends the route `timeout`.
 - `.gitignore` for Go builds, local configuration and key material.
 
-[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/123-soleil/exporter_proxy/compare/0.4.1...HEAD
+[0.4.1]: https://github.com/123-soleil/exporter_proxy/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/123-soleil/exporter_proxy/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/123-soleil/exporter_proxy/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/123-soleil/exporter_proxy/compare/0.1.0...0.2.0
