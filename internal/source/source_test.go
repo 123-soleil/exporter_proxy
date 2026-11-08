@@ -554,3 +554,18 @@ func TestHTTPSourceAppendsQuery(t *testing.T) {
 		}
 	}
 }
+
+// An upstream flooding headers is refused without reading them all.
+func TestHTTPSourceHeaderFlood(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for i := range 20000 {
+			w.Header().Set(fmt.Sprintf("X-Pad-%d", i), strings.Repeat("a", 16))
+		}
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer srv.Close()
+	s := mustNew(t, config.Route{Upstream: srv.URL + "/metrics", Limits: limits(2*time.Second, 1<<20)})
+	if _, err := s.Fetch(context.Background(), Request{}); ReasonOf(err) != ReasonUnavailable {
+		t.Errorf("err = %v, want unavailable", err)
+	}
+}

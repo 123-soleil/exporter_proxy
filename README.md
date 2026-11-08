@@ -126,6 +126,12 @@ Each route has exactly one source:
   below). Any failure returns `502 Bad Gateway`, is logged and counted, so
   Prometheus marks the target down instead of scraping partial or unexpected
   data.
+- `file` paths are followed through symbolic links (Kubernetes
+  ConfigMaps and atomic writers rely on them): whoever may write the
+  directory of a route's file may point it at another file the proxy can
+  read, including another route's, past that route's `authorize` and
+  `metrics_filter`. Keep these directories writable by the writer of the
+  file only.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
 
@@ -404,9 +410,13 @@ page) from being exposed through the proxy.
   series, labels or buckets (the cost is per series and per label). Before
   parsing, bodies with more sample lines (text) or series (protobuf) than
   `max_samples` are refused (`too_many_samples`), and so are text lines
-  with more than 128 labels (`invalid`): the text parser's cost grows with
-  the square of a line's labels, and one line with thousands of them would
-  take minutes of CPU while holding the listener's slots. Peak memory is
+  with more than 256 labels and bodies whose lines hold many tiny labels
+  (the sum over lines of labels² above 4 × the body size + 65536,
+  `invalid`): the text parser's cost grows with the square of a line's
+  labels, and one line with thousands of them would take minutes of CPU
+  while holding the listener's slots. Real exporters, which spend tens of
+  bytes per label, stay far below. Upstream answers may carry at most
+  64 KiB of headers. Peak memory is
   therefore bounded by roughly `11 × max_body_bytes ×` the sum of
   `max_concurrent_requests` over all listeners for typical content (with
   the defaults, 2 MiB and 2 requests, about 45 MiB for one listener), and
@@ -1399,8 +1409,8 @@ lower a protection (basic authentication removed, a client certificate no
 longer required or no longer verified, client CA or `client_allowed_sans`
 removed, TLS lost; in the main configuration, `client_crl_file` or
 `allowed_networks` removed from a listener, or, on a route that remains,
-`authorize` removed or `metrics_filter` removed, with fewer `deny`
-patterns or without its `allow` list), including for the previous listener of a port when
+`authorize` removed or `metrics_filter` removed, with a `deny` pattern
+removed or changed, or without its `allow` list), including for the previous listener of a port when
 listeners are renamed or swap addresses, is refused as a whole: the error
 names the listeners, the running configuration is kept and
 `exporter_proxy_config_last_reload_successful` is set to 0. A web

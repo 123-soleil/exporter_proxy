@@ -226,7 +226,7 @@ func TestTooManyLabelsOnALine(t *testing.T) {
 	}
 	start := time.Now()
 	_, err := Validate([]byte("# TYPE m gauge\n"+labelLine(20000)), 100)
-	if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), "line 2: more than 128 labels") {
+	if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), "line 2: more than 256 labels") {
 		t.Errorf("20000 labels: err = %v", err)
 	}
 	if d := time.Since(start); d > time.Second {
@@ -234,27 +234,36 @@ func TestTooManyLabelsOnALine(t *testing.T) {
 	}
 }
 
-// The worst body within the limits (lines of MaxLabelsPerLine empty
-// labels, 2 MiB) stays cheap.
-func TestWorstLabelBodyIsBounded(t *testing.T) {
+// tinyLabelBody returns about size bytes of lines with labels tiny labels
+// each: the cheapest bytes for the parser's quadratic cost.
+func tinyLabelBody(size, labels int) []byte {
 	var b strings.Builder
-	for i := 0; b.Len() < 2<<20; i++ {
+	for i := 0; b.Len() < size; i++ {
 		b.WriteString("m{")
-		for j := range MaxLabelsPerLine - 1 { // plus i: exactly the limit
-			if j > 0 {
-				b.WriteByte(',')
-			}
-			fmt.Fprintf(&b, "a%d=\"\"", j)
+		for j := range labels - 1 {
+			fmt.Fprintf(&b, "a%d=\"\",", j)
 		}
-		fmt.Fprintf(&b, ",i=\"%d\"} 1\n", i)
+		fmt.Fprintf(&b, "i=\"%d\"} 1\n", i)
 	}
+	return []byte(b.String())
+}
+
+// Lines of many tiny labels are refused on their total parse cost; the
+// most expensive body still accepted parses fast.
+func TestLabelCostBudget(t *testing.T) {
+	if _, err := Validate(tinyLabelBody(2<<20, 128), 1<<20); source.ReasonOf(err) != source.ReasonInvalid ||
+		!strings.Contains(err.Error(), "too many labels for the body size") {
+		t.Errorf("2 MiB of 128 tiny labels per line: err = %v, want refused", err)
+	}
+	// Under the budget: about 24 tiny labels per line.
+	body := tinyLabelBody(2<<20, 20)
 	start := time.Now()
-	if _, err := Validate([]byte(b.String()), 1<<20); err != nil {
-		t.Fatalf("lines at the limit refused: %v", err)
+	if _, err := Validate(body, 1<<20); err != nil {
+		t.Fatalf("lines of 20 tiny labels refused: %v", err)
 	}
-	if d := time.Since(start); d > 10*time.Second {
-		t.Errorf("2 MiB of %d-label lines took %s", MaxLabelsPerLine, d)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("2 MiB of 20-label lines took %s", d)
 	} else {
-		t.Logf("2 MiB of %d-label lines: %s", MaxLabelsPerLine, d)
+		t.Logf("2 MiB of 20-label lines: %s", d)
 	}
 }

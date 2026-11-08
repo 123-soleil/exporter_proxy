@@ -237,6 +237,21 @@ func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, er
 	return cfg, nil
 }
 
+// keepsDenies reports whether next keeps every deny pattern of old, as
+// written.
+func keepsDenies(old, next *config.MetricsFilter) bool {
+	kept := map[string]bool{}
+	for _, re := range next.Deny {
+		kept[re.String()] = true
+	}
+	for _, re := range old.Deny {
+		if !kept[re.String()] {
+			return false
+		}
+	}
+	return true
+}
+
 // routesOf returns what restricts each route of l.
 func routesOf(l config.Listener) map[string]routeProtection {
 	routes := make(map[string]routeProtection, len(l.Routes))
@@ -438,9 +453,10 @@ func specWeakens(old, next spec) []string {
 			lost = append(lost, fmt.Sprintf("authorize of route %q", path))
 		}
 		if f, g := was.filter, now.filter; f != nil &&
-			(g == nil || len(g.Deny) < len(f.Deny) || (len(f.Allow) > 0 && len(g.Allow) == 0)) {
-			// Removed, fewer deny patterns, or no allow list any more:
-			// families hidden before could be served.
+			(g == nil || !keepsDenies(f, g) || (len(f.Allow) > 0 && len(g.Allow) == 0)) {
+			// Removed, a deny pattern removed or changed (a file cut in
+			// the middle of one keeps the count), or no allow list any
+			// more: families hidden before could be served.
 			lost = append(lost, fmt.Sprintf("metrics_filter of route %q", path))
 		}
 	}

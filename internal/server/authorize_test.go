@@ -149,7 +149,8 @@ func TestReloadWeakeningMetricsFilterRefused(t *testing.T) {
 	l.Routes[0].MetricsFilter = deny("secret_.*", "token_.*")
 	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
 	l.Listen = s.Addr("node").String()
-	for name, f := range map[string]*config.MetricsFilter{"removed": nil, "shorter deny list": deny("secret_.*")} {
+	for name, f := range map[string]*config.MetricsFilter{"removed": nil, "shorter deny list": deny("secret_.*"),
+		"deny pattern cut": deny("secret_.*", "tok")} {
 		l.Routes[0].MetricsFilter = f
 		if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err == nil ||
 			!strings.Contains(err.Error(), `metrics_filter of route "/metrics"`) {

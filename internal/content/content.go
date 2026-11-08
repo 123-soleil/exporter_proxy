@@ -46,20 +46,46 @@ func ValidateFormat(body []byte, maxSamples int, protobuf bool) (Result, error) 
 	if protobuf {
 		return validateProtobuf(body, maxSamples)
 	}
-	start := time.Now()
-	// The parser allocates far more than the body for cheap samples
-	// (`a 1` lines): bodies with more sample lines than max_samples are
-	// refused before parsing.
-	n, line := sampleLines(body, maxSamples)
-	if line > 0 {
-		// prometheus/common's parser is quadratic in the labels of a line:
-		// one line with thousands of labels costs minutes of CPU.
-		return Result{Duration: time.Since(start)}, source.NewError(source.ReasonInvalid,
-			"line %d: more than %d labels", line, MaxLabelsPerLine)
+	res, _, err := parseText(body, maxSamples)
+	return res, err
+}
+
+// ValidateAndFilter is ValidateFormat followed by Filter, parsing a text
+// body once.
+func ValidateAndFilter(body []byte, maxSamples int, protobuf bool, keep func(name string) bool) (Result, []byte, error) {
+	if protobuf {
+		res, err := validateProtobuf(body, maxSamples)
+		if err != nil {
+			return res, nil, err
+		}
+		out, err := filterProtobuf(body, keep)
+		return res, out, err
 	}
-	if n > maxSamples {
-		return Result{Samples: n, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
+	res, families, err := parseText(body, maxSamples)
+	if err != nil {
+		return res, nil, err
+	}
+	out, err := encodeText(families, keep)
+	return res, out, err
+}
+
+// parseText checks the cost of a text body, parses and counts it.
+func parseText(body []byte, maxSamples int) (Result, map[string]*dto.MetricFamily, error) {
+	start := time.Now()
+	// The parser is quadratic in the labels of a line and allocates far
+	// more than the body for cheap samples: such bodies are refused
+	// before parsing.
+	scan := scanText(body, maxSamples)
+	switch {
+	case scan.tooManyLabels > 0:
+		return Result{Duration: time.Since(start)}, nil, source.NewError(source.ReasonInvalid,
+			"line %d: more than %d labels", scan.tooManyLabels, MaxLabelsPerLine)
+	case scan.samples > maxSamples:
+		return Result{Samples: scan.samples, Duration: time.Since(start)}, nil, source.NewError(source.ReasonTooManySamples,
 			"more than %d samples (max_samples)", maxSamples)
+	case scan.cost > labelBudget(len(body)):
+		return Result{Duration: time.Since(start)}, nil, source.NewError(source.ReasonInvalid,
+			"too many labels for the body size (%d label pairs squared per line, at most %d)", scan.cost, labelBudget(len(body)))
 	}
 	// UTF-8 validation accepts classic names and quoted UTF-8 names, like
 	// Prometheus 3. A parser is not safe for concurrent use: one per call.
@@ -67,15 +93,14 @@ func ValidateFormat(body []byte, maxSamples int, protobuf bool) (Result, error) 
 	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	res := Result{Duration: time.Since(start)}
 	if err != nil {
-		return res, source.NewError(source.ReasonInvalid, "not in Prometheus text format: %s", safeMessage(err))
+		return res, nil, source.NewError(source.ReasonInvalid, "not in Prometheus text format: %s", safeMessage(err))
 	}
-
 	res.Samples = countSamples(families)
 	if res.Samples > maxSamples {
-		return res, source.NewError(source.ReasonTooManySamples,
+		return res, nil, source.NewError(source.ReasonTooManySamples,
 			"%d samples exceed max_samples (%d)", res.Samples, maxSamples)
 	}
-	return res, nil
+	return res, families, nil
 }
 
 // validateProtobuf decodes every metric family of a delimited protobuf
@@ -130,15 +155,29 @@ func validateProtobuf(body []byte, maxSamples int) (Result, error) {
 
 // MaxLabelsPerLine bounds the labels of one sample line in the text
 // format, checked before parsing: the parser's cost grows with the square
-// of a line's labels. Real exporters stay far below.
-const MaxLabelsPerLine = 128
+// of a line's labels. Real exporters stay below (kube_node_labels of nodes
+// labelled by Node Feature Discovery can approach 150).
+const MaxLabelsPerLine = 256
 
-// sampleLines counts the lines of a text body that are neither blank nor
-// comments: one per sample (buckets, quantiles, _sum and _count included),
-// stopping past limit. tooManyLabels is the 1-based number of the first
-// line with more than MaxLabelsPerLine labels, 0 when none.
-func sampleLines(body []byte, limit int) (n, tooManyLabels int) {
-	for lineNo := 1; len(body) > 0 && n <= limit; lineNo++ {
+// labelBudget bounds the sum over lines of (labels per line)², the parse
+// cost, for a body of size bytes: real lines spend tens of bytes per
+// label, so they stay far below; lines of tiny labels made to burn CPU do
+// not.
+func labelBudget(size int) int { return 4*size + 1<<16 }
+
+// textScan is what scanText found.
+type textScan struct {
+	samples       int // sample lines, counted up to the limit
+	tooManyLabels int // 1-based line with more than MaxLabelsPerLine labels, 0 if none
+	cost          int // sum of (labels per line)²
+}
+
+// scanText counts the lines of a text body that are neither blank nor
+// comments (one per sample: buckets, quantiles, _sum and _count included,
+// stopping past limit) and the parse cost of their labels.
+func scanText(body []byte, limit int) textScan {
+	var sc textScan
+	for lineNo := 1; len(body) > 0 && sc.samples <= limit; lineNo++ {
 		line := body
 		if i := bytes.IndexByte(body, '\n'); i >= 0 {
 			line, body = body[:i], body[i+1:]
@@ -149,12 +188,15 @@ func sampleLines(body []byte, limit int) (n, tooManyLabels int) {
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
-		n++
-		if labelCount(line) > MaxLabelsPerLine {
-			return n, lineNo
+		sc.samples++
+		labels := labelCount(line)
+		if labels > MaxLabelsPerLine {
+			sc.tooManyLabels = lineNo
+			return sc
 		}
+		sc.cost += labels * labels
 	}
-	return n, 0
+	return sc
 }
 
 // labelCount counts the '=' of a sample line outside quoted strings: one

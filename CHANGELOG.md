@@ -32,11 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `authorize.client_sans` entries match names of their own kind only
   (DNS, IP, email, URI): a DNS entry no longer matched an email or URI
   name written the same way.
-- Text lines with more than 128 labels are refused before parsing: the
-  parser is quadratic in a line's labels, and one line with thousands of
-  them took minutes of CPU while holding the listener's slots.
-- A reload removing a route's `metrics_filter`, shortening its `deny`
-  list or emptying its `allow` list is refused as weakening.
+- Text bodies whose label count makes parsing costly are refused before
+  parsing: lines with more than 256 labels, or a sum over lines of
+  labels² above 4 × the body size + 65536. The parser is quadratic in a
+  line's labels: one line with thousands of them took minutes of CPU
+  while holding the listener's slots. With `metrics_filter`, the text is
+  parsed once.
+- Upstream answers may carry at most 64 KiB of headers (Go's default,
+  10 MiB, let one read allocate about 150 MiB).
+- A reload removing a route's `metrics_filter`, removing or changing one
+  of its `deny` patterns or emptying its `allow` list is refused as
+  weakening.
 
 ## [0.4.0] - 2026-11-08
 

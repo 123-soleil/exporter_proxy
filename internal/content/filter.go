@@ -27,6 +27,11 @@ func Filter(body []byte, protobuf bool, keep func(name string) bool) ([]byte, er
 	if err != nil {
 		return nil, source.NewError(source.ReasonInvalid, "not in Prometheus text format: %s", safeMessage(err))
 	}
+	return encodeText(families, keep)
+}
+
+// encodeText encodes the families keep accepts, sorted by name.
+func encodeText(families map[string]*dto.MetricFamily, keep func(name string) bool) ([]byte, error) {
 	var out bytes.Buffer
 	for _, name := range slices.Sorted(maps.Keys(families)) {
 		if !keep(name) {

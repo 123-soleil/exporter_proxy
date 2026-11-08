@@ -30,6 +30,9 @@ const acceptHeader = "text/plain;version=0.0.4;q=1,*/*;q=0.1"
 const acceptProtobuf = "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;escaping=allow-utf-8;q=1," +
 	"text/plain;version=0.0.4;q=0.5,*/*;q=0.1"
 
+// maxResponseHeaderBytes bounds the headers of an upstream answer.
+const maxResponseHeaderBytes = 64 << 10
+
 // httpSource fetches an HTTP exporter over TCP or over a Unix socket.
 type httpSource struct {
 	url          string
@@ -44,11 +47,15 @@ func newHTTPSource(r config.Route) (*httpSource, error) {
 	transport := &http.Transport{
 		// Never use HTTP_PROXY/HTTPS_PROXY: scrapes must go straight to the
 		// configured upstream.
-		Proxy:               nil,
-		DialContext:         dialer.DialContext,
-		MaxIdleConns:        2,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     90 * time.Second,
+		Proxy:       nil,
+		DialContext: dialer.DialContext,
+		// An exporter's answer has a few headers: without a bound, one
+		// sending megabytes of them made each read allocate far more than
+		// max_body_bytes.
+		MaxResponseHeaderBytes: maxResponseHeaderBytes,
+		MaxIdleConns:           2,
+		MaxIdleConnsPerHost:    2,
+		IdleConnTimeout:        90 * time.Second,
 		// Compression stays enabled: the transport decompresses gzip
 		// transparently and readLimited bounds the decompressed size.
 	}

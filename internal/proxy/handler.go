@@ -711,18 +711,19 @@ func (h *Handler) fetch(ctx context.Context, rt route, req source.Request) (body
 	}
 	h.rec.SourceRead(h.listener, rt.path, len(res.Body))
 
-	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
-	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
-	if err != nil {
-		return nil, false, err
-	}
 	if rt.filter != nil {
-		// After validation: what is filtered was checked as a whole.
-		body, err := content.Filter(res.Body, res.Protobuf, rt.filter.Keep)
+		// Validated as a whole, then filtered, from a single parse.
+		parsed, body, err := content.ValidateAndFilter(res.Body, rt.maxSamples, res.Protobuf, rt.filter.Keep)
+		h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
 		if err != nil {
 			return nil, false, err
 		}
 		return body, res.Protobuf, nil
+	}
+	parsed, err := content.ValidateFormat(res.Body, rt.maxSamples, res.Protobuf)
+	h.rec.ContentParsed(h.listener, rt.path, parsed.Samples, parsed.Duration, err == nil)
+	if err != nil {
+		return nil, false, err
 	}
 	return res.Body, res.Protobuf, nil
 }
