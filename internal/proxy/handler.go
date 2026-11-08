@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/time/rate"
@@ -209,10 +211,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// Verified identities only: they cannot be forged by the
 			// client.
 			if user, ok := userOf(req.Context()); ok {
-				attrs = append(attrs, "user", truncate(user, 64))
+				attrs = append(attrs, "user", logSafe(user))
 			}
 			if name := certName(req.TLS); name != "" {
-				attrs = append(attrs, "client_cert", truncate(name, 64))
+				attrs = append(attrs, "client_cert", logSafe(name))
 			}
 			h.logger.Info("request", attrs...)
 		}
@@ -311,6 +313,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if _, err := rw.Write(body); err != nil {
 		h.logger.Debug("writing response failed", "route", rt.path, "err", err)
 	}
+}
+
+// logSafe prepares a name for logs: line breaks and other control
+// characters removed (the log handlers escape them too), then cut to 64
+// bytes.
+func logSafe(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", ""), "\r", "")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+	return truncate(s, 64)
 }
 
 // truncate cuts s to at most n bytes, for logs.
