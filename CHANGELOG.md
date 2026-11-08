@@ -66,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metrics`, checked on every handshake and request; fail closed (CRL past
   its next update, issuer without CRL); `--check` warns 7 days before a
   CRL's next update; a reload cannot remove it.
+- `--check --probe` reads every source once, like the proxy, and validates
+  its content (warning above 80% of `max_samples`).
 
 ## [0.1.0] - 2026-11-08
 

@@ -56,6 +56,12 @@ func TestRunExitCodes(t *testing.T) {
 			wantStderr: "log.format",
 		},
 		{
+			name:       "probe without check",
+			args:       []string{"--probe"},
+			wantCode:   exitUsage,
+			wantStderr: "--probe only applies with --check",
+		},
+		{
 			name:       "unexpected positional argument",
 			args:       []string{"extra"},
 			wantCode:   exitUsage,

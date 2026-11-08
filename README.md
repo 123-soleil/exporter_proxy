@@ -1073,6 +1073,7 @@ exporter_proxy --version
 | `--log.level` | Minimum log level: `debug`, `info`, `warn`, `error` (default `info`). |
 | `--log.format` | Log format: `logfmt` or `json` (default `logfmt`).              |
 | `--log.access` | Log one line per served request (default off).                  |
+| `--probe`      | With `--check`: also read every source once (see below).        |
 | `--version` | Print version, revision and Go version on one line, then exit 0.   |
 
 The version is injected at build time (`-ldflags -X`) from the git tag; a
@@ -1158,6 +1159,14 @@ otherwise; warnings do not fail the check:
   not older than `max_age` nor more than `max_age` in the future;
 - each `unix_socket` route: the path exists, is a socket and is writable by
   the current user (required by `connect()`).
+
+With `--probe`, `--check` also reads every route's source once, with the
+same code, timeout and limits as the proxy, and validates its content: an
+unreachable exporter, a TLS failure, a page that is not metrics or too many
+samples is a problem, more than 80% of `max_samples` a warning. Run it as
+the service user, before a reload or in a deployment pipeline. Routes that
+need a query parameter (`required` in `forward_params`) are not read, with
+a warning.
 
 Example output:
 
