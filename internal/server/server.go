@@ -82,6 +82,13 @@ type listener struct {
 	ln       net.Listener
 	srv      *http.Server
 	handler  *swapHandler
+	// accept is ln as served: drain stops it before shutting srv down.
+	accept *handoffListener
+	// fresh tracks the connections that have not sent a request yet.
+	fresh *freshConns
+	// served is closed when srv stops serving: every connection it
+	// accepted is then tracked by fresh.
+	served chan struct{}
 }
 
 // listenerSettings are the parts of a web configuration that apply when a
@@ -715,7 +722,10 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 			clientLogs: clientLogs, serverLogs: serverLogs}, "", 0),
 	}
 
-	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh}
+	fresh := &freshConns{m: map[net.Conn]struct{}{}}
+	srv.ConnState = fresh.track
+	l := &listener{settings: settings, auth: auth, spec: sp, ln: ln, srv: srv, handler: sh,
+		accept: &handoffListener{Listener: ln}, fresh: fresh, served: make(chan struct{})}
 	if !settings.tls {
 		return l, nil
 	}
@@ -797,14 +807,15 @@ func (s *Server) recorder() proxy.Recorder {
 // update l.spec meanwhile.
 func (s *Server) serve(l *listener) {
 	name, tlsEnabled, srv, ln := l.spec.name, l.settings.tls, l.srv, l.ln
-	served := ln
+	var served net.Listener = l.accept
 	if ln.Addr().Network() == "unix" {
-		served = unixClientsListener{ln}
+		served = unixClientsListener{l.accept}
 	}
 	s.logger.Info("listening", "listener", name, "address", ln.Addr().String(), "tls", tlsEnabled)
 	s.serving.Add(1)
 	go func() {
 		defer s.serving.Done()
+		defer close(l.served)
 		var err error
 		if tlsEnabled {
 			err = srv.ServeTLS(served, "", "")
@@ -825,6 +836,12 @@ func (s *Server) serve(l *listener) {
 
 // drain stops l gracefully in the background, then closes its idle
 // upstream connections. Called with s.mu held.
+//
+// l first stops accepting, then its connections that have not sent a
+// request yet get the time to send one, and only then is its server shut
+// down: net/http closes, without any response, a connection whose request
+// is read after Shutdown started. With a socket shared with the listener
+// replacing l (reload), l may have accepted a connection just before.
 func (s *Server) drain(l *listener) {
 	name, srv, handler := l.spec.name, l.srv, l.handler
 	l.auth.retired.Store(true)
@@ -833,12 +850,94 @@ func (s *Server) drain(l *listener) {
 		defer s.draining.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer cancel()
+		l.accept.stop()
+		// Serve tracks a connection Accept returned before it accepts
+		// again: once it returned, every accepted connection is in fresh.
+		select {
+		case <-l.served:
+		case <-ctx.Done():
+		}
+		l.fresh.wait(ctx, readHeaderTimeout)
 		if err := srv.Shutdown(ctx); err != nil {
 			_ = srv.Close()
 			s.logger.Warn("listener stopped with requests still running", "listener", name, "err", err)
 		}
 		closeIdle(handler.cur.Load().h)
 	}()
+}
+
+// handoffListener is a listener whose server can stop accepting before
+// shutting down: Accept then returns http.ErrServerClosed, so that Serve
+// returns without reporting a failure. Close is idempotent: Shutdown
+// closing it again does not fail.
+type handoffListener struct {
+	net.Listener
+	stopped  atomic.Bool
+	once     sync.Once
+	closeErr error
+}
+
+func (h *handoffListener) Accept() (net.Conn, error) {
+	c, err := h.Listener.Accept()
+	if err != nil && h.stopped.Load() {
+		return nil, http.ErrServerClosed
+	}
+	return c, err
+}
+
+func (h *handoffListener) Close() error {
+	h.once.Do(func() { h.closeErr = h.Listener.Close() })
+	return h.closeErr
+}
+
+// stop stops accepting. A socket shared with another listener (dupListener)
+// stays open: that listener accepts its connections from now on.
+func (h *handoffListener) stop() {
+	h.stopped.Store(true)
+	_ = h.Close()
+}
+
+// freshConns tracks the connections of a server that have not sent a
+// request yet (http.StateNew, TLS handshake included).
+type freshConns struct {
+	mu sync.Mutex
+	m  map[net.Conn]struct{}
+}
+
+// track is the http.Server ConnState hook.
+func (f *freshConns) track(c net.Conn, st http.ConnState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st == http.StateNew {
+		f.m[c] = struct{}{}
+	} else {
+		delete(f.m, c)
+	}
+}
+
+func (f *freshConns) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.m)
+}
+
+// wait returns once no connection is fresh, after limit (a client must
+// send its request headers within readHeaderTimeout anyway), or when ctx
+// ends.
+func (f *freshConns) wait(ctx context.Context, limit time.Duration) {
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for f.count() > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // unixClientsListener gives every client of a Unix socket listener the

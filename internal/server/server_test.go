@@ -1980,3 +1980,64 @@ func TestReloadRetiresReplacedListener(t *testing.T) {
 			before.auth.retired.Load(), after.auth.retired.Load())
 	}
 }
+
+// Requests sent while reloads restart a listener on its socket are all
+// served: a connection the previous server accepted just before stopping
+// gets its response, instead of being closed (EOF) by its shutdown.
+func TestReloadRestartServesEveryRequest(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	url := "http://" + l.Listen + "/metrics"
+
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 5 * time.Second}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var sent, failed atomic.Int64
+	var firstErr atomic.Value
+	for range 2 { // max_concurrent_requests default
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				sent.Add(1)
+				resp, err := client.Get(url)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						err = fmt.Errorf("code %d", resp.StatusCode)
+					}
+				}
+				if err != nil {
+					failed.Add(1)
+					firstErr.CompareAndSwap(nil, err.Error())
+				}
+			}
+		}()
+	}
+	for i := range 30 {
+		// A different rate_limit restarts the listener on its socket.
+		writeWeb(t, dir, "web.yml", fmt.Sprintf("rate_limit:\n  interval: 1ms\n  burst: %d\n", 1000+i))
+		if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("Reload %d: %v", i, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if n := failed.Load(); n > 0 {
+		t.Errorf("%d of %d requests failed during reloads, first: %v", n, sent.Load(), firstErr.Load())
+	}
+}
