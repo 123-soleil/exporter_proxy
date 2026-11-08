@@ -493,6 +493,13 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		// be refused.
 		slotErr = h.takeSlots(rt)
 		ok = slotErr != nil
+		if ok && cached != nil {
+			// No slot: a fresh successful answer beats sharing a read
+			// that may fail for lack of time.
+			h.mu.Unlock()
+			h.rec.CacheHit(h.listener, rt.path)
+			return cached, nil
+		}
 	}
 	if ok {
 		rd = running

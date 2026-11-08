@@ -71,3 +71,11 @@ func TestProbeInterruptedDuringRead(t *testing.T) {
 	}}}}
 	expect(t, Probe(ctx, cfg), want{Problem, "interrupted"})
 }
+
+// A signal after every source was read is not reported as an
+// interruption.
+func TestProbeSignalAfterTheLastRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	expect(t, Probe(ctx, &config.Config{Listeners: []config.Listener{{Name: "node"}}}))
+}

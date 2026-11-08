@@ -18,50 +18,56 @@ const samplesWarning = 0.8
 // parameters (a required forward_params entry) are not read.
 func Probe(ctx context.Context, cfg *config.Config) []Finding {
 	c := &checker{}
+	interrupted := false
 	for _, l := range cfg.Listeners {
 		for _, r := range l.Routes {
-			if ctx.Err() != nil {
+			if interrupted || ctx.Err() != nil {
+				interrupted = true
 				break
 			}
-			c.probe(ctx, fmt.Sprintf("listener %q route %q", l.Name, r.Path), r)
+			if !c.probe(ctx, fmt.Sprintf("listener %q route %q", l.Name, r.Path), r) {
+				interrupted = true
+			}
 		}
 	}
-	if ctx.Err() != nil {
+	if interrupted {
 		// Interrupted: no false failures, one finding.
 		c.add(Problem, "probe", "interrupted: some sources were not read")
 	}
 	return c.findings
 }
 
-func (c *checker) probe(ctx context.Context, where string, r config.Route) {
+// probe reads one route; it returns false when the read was interrupted.
+func (c *checker) probe(ctx context.Context, where string, r config.Route) bool {
 	for name, p := range r.ForwardParams {
 		if p.Required {
 			c.add(Warning, where, "not probed: it needs the query parameter %q (forward_params)", name)
-			return
+			return true
 		}
 	}
 	src, err := source.New(r)
 	if err != nil {
 		c.add(Problem, where, "probe: %v", err)
-		return
+		return true
 	}
 	if closer, ok := src.(interface{ CloseIdleConnections() }); ok {
 		defer closer.CloseIdleConnections()
 	}
 	res, err := src.Fetch(ctx, source.Request{})
 	if err != nil && ctx.Err() != nil {
-		return // interrupted: reported once by Probe
+		return false // interrupted: reported once by Probe
 	}
 	if err != nil {
 		c.add(Problem, where, "probe: %s: %v", source.ReasonOf(err), err)
-		return
+		return true
 	}
 	parsed, err := content.ValidateFormat(res.Body, r.Limits.MaxSamples, res.Protobuf)
 	if err != nil {
 		c.add(Problem, where, "probe: %s: %v", source.ReasonOf(err), err)
-		return
+		return true
 	}
 	if float64(parsed.Samples) > samplesWarning*float64(r.Limits.MaxSamples) {
 		c.add(Warning, where, "probe: %d samples, close to max_samples (%d)", parsed.Samples, r.Limits.MaxSamples)
 	}
+	return true
 }

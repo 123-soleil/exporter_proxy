@@ -159,7 +159,10 @@ func TestCacheKeepsTheMoreUsefulEntry(t *testing.T) {
 	h.mu.Lock()
 	entry := h.cache["/metrics"]
 	h.mu.Unlock()
-	if entry == nil || entry.advertised != 0 {
+	if entry == nil {
+		t.Fatal("nothing cached")
+	}
+	if entry.advertised != 0 {
 		t.Errorf("cache entry advertised %v, want the route timeout's (0)", entry.advertised)
 	}
 }
