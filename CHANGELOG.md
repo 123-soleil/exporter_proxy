@@ -49,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `labels`), the metrics endpoint serves `/sd`, the routes in the
   Prometheus HTTP service discovery format, with their listener's actual
   port and scheme.
-- HTTP upstreams get `X-Prometheus-Scrape-Timeout-Seconds` with the time
-  the read may take, computed by the proxy.
+- HTTP upstreams get `X-Prometheus-Scrape-Timeout-Seconds`, computed by
+  the proxy: the scrape budget of the request starting the read, or the
+  route timeout.
 - Health endpoints `/-/healthy` and `/-/ready` on the metrics endpoint,
   protected like `/metrics`; not ready from the start of the shutdown.
 - The access log (`--log.access`) names verified identities: `user` and

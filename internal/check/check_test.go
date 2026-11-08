@@ -424,14 +424,23 @@ func TestClientCRLFile(t *testing.T) {
 		writeFile(t, p, string(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: d})))
 		return p
 	}
-	web := filepath.Join(dir, "web.yml")
-	writeFile(t, web, "{}\n")
-	run := func(path string) []Finding {
+	caPath := filepath.Join(dir, "ca.pem")
+	writeFile(t, caPath, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
+	srvCert, srvKey := writeCert(t, dir, "server", now.Add(-time.Hour), now.Add(365*24*time.Hour))
+	mtls := tlsWebConfig(t, dir, srvCert, srvKey, caPath)
+	plain := filepath.Join(dir, "web.yml")
+	writeFile(t, plain, "{}\n")
+	runWith := func(web, path string) []Finding {
 		cfg := onlyWebConfig(web)
+		cfg.Metrics.WebConfigFile = mtls
 		cfg.Listeners[0].ClientCRLFile = path
 		return Run(cfg, now)
 	}
+	run := func(path string) []Finding { return runWith(mtls, path) }
 	expect(t, run(crl("ok.crl", now.Add(30*24*time.Hour))))
+	// Refused at startup without verified client certificates: a problem.
+	expect(t, runWith(plain, crl("ok2.crl", now.Add(30*24*time.Hour))),
+		want{Problem, "client_crl_file needs a web configuration verifying client certificates"})
 	expect(t, run(crl("soon.crl", now.Add(3*24*time.Hour))), want{Warning, "must be republished before"})
 	expect(t, run(crl("old.crl", now.Add(-time.Minute))), want{Problem, "past its next update"})
 	bad := filepath.Join(dir, "bad.crl")

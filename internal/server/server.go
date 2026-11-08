@@ -197,6 +197,12 @@ func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
 // client certificate settings must be those the listener started with, then
 // serverTLSConfig applies.
 func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
+	return l.tlsConfigWithCRL(c, *l.crl.Load())
+}
+
+// tlsConfigWithCRL is tlsConfigFor with the client_crl_file path given: a
+// reload checks the TLS settings with the CRL it is about to apply.
+func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, error) {
 	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
 		return nil, err
 	}
@@ -211,7 +217,7 @@ func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if path := *l.crl.Load(); path != "" {
+	if path != "" {
 		set, err := loadCRL(path, time.Now())
 		if err != nil {
 			return nil, err // server side: refuses the handshake
@@ -571,7 +577,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 				}
 				var tlsErr error
 				if next.tls {
-					_, tlsErr = cur.tlsConfigFor(wc)
+					// With the client_crl_file this reload applies.
+					_, tlsErr = cur.tlsConfigWithCRL(wc, sp.clientCRL)
 				}
 				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr, tlsGen})
 				kept[sp.name] = true

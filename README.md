@@ -103,10 +103,12 @@ Each route has exactly one source:
 - Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
   the delimited protobuf format first, when the scraper prefers it: see
   "Formats"), a `User-Agent: exporter_proxy/<version>` and
-  `X-Prometheus-Scrape-Timeout-Seconds` with the time the read may take
-  (the route timeout, computed by the proxy, never copied from the
-  client), which exporters such as blackbox_exporter and snmp_exporter use
-  to bound their work; no client header is forwarded
+  `X-Prometheus-Scrape-Timeout-Seconds`, computed by the proxy and never
+  copied from the client: the scrape budget of the request starting the
+  read (its scrape timeout minus 500 ms), or the route timeout without a
+  scrape timeout header, whichever is shorter. Exporters such as
+  blackbox_exporter and snmp_exporter use it to answer in time (a failed
+  probe as `probe_success 0` rather than a failed scrape); no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes
@@ -646,8 +648,11 @@ Besides the standard `go_*`, `process_*` and
 - `exporter_proxy_config_last_reload_success_timestamp_seconds` (gauge): time
   of the last successful configuration load.
 - `exporter_proxy_auth_failures_total{listener,reason}`: connections and
-  requests refused before routing (see "Refused authentications"); the
-  metrics endpoint is reported as `listener="metrics"`.
+  requests refused by authentication or access control (see "Refused
+  authentications" for the reasons: `tls_handshake`,
+  `missing_credentials`, `invalid_credentials`, `rate_limited`,
+  `network_not_allowed`, `forbidden`, `certificate_revoked`); the metrics
+  endpoint is reported as `listener="metrics"`.
 - `exporter_proxy_requests_in_flight{listener}` (gauge): requests holding a
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
@@ -822,8 +827,10 @@ The metrics endpoint also serves, like Prometheus:
 
 - `/-/healthy`: `200` while the process serves;
 - `/-/ready`: `200` once every listener serves, `503` from the start of the
-  shutdown (`SIGTERM`), so that load balancers stop sending traffic before
-  the ports close.
+  shutdown (`SIGTERM`). The ports close right after, during the graceful
+  shutdown: to drain a load balancer first, mark the instance out of it
+  before stopping the service (a `preStop` hook in Kubernetes, for
+  example); `/-/ready` then confirms the state.
 
 They are protected like `/metrics` (web configuration and
 `allowed_networks`): a probe needs the same access, so they reveal nothing
@@ -1435,9 +1442,10 @@ scrape_configs:
   (`exporter_proxy_source_errors_total`) before the scraper gives up. The
   route `timeout` remains the upper bound: if it is shorter than
   `scrape_timeout`, it is the one that applies.
-- Each scraper and each route counts against `max_concurrent_requests` of
-  the listener (default 2) when their scrapes overlap: with several scrapers
-  (high availability pairs) or many routes on one listener, raise it.
+- Each route counts against `max_concurrent_requests` of the listener
+  (default 2) when their scrapes overlap; several scrapers of the same
+  route (high availability pairs) share one read and take one slot. With
+  many routes on one listener, raise it.
 
 These files were validated with `promtool check config` (Prometheus 3.7)
 and `vmagent -dryRun` (vmagent 1.128), then used to scrape a running

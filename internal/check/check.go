@@ -47,13 +47,13 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 
 	c.webConfig("metrics", cfg.Metrics.WebConfigFile)
 	if cfg.Metrics.ClientCRLFile != "" {
-		c.crl("metrics", cfg.Metrics.ClientCRLFile)
+		c.crl("metrics", cfg.Metrics.ClientCRLFile, cfg.Metrics.WebConfigFile)
 	}
 	for _, l := range cfg.Listeners {
 		where := fmt.Sprintf("listener %q", l.Name)
 		c.webConfig(where, l.WebConfigFile)
 		if l.ClientCRLFile != "" {
-			c.crl(where, l.ClientCRLFile)
+			c.crl(where, l.ClientCRLFile, l.WebConfigFile)
 		}
 		for _, r := range l.Routes {
 			rwhere := fmt.Sprintf("%s route %q", where, r.Path)
@@ -139,7 +139,13 @@ const crlWarning = 7 * 24 * time.Hour
 
 // crl checks a client_crl_file: it parses, and every CRL in it is within
 // its dates.
-func (c *checker) crl(where, path string) {
+func (c *checker) crl(where, path, webConfig string) {
+	// Like startup and reload: a CRL only applies to verified client
+	// certificates.
+	if wc, err := webconfig.Read(webConfig); err == nil && !wc.ClientCertsVerified {
+		c.add(Problem, where, "client_crl_file needs a web configuration verifying client certificates "+
+			"(TLS with client_auth_type RequireAndVerifyClientCert or VerifyClientCertIfGiven): the service would not start")
+	}
 	lists, err := webconfig.ReadCRLs(path)
 	if err != nil {
 		c.add(Problem, where, "client_crl_file %s: %v", path, err)

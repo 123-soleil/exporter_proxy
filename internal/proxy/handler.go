@@ -263,7 +263,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The delimited protobuf format (native histograms) when the scraper
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
-	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query}, budget, hasBudget)
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(budget, hasBudget)}, budget, hasBudget)
 	if errors.Is(err, errNoSlot) || errors.Is(err, errNoRouteSlot) {
 		h.rec.RequestRejected(h.listener)
 		limit, scope := cap(h.slots), "listener"
@@ -367,6 +367,15 @@ const scrapeMargin = 500 * time.Millisecond
 // "timeout" (counted and alerted on as source failures) by announcing a
 // tiny timeout. Real scrape timeouts are at least a second.
 const minScrapeBudget = time.Second
+
+// advertised is the timeout told to the upstream: the scrape budget of
+// the request starting the read, 0 (the route timeout) without one.
+func advertised(budget time.Duration, hasBudget bool) time.Duration {
+	if !hasBudget {
+		return 0
+	}
+	return budget
+}
 
 // scrapeBudget returns the time available to read the source according to
 // the scraper's timeout header: the timeout minus scrapeMargin, or the whole
@@ -493,6 +502,13 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
 			rd.at = time.Now()
 			h.mu.Lock()
+			// The slots are free before the read stops being shareable, and
+			// before anyone gets the result: a request arriving meanwhile
+			// either joins the read or finds a slot.
+			if rt.slots != nil {
+				<-rt.slots
+			}
+			<-h.slots
 			if h.reads[key] == rd {
 				delete(h.reads, key)
 			}
@@ -502,12 +518,6 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 				h.cache[key] = rd
 			}
 			h.mu.Unlock()
-			// The slots are free before anyone gets the result: a
-			// scraper's next request finds them available.
-			if rt.slots != nil {
-				<-rt.slots
-			}
-			<-h.slots
 			h.rec.InFlight(h.listener, -1)
 			close(rd.done)
 		}()

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -114,5 +115,33 @@ func TestForwardParamsReachTheUpstream(t *testing.T) {
 	defer mu.Unlock()
 	if w.Code != http.StatusBadRequest || len(got) != 0 {
 		t.Errorf("refused target: code %d, upstream reads %d; want 400 and none", w.Code, len(got))
+	}
+}
+
+// The upstream is told the scrape budget of the request, not the longer
+// route timeout: blackbox_exporter then answers probe_success 0 before the
+// scraper gives up, instead of the scrape failing as a whole.
+func TestUpstreamToldTheScrapeBudget(t *testing.T) {
+	var got string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(source.ScrapeTimeoutHeader)
+		_, _ = fmt.Fprint(w, metrics)
+	}))
+	defer up.Close()
+	src, err := source.New(config.Route{Path: "/m", Upstream: up.URL,
+		Limits: config.Limits{Timeout: 10 * time.Second, MaxBodyBytes: 1 << 20, MaxSamples: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandler("test", []route{{path: "/m", src: src, maxSamples: 100}}, 2, Options{})
+	req := httptest.NewRequest(http.MethodGet, "/m", nil)
+	req.Header.Set(scrapeTimeoutHeader, "3")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if got != "2.500" {
+		t.Errorf("upstream told %q, want 2.500 (3s scrape timeout minus the margin)", got)
+	}
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/m", nil))
+	if secs, _ := strconv.ParseFloat(got, 64); secs < 9 || secs > 10 {
+		t.Errorf("without a scrape timeout: upstream told %q, want the route timeout", got)
 	}
 }
