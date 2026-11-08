@@ -271,8 +271,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rd, done, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(rt, budget, hasBudget)}, budget, hasBudget)
 	// The read keeps its slots until this request has written its answer:
 	// max_concurrent_requests also bounds the answers held in memory for
-	// slow clients.
-	defer done()
+	// slow clients. done is nil for answers holding no slot (cache).
+	if done != nil {
+		defer done()
+	}
 	if errors.Is(err, errNoSlot) || errors.Is(err, errNoRouteSlot) {
 		h.rec.RequestRejected(h.listener)
 		limit, scope := cap(h.slots), "listener"
@@ -329,9 +331,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	// The answer is ready: the client gets a write time in proportion to
-	// its size, not what is left of the route timeout. A client that does
-	// not read keeps the read's slot that long only.
-	_ = http.NewResponseController(rw).SetWriteDeadline(time.Now().Add(writeTime(len(body), rt.timeout)))
+	// its size (bytes sent, compressed or not), not what is left of the
+	// route timeout. A client that does not read keeps the read's slot
+	// that long only.
+	if done != nil {
+		// Only answers holding a slot: one from the cache keeps the
+		// deadline of the request.
+		_ = http.NewResponseController(rw).SetWriteDeadline(time.Now().Add(writeTime(len(body), rt.timeout)))
+	}
 	rw.WriteHeader(http.StatusOK)
 	if req.Method == http.MethodHead {
 		return
@@ -505,7 +512,7 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			if joinable(c, sreq) {
 				h.mu.Unlock()
 				h.rec.CacheHit(h.listener, rt.path)
-				return c, noRelease, nil
+				return c, nil, nil
 			}
 			cached = c // still better than a 503 when no slot is free
 		}
@@ -526,7 +533,7 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 			// that may fail for lack of time.
 			h.mu.Unlock()
 			h.rec.CacheHit(h.listener, rt.path)
-			return cached, noRelease, nil
+			return cached, nil, nil
 		}
 	}
 	if ok {
@@ -542,9 +549,9 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 				h.mu.Unlock()
 				if cached != nil {
 					h.rec.CacheHit(h.listener, rt.path)
-					return cached, noRelease, nil
+					return cached, nil, nil
 				}
-				return nil, noRelease, err
+				return nil, nil, err
 			}
 		}
 		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -608,14 +615,11 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 	}
 	release()
 	if ctx.Err() != nil {
-		return nil, noRelease, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
-	return nil, noRelease, source.NewError(source.ReasonTimeout,
+	return nil, nil, source.NewError(source.ReasonTimeout,
 		"no complete answer within %s (left by the scraper's timeout)", budget.Round(time.Millisecond))
 }
-
-// noRelease is the release of an answer holding no slot (cache, refusal).
-func noRelease() {}
 
 // releaseSlots gives back the slots of a read, once. Called with h.mu
 // held, decrementing the in-flight gauge first so that it never exceeds

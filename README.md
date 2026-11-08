@@ -392,10 +392,13 @@ page) from being exposed through the proxy.
   `503 Service Unavailable` instead of queuing. A read keeps its slot until
   every request that got its result has written it, so clients reading
   slowly cannot make the proxy hold more answers than that. Once its
-  answer is ready, a client has 5 s plus 2 s per MiB of body to read it
-  (at most the route timeout plus 10 s): an authenticated client that does
-  not read keeps a slot that long, which is the price of the memory bound
-  (restrict who may connect with `allowed_networks` and authentication).
+  answer is ready, a client has 5 s plus 2 s per MiB sent (compressed
+  when gzip is used) to read it, at most the route timeout plus 10 s; an
+  HTTP/2 connection whose writes make no progress for 10 s is closed.
+  An authenticated client that does not read keeps a slot that long, which
+  is the price of the memory bound (restrict who may connect with
+  `allowed_networks` and authentication). Answers from the cache take no
+  slot and keep the usual write deadline.
 - Parsing is linear in the response size, but the parser allocates about
   **10 times the body size** while it runs. Peak memory is therefore bounded
   by roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests` over

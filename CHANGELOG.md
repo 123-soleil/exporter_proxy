@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that got its result has written it: slow clients can no longer make the
   proxy hold more answers in memory than the limit (the memory bound of
   the README holds). A client has 5 s plus 2 s per MiB to read a ready
-  answer, so one that does not read holds a slot briefly.
+  answer, and an HTTP/2 connection whose writes make no progress for 10 s
+  is closed, so one that does not read holds a slot briefly.
 - The systemd unit is `Type=notify`: the service is started, and accepts
   reloads, once every listener serves; a reload right after a start no
   longer kills it.

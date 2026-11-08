@@ -32,10 +32,11 @@ import (
 
 // HTTP server limits. Write deadlines are derived from the route timeouts.
 const (
-	readHeaderTimeout = 10 * time.Second // slow clients sending headers
-	idleTimeout       = 60 * time.Second // keep-alive between scrapes
-	maxHeaderBytes    = 16 << 10         // scrape requests are tiny
-	writeMargin       = 10 * time.Second // parsing and sending after the source read
+	readHeaderTimeout     = 10 * time.Second // slow clients sending headers
+	http2WriteByteTimeout = 10 * time.Second // HTTP/2 writes without progress
+	idleTimeout           = 60 * time.Second // keep-alive between scrapes
+	maxHeaderBytes        = 16 << 10         // scrape requests are tiny
+	writeMargin           = 10 * time.Second // parsing and sending after the source read
 
 	// metricsWriteTimeout covers promhttp's own 10 s timeout.
 	metricsWriteTimeout = 10*time.Second + writeMargin
@@ -867,6 +868,12 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		WriteTimeout:   writeMargin,
 		IdleTimeout:    idleTimeout,
 		MaxHeaderBytes: maxHeaderBytes,
+		// HTTP/2: a connection whose writes make no progress for that
+		// long is closed. Stream write deadlines alone cannot end a write
+		// blocked on a client that stopped reading the socket, which
+		// would hold a read's slot (and its answer) as long as the
+		// connection stays open.
+		HTTP2: &http.HTTP2Config{WriteByteTimeout: http2WriteByteTimeout},
 		// TLS handshake failures are counted and logged as such.
 		ErrorLog: log.New(&serverErrorLog{listener: sp.name, logger: s.logger, rec: s.recorder(),
 			clientLogs: clientLogs, serverLogs: serverLogs}, "", 0),
