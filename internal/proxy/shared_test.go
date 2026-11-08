@@ -262,3 +262,62 @@ func TestSharedReadNotJoinedWithAShorterAdvertisedTimeout(t *testing.T) {
 		t.Errorf("reverse case: %d reads, want 1", n)
 	}
 }
+
+// With no slot left for a read of its own, a request shares the running
+// read rather than being refused, whatever the timeouts.
+func TestSharedReadJoinedWhenNoSlotIsFree(t *testing.T) {
+	for name, header := range map[string]string{"longer budget": "15", "no scrape timeout": ""} {
+		t.Run(name, func(t *testing.T) {
+			src := newCountingSource()
+			rec := &recorder{}
+			h := newTestHandler(src, 1, rec, &bytes.Buffer{}, false) // a single slot
+			first := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			first.Header.Set(scrapeTimeoutHeader, "10")
+			a := serve(h, first)
+			<-src.started
+			second := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			if header != "" {
+				second.Header.Set(scrapeTimeoutHeader, header)
+			}
+			b := serve(h, second)
+			waitShared(t, rec, 1)
+			close(src.release)
+			if w := <-b; w.Code != http.StatusOK {
+				t.Errorf("second request: code %d, want 200 (shared)", w.Code)
+			}
+			<-a
+			if n := src.reads.Load(); n != 1 {
+				t.Errorf("%d reads, want 1", n)
+			}
+		})
+	}
+}
+
+// A cached answer obtained with a short timeout is not served to a
+// request with more time: it reads again.
+func TestCacheNotServedToLongerBudgets(t *testing.T) {
+	src := &countingFetch{}
+	h := newHandler("test", []route{{path: "/metrics", src: src, maxSamples: 100, cacheTTL: time.Hour,
+		timeout: 10 * time.Second}}, 2, Options{Recorder: &recorder{}})
+	with := func(header string) {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if header != "" {
+			req.Header.Set(scrapeTimeoutHeader, header)
+		}
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	with("2") // budget 1.5s, told to the upstream
+	with("2") // same budget: from the cache
+	if n := src.reads.Load(); n != 1 {
+		t.Fatalf("%d reads, want 1", n)
+	}
+	with("") // no budget: the route timeout, more than the cached read had
+	if n := src.reads.Load(); n != 2 {
+		t.Errorf("%d reads, want 2 (not served from a shorter read)", n)
+	}
+	with("") // told the route timeout: cached for everyone
+	with("3")
+	if n := src.reads.Load(); n != 2 {
+		t.Errorf("%d reads, want 2", n)
+	}
+}

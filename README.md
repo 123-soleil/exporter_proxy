@@ -107,8 +107,9 @@ Each route has exactly one source:
   budget of the request starting the read (derived from its scrape
   timeout, see "Response validation and limits"), or the route timeout without a scrape
   timeout header, whichever is shorter. A request does not join a read
-  that told the upstream less than its own budget: another client's short
-  timeout never shortens its answer. Exporters such as
+  that told the upstream less than its own budget (another client's short
+  timeout), unless no slot is left for a read of its own: it then shares
+  the running read rather than being refused. Exporters such as
   blackbox_exporter and snmp_exporter use it to answer in time (a failed
   probe as `probe_success 0` rather than a failed scrape); no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
@@ -224,6 +225,9 @@ routes:
 - Off by default. Allowed on `upstream` routes only (files are read
   without cost), at most `1h`, and not with `forward_params` (each target
   would be a cache entry, and probes must be live).
+- A cached answer is only served to requests that could have shared the
+  read producing it: one obtained with a shorter scrape timeout than a
+  request's budget is not handed to it, which reads again.
 - Only valid results are kept: a failure is never cached, the next request
   reads again.
 - Answers from such a route carry `Age` (seconds since the read); they

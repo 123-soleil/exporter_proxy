@@ -44,3 +44,15 @@ func TestProbe(t *testing.T) {
 		want{Problem, `route "/down": probe: unavailable`},
 		want{Warning, `route "/probe": not probed: it needs the query parameter "target"`})
 }
+
+// Interrupted probes stop with one finding, not a failure per route.
+func TestProbeInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	limits := config.Limits{Timeout: time.Second, MaxBodyBytes: 1 << 20, MaxSamples: 10}
+	cfg := &config.Config{Listeners: []config.Listener{{Name: "node", Routes: []config.Route{
+		{Path: "/a", Upstream: "http://127.0.0.1:1/a", Limits: limits},
+		{Path: "/b", Upstream: "http://127.0.0.1:1/b", Limits: limits},
+	}}}}
+	expect(t, Probe(ctx, cfg), want{Problem, "interrupted"})
+}

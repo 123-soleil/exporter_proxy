@@ -20,6 +20,11 @@ func Probe(ctx context.Context, cfg *config.Config) []Finding {
 	c := &checker{}
 	for _, l := range cfg.Listeners {
 		for _, r := range l.Routes {
+			if ctx.Err() != nil {
+				// Interrupted: no false failures for the remaining routes.
+				c.add(Problem, "probe", "interrupted: the remaining sources were not read")
+				return c.findings
+			}
 			c.probe(ctx, fmt.Sprintf("listener %q route %q", l.Name, r.Path), r)
 		}
 	}

@@ -108,6 +108,10 @@ type route struct {
 	slots chan struct{}
 	// filter keeps some metric families only; nil: all.
 	filter *config.MetricsFilter
+	// timeout is the route timeout; file: the source is a file, which
+	// takes no advertised timeout.
+	timeout time.Duration
+	file    bool
 }
 
 // Handler serves the routes of one listener.
@@ -153,7 +157,8 @@ func NewHandler(l config.Listener, opts Options) (*Handler, error) {
 		}
 		routes = append(routes, route{path: r.Path, src: src, maxSamples: r.Limits.MaxSamples,
 			authz: newAuthorization(r.Authorize), params: r.ForwardParams, cacheTTL: r.CacheTTL,
-			slots: routeSlots(r.MaxConcurrentRequests), filter: r.MetricsFilter})
+			slots: routeSlots(r.MaxConcurrentRequests), filter: r.MetricsFilter,
+			timeout: r.Limits.Timeout, file: r.File != ""})
 	}
 	return newHandler(l.Name, routes, l.MaxConcurrentRequests, opts), nil
 }
@@ -263,7 +268,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The delimited protobuf format (native histograms) when the scraper
 	// prefers it; files and upstreams without it answer in text.
 	wantProto := expfmt.NegotiateAccept(req.Header, servedFormats...).FormatType() == expfmt.TypeProtoDelim
-	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(budget, hasBudget)}, budget, hasBudget)
+	rd, err := h.read(req.Context(), rt, source.Request{Protobuf: wantProto, Query: query, Timeout: advertised(rt, budget, hasBudget)}, budget, hasBudget)
 	if errors.Is(err, errNoSlot) || errors.Is(err, errNoRouteSlot) {
 		h.rec.RequestRejected(h.listener)
 		limit, scope := cap(h.slots), "listener"
@@ -369,9 +374,10 @@ const scrapeMargin = 500 * time.Millisecond
 const minScrapeBudget = time.Second
 
 // advertised is the timeout told to the upstream: the scrape budget of
-// the request starting the read, 0 (the route timeout) without one.
-func advertised(budget time.Duration, hasBudget bool) time.Duration {
-	if !hasBudget {
+// the request, or 0 for the route timeout (no budget, a budget at least
+// the route timeout, or a file source, which takes none).
+func advertised(rt route, budget time.Duration, hasBudget bool) time.Duration {
+	if !hasBudget || rt.file || (rt.timeout > 0 && budget >= rt.timeout) {
 		return 0
 	}
 	return budget
@@ -463,43 +469,43 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 	}
 	h.mu.Lock()
 	if rt.cacheTTL > 0 {
-		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL {
+		// Served only to requests that could have joined the read that
+		// produced it: an answer obtained with another client's shorter
+		// timeout is not handed to a scraper with more time.
+		if c := h.cache[key]; c != nil && time.Since(c.at) < rt.cacheTTL && joinable(c, sreq) {
 			h.mu.Unlock()
 			h.rec.CacheHit(h.listener, rt.path)
 			return c, nil
 		}
 	}
-	rd, ok := h.reads[key]
-	// A read that told the upstream a shorter timeout than this request's
-	// budget (another client's scrape timeout) may answer with a failure
-	// this request had time to avoid: it reads on its own instead.
-	if ok && rd.advertised > 0 && (sreq.Timeout == 0 || sreq.Timeout > rd.advertised) {
-		ok = false
+	var rd *sharedRead
+	running, ok := h.reads[key]
+	var slotErr error
+	if ok && !joinable(running, sreq) {
+		// The running read told the upstream a shorter timeout than this
+		// request's budget (another client's scrape timeout): it may
+		// answer with a failure this request had time to avoid. Read on
+		// its own if a slot is free; otherwise share it anyway rather than
+		// be refused.
+		slotErr = h.takeSlots(rt)
+		ok = slotErr != nil
 	}
 	if ok {
+		rd = running
 		rd.clients++
 		h.mu.Unlock()
 		h.rec.RequestShared(h.listener, rt.path)
 	} else {
-		// Never queue: a full listener or route answers immediately.
-		select {
-		case h.slots <- struct{}{}:
-		default:
-			h.mu.Unlock()
-			return nil, errNoSlot
-		}
-		if rt.slots != nil {
-			select {
-			case rt.slots <- struct{}{}:
-			default:
-				<-h.slots
+		if running == nil {
+			// Never queue: a full listener or route answers immediately.
+			if err := h.takeSlots(rt); err != nil {
 				h.mu.Unlock()
-				return nil, errNoRouteSlot
+				return nil, err
 			}
 		}
 		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-		rd = &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel, advertised: sreq.Timeout}
-		h.reads[key] = rd
+		nr := &sharedRead{done: make(chan struct{}), clients: 1, cancel: cancel, advertised: sreq.Timeout}
+		h.reads[key] = nr
 		h.mu.Unlock()
 		h.rec.InFlight(h.listener, 1)
 		// No scrape budget on the read itself, only the route timeout
@@ -507,10 +513,11 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 		// short for those joining it with a longer budget. Each request
 		// waits at most its own budget, and the read is canceled once none
 		// waits.
+		rd = nr
 		go func() {
 			defer cancel()
-			rd.body, rd.protobuf, rd.err = h.safeFetch(fetchCtx, rt, sreq)
-			rd.at = time.Now()
+			nr.body, nr.protobuf, nr.err = h.safeFetch(fetchCtx, rt, sreq)
+			nr.at = time.Now()
 			h.mu.Lock()
 			// The slots are free before the read stops being shareable, and
 			// before anyone gets the result: a request arriving meanwhile
@@ -519,17 +526,17 @@ func (h *Handler) read(ctx context.Context, rt route, sreq source.Request, budge
 				<-rt.slots
 			}
 			<-h.slots
-			if h.reads[key] == rd {
+			if h.reads[key] == nr {
 				delete(h.reads, key)
 			}
 			// Only validated results are kept: a failure is retried by
 			// the next request.
-			if rt.cacheTTL > 0 && rd.err == nil {
-				h.cache[key] = rd
+			if rt.cacheTTL > 0 && nr.err == nil {
+				h.cache[key] = nr
 			}
 			h.mu.Unlock()
 			h.rec.InFlight(h.listener, -1)
-			close(rd.done)
+			close(nr.done)
 		}()
 	}
 
@@ -570,6 +577,32 @@ func (h *Handler) safeFetch(ctx context.Context, rt route, req source.Request) (
 		}
 	}()
 	return h.fetch(ctx, rt, req)
+}
+
+// joinable reports whether a request asking for sreq may get the result
+// of read rd: rd told the upstream the route timeout (advertised 0), or at
+// least this request's budget.
+func joinable(rd *sharedRead, sreq source.Request) bool {
+	return rd.advertised == 0 || (sreq.Timeout > 0 && sreq.Timeout <= rd.advertised)
+}
+
+// takeSlots takes a listener slot and, with a route limit, a route slot,
+// without waiting. Called with h.mu held.
+func (h *Handler) takeSlots(rt route) error {
+	select {
+	case h.slots <- struct{}{}:
+	default:
+		return errNoSlot
+	}
+	if rt.slots != nil {
+		select {
+		case rt.slots <- struct{}{}:
+		default:
+			<-h.slots
+			return errNoRouteSlot
+		}
+	}
+	return nil
 }
 
 // leave records that a request no longer waits for rd: the last one
