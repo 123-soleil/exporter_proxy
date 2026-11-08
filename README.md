@@ -637,6 +637,21 @@ Other built-in defaults:
 | `--log.format`    | `logfmt`                          |
 | `--log.access`    | off                               |
 
+### Health endpoints
+
+The metrics endpoint also serves, like Prometheus:
+
+- `/-/healthy`: `200` while the process serves;
+- `/-/ready`: `200` once every listener serves, `503` from the start of the
+  shutdown (`SIGTERM`), so that load balancers stop sending traffic before
+  the ports close.
+
+They are protected like `/metrics` (web configuration and
+`allowed_networks`): a probe needs the same access, so they reveal nothing
+to anyone else. For a probe without credentials, give the metrics endpoint
+a web configuration without authentication and restrict it with
+`allowed_networks`.
+
 ### Service discovery
 
 With `metrics.service_discovery`, the metrics endpoint also serves
@@ -913,7 +928,7 @@ docker run -d --name exporter_proxy --restart unless-stopped \
 | Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
 | Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.1.0 --log.format=json`. |
 | Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.1.0 --check` |
-| Health | No shell in the image, so no `HEALTHCHECK`: Prometheus scraping the metrics endpoint (`up`) is the health check. |
+| Health | No shell in the image, so no `HEALTHCHECK`. Orchestrators probe `/-/healthy` and `/-/ready` on the metrics endpoint (see "Health endpoints"); Prometheus scraping the metrics endpoint (`up`) remains the main health check. |
 | Not available | systemd socket activation (`listen: "systemd:<name>"`). |
 
 ## Usage

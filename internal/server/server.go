@@ -64,6 +64,9 @@ type Server struct {
 	logger *slog.Logger
 	opts   Options
 	errc   chan error
+	// ready: every listener serves, and the server is not shutting down
+	// (the metrics endpoint's /-/ready).
+	ready atomic.Bool
 
 	mu        sync.Mutex
 	listeners map[string]*listener // by name
@@ -424,6 +427,7 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		s.listeners[l.spec.name] = l
 		s.serve(l)
 	}
+	s.ready.Store(true)
 	return s, nil
 }
 
@@ -649,10 +653,7 @@ func (s *Server) pruneSuccesses() {
 func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 	var specs []spec
 	if s.opts.MetricsHandler != nil {
-		handler := s.opts.MetricsHandler
-		if cfg.Metrics.ServiceDiscovery != nil {
-			handler = &sdHandler{s: s, cfg: cfg, next: handler}
-		}
+		handler := &metricsEndpoint{s: s, cfg: cfg, next: s.opts.MetricsHandler}
 		specs = append(specs, spec{
 			name:         MetricsListener,
 			listen:       cfg.Metrics.Listen,
@@ -1150,6 +1151,7 @@ func (s *Server) Err() <-chan error { return s.errc }
 // Shutdown stops accepting connections and waits for in-flight requests to
 // complete, until ctx is done; remaining connections are then closed.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.ready.Store(false)
 	type running struct {
 		name    string
 		srv     *http.Server

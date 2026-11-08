@@ -106,3 +106,57 @@ func TestServiceDiscoveryDisabled(t *testing.T) {
 		t.Errorf("code %d, want 404", code)
 	}
 }
+
+func TestHealthEndpoints(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	cfg := &config.Config{
+		Metrics:   config.MetricsEndpoint{Listen: freeAddr(t), WebConfigFile: web},
+		Listeners: []config.Listener{withAddr(t, listenerConfig("plain", web, up.URL))},
+	}
+	s, err := Start(cfg, Options{Logger: slog.New(slog.DiscardHandler), MetricsHandler: http.NotFoundHandler()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	base := "http://" + s.Addr(MetricsListener).String()
+	for _, p := range []string{HealthyPath, ReadyPath} {
+		if code, body := get(t, base+p, "", ""); code != http.StatusOK {
+			t.Errorf("%s: %d %s", p, code, body)
+		}
+	}
+	// Not ready once shutting down: load balancers stop sending traffic.
+	s.ready.Store(false)
+	if code, _ := get(t, base+ReadyPath, "", ""); code != http.StatusServiceUnavailable {
+		t.Errorf("%s while shutting down: %d, want 503", ReadyPath, code)
+	}
+	if code, _ := get(t, base+HealthyPath, "", ""); code != http.StatusOK {
+		t.Errorf("%s while shutting down: %d, want 200", HealthyPath, code)
+	}
+}
+
+// The health endpoints are protected like the metrics.
+func TestHealthEndpointsRequireAuthentication(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	locked := writeWeb(t, dir, "locked.yml", usersYAML(t, map[string]string{"u": "pw"}))
+	cfg := &config.Config{
+		Metrics:   config.MetricsEndpoint{Listen: freeAddr(t), WebConfigFile: locked},
+		Listeners: []config.Listener{withAddr(t, listenerConfig("plain", web, up.URL))},
+	}
+	s, err := Start(cfg, Options{Logger: slog.New(slog.DiscardHandler), MetricsHandler: http.NotFoundHandler()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	base := "http://" + s.Addr(MetricsListener).String()
+	if code, _ := get(t, base+ReadyPath, "", ""); code != http.StatusUnauthorized {
+		t.Errorf("without credentials: %d, want 401", code)
+	}
+	if code, _ := get(t, base+ReadyPath, "u", "pw"); code != http.StatusOK {
+		t.Errorf("with credentials: %d, want 200", code)
+	}
+}
