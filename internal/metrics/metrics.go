@@ -47,6 +47,7 @@ type Metrics struct {
 	sourceErrors    *prometheus.CounterVec
 	inFlight        *inFlightGauge
 	rejected        *prometheus.CounterVec
+	shared          *prometheus.CounterVec
 	authFailures    *prometheus.CounterVec
 	fileModified    *prometheus.GaugeVec
 	webConfigError  *prometheus.GaugeVec
@@ -113,6 +114,10 @@ func New() *Metrics {
 			Namespace: namespace, Name: "requests_rejected_total",
 			Help: "Requests refused with 503 because max_concurrent_requests was reached.",
 		}, []string{"listener"}),
+		shared: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "requests_shared_total",
+			Help: "Requests answered with the result of a source read started by a concurrent request of the same route.",
+		}, lr),
 		authFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "auth_failures_total",
 			Help: "Connections or requests refused before routing, by reason: tls_handshake, missing_credentials, invalid_credentials, rate_limited.",
@@ -141,7 +146,7 @@ func New() *Metrics {
 
 	m.registry.MustRegister(
 		m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples,
-		m.sourceErrors, m.inFlight, m.rejected, m.authFailures, m.fileModified, m.webConfigError,
+		m.sourceErrors, m.inFlight, m.rejected, m.shared, m.authFailures, m.fileModified, m.webConfigError,
 		m.configHash, m.reloadSuccessful, m.reloadSuccessTstamp,
 		versioncollector.NewCollector(namespace),
 		collectors.NewGoCollector(),
@@ -199,6 +204,7 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 			m.authFailures.WithLabelValues(l.Name, string(reason))
 		}
 		for _, r := range l.Routes {
+			m.shared.WithLabelValues(l.Name, r.Path)
 			for _, reason := range reasons {
 				m.sourceErrors.WithLabelValues(l.Name, r.Path, string(reason))
 			}
@@ -211,7 +217,7 @@ func (m *Metrics) ConfigLoaded(cfg *config.Config, at time.Time) {
 func (m *Metrics) deleteSeries(labels prometheus.Labels) {
 	routeVecs := []interface {
 		DeletePartialMatch(prometheus.Labels) int
-	}{m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples, m.sourceErrors, m.fileModified}
+	}{m.requests, m.requestDuration, m.parseDuration, m.responseSize, m.samples, m.sourceErrors, m.shared, m.fileModified}
 	for _, v := range routeVecs {
 		v.DeletePartialMatch(labels)
 	}
@@ -404,6 +410,16 @@ func (m *Metrics) WebConfigRead(listener string, tls, ok bool) {
 		v = 1
 	}
 	m.webConfigError.WithLabelValues(listener).Set(v)
+}
+
+// RequestShared implements proxy.Recorder.
+func (m *Metrics) RequestShared(listener, route string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.known(listener, route) {
+		return
+	}
+	m.shared.WithLabelValues(listener, route).Inc()
 }
 
 // SourceFailed implements proxy.Recorder.

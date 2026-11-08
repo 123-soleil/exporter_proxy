@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section in the README; CI builds the image and runs it as documented.
 - Responses are compressed with gzip when the scraper accepts it
   (`Accept-Encoding`) and the body is 1 KiB or more.
+- Shared reads: requests for a route arriving while its source is being
+  read get the result of that read instead of reading again (scrapers in
+  high availability), without taking a `max_concurrent_requests` slot;
+  new counter `exporter_proxy_requests_shared_total{listener,route}`.
 
 ## [0.1.0] - 2026-11-08
 

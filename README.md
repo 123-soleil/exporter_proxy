@@ -61,7 +61,7 @@ scraper --basic--> :9443  /node/metrics      --> http://127.0.0.1:19100/metrics 
 | Content read and validated | `200` | Body returned unchanged, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Vary: Accept-Encoding`. Compressed with gzip (`Content-Encoding: gzip`, fastest level) when the client accepts it (`Accept-Encoding`, as Prometheus sends) and the body is 1 KiB or more: the network hop between the scraper and the proxy carries about a tenth of the size. `HEAD` returns the headers only. |
 | Path not configured on this listener | `404` | Matching is exact: `/metrics/` does not match `/metrics`. The query string is ignored for matching and never forwarded. |
 | Method other than `GET` or `HEAD` | `405` | With `Allow: GET, HEAD`. |
-| `max_concurrent_requests` reached | `503` | Immediate, never queued. |
+| `max_concurrent_requests` reached | `503` | Immediate, never queued. A request for a route whose source is already being read does not need a slot: it shares that read (see below). |
 | Web configuration file of the listener unreadable or invalid; without `basic_auth_users` while the listener requires basic authentication (started with it, or users seen while running); or enabling TLS while the listener serves plain HTTP | `518` | Body `web configuration unreadable`; answered to every request (after the `rate_limit` of the web configuration, if any, but before authentication) until the file is fixed (it is re-read on every request). The error goes to the logs at `error` level and `exporter_proxy_web_config_read_error{listener}` is set to 1. `518` is an unassigned code, chosen so that this case is never confused with an upstream (`502`) or proxy error. |
 | Source rejected | `502` | Body `source rejected: <reason>` with the reason only (`unavailable`, `timeout`, `too_large`, `stale`, `invalid`, `too_many_samples`); details such as paths or addresses only go to the logs, at `warn` level. |
 
@@ -114,6 +114,28 @@ Each route has exactly one source:
   data.
 - Files must be written atomically (temporary file in the same directory,
   then rename) so that a half-written file is never served.
+
+### Shared reads
+
+Requests for a route that arrive while its source is already being read
+(two Prometheus servers in high availability, several scrapers of the same
+target) do not read it again: they get the result of the read in progress,
+validated once and compressed once.
+
+- Only the first read takes a `max_concurrent_requests` slot: the others
+  are neither refused with `503` nor counted in
+  `exporter_proxy_requests_in_flight`. They are counted in
+  `exporter_proxy_requests_shared_total`.
+- Nothing is cached: a request arriving after the read finished reads the
+  source again, so no answer is ever older than the scrape that asked.
+- The read runs with the route timeout only: the request that started it
+  does not cut it short for others with a longer scrape timeout. Every
+  request waits at most its own scrape budget; the read goes on while at
+  least one request waits for it, and is canceled once none does.
+- Every request is counted in `exporter_proxy_requests_total` with its own
+  status; source events (`exporter_proxy_samples`,
+  `exporter_proxy_source_errors_total`, ...) count reads, once per read,
+  except failures, counted for every request that got them.
 
 ### Response validation and limits
 
@@ -339,6 +361,9 @@ Besides the standard `go_*`, `process_*` and
   concurrency slot (reading a source).
 - `exporter_proxy_requests_rejected_total{listener}`: requests refused with
   `503` because `max_concurrent_requests` was reached.
+- `exporter_proxy_requests_shared_total{listener,route}`: requests answered
+  with the result of a source read started by a concurrent request of the
+  same route (shared reads, below).
 - `exporter_proxy_web_config_read_error{listener}` (gauge, 0 or 1): 1 while
   the listener's web configuration cannot be applied: the last request
   could not read the file (answered `518`), or the last new TLS connection

@@ -56,6 +56,13 @@ type recorder struct {
 	modTimes []time.Time
 	parsed   []int
 	failed   []source.Reason
+	shared   int
+}
+
+func (r *recorder) RequestShared(string, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.shared++
 }
 
 func (r *recorder) RequestServed(_, route string, code int, _ time.Duration) {
@@ -300,27 +307,35 @@ func TestHandlerConcurrencyLimit(t *testing.T) {
 	src := &blockingSource{started: make(chan struct{}), release: make(chan struct{})}
 	rec := &recorder{}
 	var logs bytes.Buffer
-	h := newTestHandler(src, 2, rec, &logs, false)
+	// Three routes: requests of a same route share their read.
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := newHandler("test", []route{
+		{path: "/a", src: src, maxSamples: 100},
+		{path: "/b", src: src, maxSamples: 100},
+		{path: "/c", src: src, maxSamples: 100},
+	}, 2, Options{Logger: logger, Recorder: rec})
 
 	// Fill both slots.
 	var wg sync.WaitGroup
-	codes := make([]int, 2)
-	for i := range codes {
+	paths := []string{"/a", "/b"}
+	codes := make([]int, len(paths))
+	for i, p := range paths {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			w := httptest.NewRecorder()
-			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, p, nil))
 			codes[i] = w.Code
 		}()
 		<-src.started
 	}
 
-	// The third request is refused at once, without reaching the source.
+	// A third route's request is refused at once, without reaching the
+	// source.
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/c", nil))
 		close(done)
 	}()
 	select {
@@ -360,7 +375,7 @@ func TestHandlerConcurrencyLimit(t *testing.T) {
 	close(src.release)
 	go func() { <-src.started }()
 	w = httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/c", nil))
 	if w.Code != http.StatusOK {
 		t.Errorf("request after release: code = %d, want 200", w.Code)
 	}
@@ -487,24 +502,17 @@ func (d *deadlineSource) Fetch(ctx context.Context) (*source.Result, error) {
 	return &source.Result{Body: []byte(metrics)}, nil
 }
 
-func TestHandlerPassesScrapeBudgetToSource(t *testing.T) {
+// The scraper's budget bounds how long a request waits, not the read
+// itself, which may be shared with requests having longer budgets: the
+// source only applies the route timeout.
+func TestHandlerReadNotBoundByTheStarterBudget(t *testing.T) {
 	src := &deadlineSource{}
 	h := newTestHandler(src, 2, &recorder{}, &bytes.Buffer{}, false)
-
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if src.has {
-		t.Error("deadline set without the scrape timeout header")
-	}
-
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	req.Header.Set(scrapeTimeoutHeader, "5")
-	start := time.Now()
 	h.ServeHTTP(httptest.NewRecorder(), req)
-	if !src.has {
-		t.Fatal("no deadline with the scrape timeout header")
-	}
-	if left := src.deadline.Sub(start); left > 4600*time.Millisecond || left < 4400*time.Millisecond {
-		t.Errorf("deadline in %v, want about 4.5s (5s minus margin)", left)
+	if src.has {
+		t.Errorf("read given a deadline (%v) from the scrape budget", time.Until(src.deadline))
 	}
 }
 
