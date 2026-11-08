@@ -993,6 +993,19 @@ forces another one.
 UTC, so rebuilding a commit gives the same values). Each can be overridden,
 e.g. `make build VERSION=1.0.0`.
 
+### Continuous integration
+
+GitHub Actions (`.github/workflows/`):
+
+| Workflow | When | What |
+|----------|------|------|
+| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`); tests with the race detector on Linux and macOS, Go 1.26 and the latest Go, and `make build`. |
+| `security.yml` | Every Monday, or by hand | `go mod verify` and `govulncheck` on `main`, for vulnerabilities published after a merge. |
+| `release.yml` | A GitHub release is published | Tests and `govulncheck`, then `make build` for Linux, macOS, FreeBSD, NetBSD and OpenBSD (386, amd64, arm64, armv5/6/7 where supported), each packaged as `exporter_proxy_<tag>_<os>_<arch>.tar.gz` (binary, README, CHANGELOG, LICENSE, `deploy/`) and uploaded to the release with `sha256sums.txt`. |
+
+Dependabot proposes Go module and GitHub Actions updates every week, a
+week after their release. Actions are pinned by commit SHA.
+
 `make test` includes end-to-end tests (`cmd/exporter_proxy/e2e_test.go`)
 that run the whole program with a certificate authority, server and client
 certificates generated at test time. They check that the mTLS listener
