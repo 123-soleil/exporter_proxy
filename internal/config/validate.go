@@ -47,6 +47,7 @@ func validate(fc *fileConfig) error {
 	// metrics section: mandatory.
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)
+	v.checkNetworks("metrics", fc.Metrics.AllowedNetworks)
 
 	// defaults section: every value set must be positive.
 	v.checkLimits("defaults", fc.Defaults.fileLimits)
@@ -77,6 +78,7 @@ func validate(fc *fileConfig) error {
 		v.checkListen(where, l.Listen, listens)
 		v.checkWebConfigFile(where, l.WebConfigFile)
 		v.checkPositiveInt(where, "max_concurrent_requests", l.MaxConcurrentRequests)
+		v.checkNetworks(where, l.AllowedNetworks)
 
 		if len(l.Routes) == 0 {
 			v.addf(where, "at least one route is required")
@@ -203,6 +205,23 @@ func (v *validator) checkListen(where, addr string, seen map[string]string) {
 		return
 	}
 	seen[addr] = where
+}
+
+// checkNetworks checks allowed_networks: unset allows every address, an
+// empty list would refuse every client.
+func (v *validator) checkNetworks(where string, entries []string) {
+	if entries == nil {
+		return
+	}
+	if len(entries) == 0 {
+		v.addf(where, "allowed_networks is empty: remove it or list the allowed networks")
+		return
+	}
+	for _, e := range entries {
+		if _, err := ParseNetwork(e); err != nil {
+			v.addf(where, "allowed_networks %q is not an address or a network in CIDR notation: %v", e, err)
+		}
+	}
 }
 
 func (v *validator) checkWebConfigFile(where, p string) {

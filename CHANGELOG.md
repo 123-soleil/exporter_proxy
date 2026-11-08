@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read get the result of that read instead of reading again (scrapers in
   high availability), without taking a `max_concurrent_requests` slot;
   new counter `exporter_proxy_requests_shared_total{listener,route}`.
+- `allowed_networks` on listeners and on `metrics`: connections from other
+  client addresses are closed as soon as they are accepted, before the TLS
+  handshake, and counted as `network_not_allowed` in
+  `exporter_proxy_auth_failures_total`. Applied by a reload without
+  restart; connections opened before a reload that removed their address
+  get `403` at their next request and are closed.
 
 ## [0.1.0] - 2026-11-08
 

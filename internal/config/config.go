@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -56,8 +57,9 @@ func hash48(data []byte) uint64 {
 
 // MetricsEndpoint is where exporter_proxy exposes its own metrics.
 type MetricsEndpoint struct {
-	Listen        string
-	WebConfigFile string
+	Listen          string
+	WebConfigFile   string
+	AllowedNetworks []netip.Prefix // nil: every client address
 }
 
 // Listener is one listening address with its authentication and routes.
@@ -66,7 +68,10 @@ type Listener struct {
 	Listen                string
 	WebConfigFile         string
 	MaxConcurrentRequests int
-	Routes                []Route
+	// AllowedNetworks are the client networks allowed to connect; nil:
+	// every client address.
+	AllowedNetworks []netip.Prefix
+	Routes          []Route
 }
 
 // Route maps an exact request path to one metrics source.
@@ -99,8 +104,9 @@ type fileConfig struct {
 }
 
 type fileMetrics struct {
-	Listen        string `yaml:"listen"`
-	WebConfigFile string `yaml:"web_config_file"`
+	Listen          string   `yaml:"listen"`
+	WebConfigFile   string   `yaml:"web_config_file"`
+	AllowedNetworks []string `yaml:"allowed_networks"`
 }
 
 type fileLimits struct {
@@ -119,6 +125,7 @@ type fileListener struct {
 	Listen                string      `yaml:"listen"`
 	WebConfigFile         string      `yaml:"web_config_file"`
 	MaxConcurrentRequests *int        `yaml:"max_concurrent_requests"`
+	AllowedNetworks       []string    `yaml:"allowed_networks"`
 	Routes                []fileRoute `yaml:"routes"`
 }
 
@@ -181,8 +188,9 @@ func resolve(fc *fileConfig) *Config {
 
 	cfg := &Config{
 		Metrics: MetricsEndpoint{
-			Listen:        fc.Metrics.Listen,
-			WebConfigFile: fc.Metrics.WebConfigFile,
+			Listen:          fc.Metrics.Listen,
+			WebConfigFile:   fc.Metrics.WebConfigFile,
+			AllowedNetworks: networks(fc.Metrics.AllowedNetworks),
 		},
 		Listeners: make([]Listener, 0, len(fc.Listeners)),
 	}
@@ -192,6 +200,7 @@ func resolve(fc *fileConfig) *Config {
 			Listen:                fl.Listen,
 			WebConfigFile:         fl.WebConfigFile,
 			MaxConcurrentRequests: valueOr(fl.MaxConcurrentRequests, baseConcurrency),
+			AllowedNetworks:       networks(fl.AllowedNetworks),
 			Routes:                make([]Route, 0, len(fl.Routes)),
 		}
 		for _, fr := range fl.Routes {
@@ -211,6 +220,52 @@ func resolve(fc *fileConfig) *Config {
 		cfg.Listeners = append(cfg.Listeners, l)
 	}
 	return cfg
+}
+
+// networks returns validated allowed_networks entries as prefixes, nil when
+// unset.
+func networks(entries []string) []netip.Prefix {
+	if entries == nil {
+		return nil
+	}
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for _, e := range entries {
+		p, err := ParseNetwork(e)
+		if err != nil {
+			panic(fmt.Sprintf("allowed_networks entry %q passed validation: %v", e, err)) // validated before
+		}
+		prefixes = append(prefixes, p)
+	}
+	return prefixes
+}
+
+// ParseNetwork parses an allowed_networks entry: a network in CIDR
+// notation, written with its host bits cleared (192.0.2.0/24), or a single
+// address. IPv4-mapped IPv6 forms are converted to IPv4, like client
+// addresses are.
+func ParseNetwork(s string) (netip.Prefix, error) {
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		if p != p.Masked() {
+			return netip.Prefix{}, fmt.Errorf("host bits set, use %q", p.Masked().String())
+		}
+		if p.Addr().Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		return p, nil
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	if a.Zone() != "" {
+		return netip.Prefix{}, errors.New("an IPv6 zone is not allowed")
+	}
+	a = a.Unmap()
+	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
 func valueOr[T any](p *T, def T) T {

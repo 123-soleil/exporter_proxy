@@ -249,7 +249,34 @@ net/http errors clients can cause, never hides them.
 | `tls_handshake` | TLS or mTLS handshake failed because of the client: no or invalid client certificate, TLS version or cipher mismatch, client closing during the handshake (port scanners, TCP health checks). Handshakes refused because the server's own TLS settings cannot be loaded (web configuration, certificate, key or client CA, or a server certificate outside its validity dates) are not counted here: they are logged at `error` level and shown by `exporter_proxy_web_config_read_error` | connection closed | `warn` `msg="TLS handshake failed"` with `remote` and `err` |
 | `missing_credentials` | Basic auth required, none sent | `401` | `warn` `msg="authentication refused"` with `remote` |
 | `invalid_credentials` | Unknown user or wrong password | `401` | `warn`, with `remote` and `user` (truncated to 64 characters; passwords are never logged) |
+| `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
+
+### Allowed networks
+
+`allowed_networks` (on a listener or on `metrics`) lists the client
+addresses allowed to connect, as single addresses (`192.0.2.10`) or networks
+in CIDR notation written with their host bits cleared (`10.0.0.0/8`,
+`2001:db8::/32`). A connection from any other address is closed as soon as
+it is accepted: before the TLS handshake and before any request, so it
+costs no TLS or bcrypt work. Without `allowed_networks`, every address may
+connect.
+
+- It adds to the web configuration's authentication, it does not replace
+  it: a client in an allowed network still needs its certificate or
+  password.
+- IPv4 clients of a dual-stack socket (`::ffff:10.1.2.3`) are matched as
+  IPv4 addresses.
+- A reload applies a new list without restarting the listener. The list
+  is also checked on every request: a connection opened before a reload
+  that removed its address gets `403` at its next request and is closed
+  (counted and logged like a refused connection).
+- An empty list is invalid (it would refuse every client), and so is a
+  listener on a Unix socket (`systemd:` socket unit with `ListenStream=`
+  a path) with `allowed_networks`: its clients have no address. Such a
+  listener does not start.
+- With systemd, `IPAddressAllow=` and `IPAddressDeny=` filter for the whole
+  service; `allowed_networks` filters per listener, also in a container.
 
 ### Rate limiting of password checks
 
@@ -427,6 +454,9 @@ listeners:
     listen: ":9100"
     web_config_file: /etc/exporter_proxy/web-mtls.yml
     max_concurrent_requests: 20   # per-listener override
+    allowed_networks:             # optional: only these clients may connect
+      - 10.0.0.0/8
+      - 192.0.2.10
     routes:
       - path: /metrics
         upstream: http://127.0.0.1:19100/metrics
@@ -478,6 +508,7 @@ together on one log line (each prefixed with its location, e.g.
 | `upstream` | `http://` only, with a host, without credentials (`user:password@`) or fragment. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
+| `allowed_networks` | Optional, on listeners and `metrics`: a non-empty list of addresses or networks in CIDR notation with host bits cleared. Not allowed on a listener whose socket is a Unix socket (refused when it starts). |
 | Limits     | `timeout`, `max_body_bytes`, `max_samples`, `max_concurrent_requests` and `max_age` must be greater than 0 wherever they are set. |
 
 Once valid, the configuration is identified by a hash: the first 48 bits of
@@ -885,10 +916,10 @@ the `listen` value as written):
 | Change | Effect |
 |--------|--------|
 | Same `name`, `listen` and `web_config_file`, and the same TLS, HTTP/2, `rate_limit` and client certificate settings (`client_auth_type`, client CA content, `client_allowed_sans`) in that file | Routes and limits are swapped atomically; the socket and open connections are kept. |
-| Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. |
+| Same `listen`, other `web_config_file` or one of these settings changed in it, or listener renamed | The socket is duplicated: the port is never closed. A new server starts on it and the previous one stops gracefully: its open connections, including idle keep-alive ones accepted under the previous client certificate settings, are closed, and clients reconnect under the new ones. Until then, requests on those connections get the new routes and `allowed_networks` if the new listener has the same web configuration file, TLS and client certificate settings (the previous server's authentication then enforces the same), `503` otherwise. |
 | New `listen` address | Bound at reload. |
 | New `systemd:<name>` | Refused: systemd passes its sockets at startup only; restart the service. |
-| Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. |
+| Listener removed | Stopped gracefully: in-flight requests complete (up to 15 s), then the port is closed. New requests on connections still open get `503`. |
 
 During a reload, requests already running on the previous handler still
 count against its `max_concurrent_requests`, while new requests use the new

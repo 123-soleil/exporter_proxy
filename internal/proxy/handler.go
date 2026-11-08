@@ -66,10 +66,12 @@ const (
 	AuthMissingCredentials AuthReason = "missing_credentials" // basic auth required, none sent
 	AuthInvalidCredentials AuthReason = "invalid_credentials" // unknown user or wrong password
 	AuthRateLimited        AuthReason = "rate_limited"        // too many attempts, answered 429
+	AuthNetworkNotAllowed  AuthReason = "network_not_allowed" // client address outside allowed_networks
 )
 
 // AuthReasons lists every AuthReason, to initialize metric series.
-var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited}
+var AuthReasons = []AuthReason{AuthTLSHandshake, AuthMissingCredentials, AuthInvalidCredentials, AuthRateLimited,
+	AuthNetworkNotAllowed}
 
 // Options configures a handler.
 type Options struct {

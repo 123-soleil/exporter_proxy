@@ -303,6 +303,10 @@ type authHandler struct {
 	pending  chan struct{}
 	// tlsHealth is set on TLS listeners.
 	tlsHealth *tlsHealth
+	// allows checks a client address against the listener's
+	// allowed_networks on every request: a reload narrowing them refuses
+	// connections opened before it at their next request. Nil: no check.
+	allows func(remote string) bool
 	// retired is set once the listener is replaced or stopped: requests
 	// and handshakes it still finishes no longer report the web
 	// configuration state, which belongs to the listener of the same name
@@ -360,6 +364,19 @@ const (
 )
 
 func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.allows != nil && !h.allows(r.RemoteAddr) {
+		if !h.retired.Load() {
+			h.rec.AuthFailed(h.listener, proxy.AuthNetworkNotAllowed)
+		}
+		h.logger.Log(r.Context(), h.clientLogs.level(slog.LevelWarn),
+			"request refused: client address no longer in allowed_networks, closing the connection",
+			"remote", r.RemoteAddr)
+		// HTTP/1.1 closes the connection after the answer; HTTP/2 sends
+		// GOAWAY.
+		w.Header().Set("Connection", "close")
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
 	// Before reading the web configuration: refused requests cost nothing.
 	if h.limiter != nil && !h.limiter.Allow() {
 		h.refuse(w, r, proxy.AuthRateLimited, "", http.StatusTooManyRequests)

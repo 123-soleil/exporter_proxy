@@ -41,6 +41,10 @@ listeners:
     web_config_file: /etc/exporter_proxy/web-mtls.yml
     # Optional, overrides defaults.max_concurrent_requests.
     # max_concurrent_requests: 2
+    # Optional: only these client addresses or networks may connect (the
+    # Prometheus servers); others are refused before the TLS handshake.
+    # allowed_networks:
+    #   - CHANGE_ME/24
     routes:
       # Exact request path, starting with '/'. Required, unique in the
       # listener.
