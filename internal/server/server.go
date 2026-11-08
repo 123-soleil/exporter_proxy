@@ -109,7 +109,7 @@ type listenerSettings struct {
 type mtlsSettings struct {
 	clientAuth  string // normalized client_auth_type
 	clientCA    bool   // a client CA is configured (file or inline)
-	allowedSANs string // sorted client_allowed_sans, newline-separated
+	allowedSANs string // sorted client_allowed_sans, quoted: unambiguous
 }
 
 func mtlsOf(tc *web.TLSConfig) mtlsSettings {
@@ -119,8 +119,17 @@ func mtlsOf(tc *web.TLSConfig) mtlsSettings {
 	return mtlsSettings{
 		clientAuth:  webconfig.NormalizeClientAuth(tc.ClientAuth),
 		clientCA:    tc.ClientCAs != "" || tc.ClientCAsText != "",
-		allowedSANs: strings.Join(slices.Sorted(slices.Values(tc.ClientAllowedSans)), "\n"),
+		allowedSANs: quotedSANs(tc.ClientAllowedSans),
 	}
+}
+
+// quotedSANs encodes a client_allowed_sans list for comparison: sorted and
+// quoted, so that no two lists share an encoding; empty when unset.
+func quotedSANs(sans []string) string {
+	if len(sans) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%q", slices.Sorted(slices.Values(sans)))
 }
 
 func settingsOf(wc *web.Config) listenerSettings {
@@ -153,13 +162,87 @@ func settingsOf(wc *web.Config) listenerSettings {
 // listener started with: a file half-written or changed while running
 // never lets a client in under other rules. Changing them takes a reload.
 var errClientAuthChanged = errors.New("client certificate settings (client_auth_type, client CA, client_allowed_sans) " +
-	"differ from those the listener started with: fix the file, or reload to apply them")
+	"differ from those the listener started with: fix the file, or reload to apply them " +
+	"(restart the service if they are weaker)")
 
 // checkClientAuth refuses a web configuration whose client certificate
 // settings differ from those of the listener.
 func (l *listener) checkClientAuth(tc *web.TLSConfig) error {
 	if mtlsOf(tc) != l.settings.mtls {
 		return errClientAuthChanged
+	}
+	return nil
+}
+
+// tlsConfigFor builds the TLS configuration of a new connection: the
+// client certificate settings must be those the listener started with, then
+// serverTLSConfig applies.
+func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
+	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
+		return nil, err
+	}
+	// The listener offers HTTP/2 as set when it started, whatever the file
+	// says now: its ciphers must carry it.
+	withListenerHTTP2 := *c
+	withListenerHTTP2.HTTPConfig.HTTP2 = l.settings.http2
+	if err := webconfig.ValidateHTTP2Ciphers(&withListenerHTTP2); err != nil {
+		return nil, err
+	}
+	return serverTLSConfig(c)
+}
+
+// serverTLSConfig builds a TLS configuration from c with exporter-toolkit,
+// then applies exporter_proxy's rules: a client CA pool with at least one
+// certificate (checked on the pool built from the single read of the file),
+// a server certificate within its validity dates, loaded once and pinned in
+// the configuration (so that every handshake of the connection, TLS 1.3
+// session resumption included, goes through this check), and
+// client_allowed_sans also on resumption.
+func serverTLSConfig(c *web.Config) (*tls.Config, error) {
+	cfg, err := web.ConfigToTLSConfig(&c.TLSConfig)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ClientCAs != nil && cfg.ClientCAs.Equal(x509.NewCertPool()) {
+		return nil, errors.New("the client CA contains no certificate: every client would be refused")
+	}
+	if cfg.GetCertificate != nil {
+		cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCertDates(cert, time.Now()); err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []tls.Certificate{*cert}
+		cfg.GetCertificate = nil
+	}
+	restrictSANsOnResumption(cfg, c.TLSConfig)
+	return cfg, nil
+}
+
+// errCertDates marks a server certificate chain outside its validity
+// dates.
+var errCertDates = errors.New("server certificate outside its validity dates")
+
+// checkCertDates refuses a server certificate (the leaf) outside its
+// validity dates: clients would reject it, and the failure would look like
+// theirs. Intermediates are not checked: chains commonly carry an expired
+// cross-signed certificate that clients skip by building another path to
+// their trust store (only --check warns about them).
+func checkCertDates(cert *tls.Certificate, now time.Time) error {
+	if len(cert.Certificate) == 0 {
+		return errors.New("no server certificate")
+	}
+	c, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("server certificate: %w", err)
+	}
+	switch {
+	case now.After(c.NotAfter):
+		return fmt.Errorf("%w: %q expired on %s", errCertDates, c.Subject, c.NotAfter.UTC().Format(time.RFC3339))
+	case now.Before(c.NotBefore):
+		return fmt.Errorf("%w: %q is not valid before %s", errCertDates, c.Subject, c.NotBefore.UTC().Format(time.RFC3339))
 	}
 	return nil
 }
@@ -358,27 +441,43 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 
 	type swap struct {
-		l  *listener
-		sp spec
+		l         *listener
+		sp        spec
+		basicAuth bool   // the web configuration has users
+		tlsErr    error  // TLS settings checked like a new connection
+		tlsGen    uint64 // TLS health generation before the check
 	}
 	var swaps []swap
 	var started []*listener
-	type authLoss struct{ listener, what string }
-	var authRemoved []authLoss // listeners whose protection is weakened
+	var weakened []string // listeners whose protection the reload would lower
 	kept := map[string]bool{}
 	for _, sp := range specs {
 		cur := s.listeners[sp.name]
 		if cur != nil && cur.spec.listen == sp.listen && cur.spec.webConfig == sp.webConfig {
+			// Read before the file: a handshake failing on a file changed
+			// after this read is not cleared by the check below.
+			var tlsGen uint64
+			if h := cur.auth.tlsHealth; h != nil {
+				tlsGen = h.generation()
+			}
 			wc, err := webconfig.Load(sp.webConfig)
 			if err != nil {
 				s.abortReload(started)
 				return fmt.Errorf("listener %q: %w", sp.name, err)
 			}
 			// Compared with what the listener enforces now, including what
-			// was seen while running (fail closed): a weaker file restarts
-			// the listener with it, instead of keeping the refusals.
-			if settingsOf(wc) == cur.running() {
-				swaps = append(swaps, swap{cur, sp})
+			// was seen while running (fail closed): a different file
+			// restarts the listener with it, if it does not weaken it.
+			// Users in the file are required by requests anyway (usersSeen
+			// is set by the first one): not a reason to restart.
+			running, next := cur.running(), settingsOf(wc)
+			running.basicAuth = running.basicAuth || next.basicAuth
+			if next == running {
+				var tlsErr error
+				if next.tls {
+					_, tlsErr = cur.tlsConfigFor(wc)
+				}
+				swaps = append(swaps, swap{cur, sp, next.basicAuth, tlsErr, tlsGen})
 				kept[sp.name] = true
 				continue
 			}
@@ -417,16 +516,38 @@ func (s *Server) Reload(cfg *config.Config) error {
 		}
 		if prev != nil {
 			if lost := prev.weakens(l.settings); len(lost) > 0 {
-				authRemoved = append(authRemoved, authLoss{sp.name, strings.Join(lost, " and ")})
+				weakened = append(weakened, fmt.Sprintf("listener %q: %s", sp.name, strings.Join(lost, " and ")))
 			}
 		}
 		started = append(started, l)
+	}
+	if len(weakened) > 0 {
+		// A web configuration caught empty or half-written must not lower
+		// authentication: a reload never does. Lowering it on purpose takes
+		// a restart.
+		s.abortReload(started)
+		return fmt.Errorf("the reload would weaken authentication (%s): fix the web configuration, "+
+			"or restart the service to apply it", strings.Join(weakened, "; "))
 	}
 
 	// Commit: nothing below can fail.
 	for _, sw := range swaps {
 		sw.l.spec = sw.sp
 		retire(sw.l.handler.store(sw.sp))
+		if sw.basicAuth {
+			// Users found by the reload are required from now on, like
+			// users seen by a request (fail closed).
+			sw.l.auth.usersSeen.Store(true)
+		}
+		// The TLS state checked by this reload replaces the previous one,
+		// reported by ReportTLSHealth once the metrics are reset.
+		if h := sw.l.auth.tlsHealth; h != nil {
+			if sw.tlsErr != nil {
+				h.markFailing()
+			} else {
+				h.markHealthySince(sw.tlsGen)
+			}
+		}
 	}
 	next := make(map[string]*listener, len(specs))
 	for name := range kept {
@@ -445,13 +566,20 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 	s.listeners = next
 	s.pruneSuccesses()
-	for _, a := range authRemoved {
-		// On purpose, or a web configuration file caught empty or
-		// half-written by this reload: say it loudly.
-		s.logger.Warn("authentication weakened by this reload: "+a.what+" removed or lowered",
-			"listener", a.listener)
-	}
 	return nil
+}
+
+// ReportTLSHealth reports again the TLS listeners whose settings fail, after
+// the metrics were reset by a configuration load (startup or reload), so
+// that the failure shows from the start instead of at the next handshake.
+func (s *Server) ReportTLSHealth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.listeners {
+		if l.auth.tlsHealth != nil {
+			l.auth.tlsHealth.reportFailing()
+		}
+	}
 }
 
 // abortReload closes the listeners started by a failed reload and forgets
@@ -508,7 +636,26 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 
 	var problems []string
 	for _, sp := range specs {
-		if err := web.Validate(sp.webConfig); err != nil {
+		err := web.Validate(sp.webConfig)
+		var wc *web.Config
+		if err == nil {
+			// exporter_proxy's own rules, checked for every file now so that
+			// all problems are reported at once.
+			wc, err = webconfig.Load(sp.webConfig)
+		}
+		if err == nil && wc.TLSConfig.IsEnabled() {
+			// What every new connection would check. A certificate outside
+			// its dates only stops that listener's TLS connections (as a
+			// server-side failure): logged, not refused, so that the other
+			// listeners and the metrics endpoint keep running.
+			_, err = serverTLSConfig(wc)
+			if errors.Is(err, errCertDates) {
+				s.logger.Error("server certificate outside its validity dates: new TLS connections will be refused",
+					"listener", sp.name, "web_config_file", sp.webConfig, "err", errfmt.OneLine(err))
+				err = nil
+			}
+		}
+		if err != nil {
 			problems = append(problems, fmt.Sprintf("listener %q: web_config_file %s: %s",
 				sp.name, sp.webConfig, errfmt.OneLine(err)))
 		}
@@ -585,29 +732,54 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
 	tlsCfg.NextProtos = nextProtos
-	// Certificates, key and client CA are re-read on every new connection,
-	// like exporter-toolkit: renewed files apply without restart.
-	name, webConfig, logger, rec := sp.name, sp.webConfig, s.logger.With("listener", sp.name), s.recorder()
-	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-		c, err := webconfig.Load(webConfig)
-		if err == nil {
-			err = l.checkClientAuth(&c.TLSConfig)
-		}
-		if err == nil {
-			var cfg *tls.Config
-			if cfg, err = web.ConfigToTLSConfig(&c.TLSConfig); err == nil {
-				restrictSANsOnResumption(cfg, c.TLSConfig)
-				rec.WebConfigRead(name, true, true)
-				cfg.NextProtos = nextProtos
-				return cfg, nil
-			}
-		}
-		rec.WebConfigRead(name, true, false)
+	webConfig, logger := sp.webConfig, s.logger.With("listener", sp.name)
+	var health *tlsHealth
+	// fail reports a failure of the server's TLS settings, and returns the
+	// error marked for serverErrorLog: the server, not the client, failed
+	// the handshake.
+	fail := func(err error) error {
+		health.failed()
 		logger.Log(context.Background(), serverLogs.level(slog.LevelError), "cannot load TLS settings for a new connection",
 			"web_config_file", webConfig, "err", errfmt.OneLine(err))
-		// The marker tells serverErrorLog that the server, not the client,
-		// failed the handshake.
-		return nil, fmt.Errorf("%s: %w", serverTLSUnavailable, err)
+		return fmt.Errorf("%s: %w", serverTLSUnavailable, err)
+	}
+	health = newTLSHealth(func() error {
+		c, err := webconfig.LoadForRequest(webConfig)
+		if err != nil {
+			return err
+		}
+		_, err = l.tlsConfigFor(c)
+		return err
+	}, func(ok bool) {
+		if !auth.retired.Load() {
+			s.recorder().WebConfigRead(sp.name, true, ok)
+		}
+	})
+	auth.tlsHealth = health
+	if _, err := l.tlsConfigFor(wc); err != nil {
+		// Logged by prepare (a certificate outside its dates). Reported by
+		// ReportTLSHealth once the start or reload is applied, not now: an
+		// aborted reload must not raise an alarm for a listener that keeps
+		// running.
+		health.markFailing()
+	}
+	// Certificates, key and client CA are re-read on every new connection,
+	// like exporter-toolkit: renewed files apply without restart.
+	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		gen := health.generation()
+		// The client CA is checked on the pool built from a single read of
+		// it (tlsConfigFor), not read twice.
+		c, err := webconfig.LoadForRequest(webConfig)
+		if err != nil {
+			return nil, fail(err)
+		}
+		cfg, err := l.tlsConfigFor(c)
+		if err != nil {
+			return nil, fail(err)
+		}
+		health.succeededSince(gen)
+		cfg.NextProtos = nextProtos
+		return cfg, nil
 	}
 	srv.TLSConfig = tlsCfg
 	return l, nil
@@ -625,15 +797,19 @@ func (s *Server) recorder() proxy.Recorder {
 // update l.spec meanwhile.
 func (s *Server) serve(l *listener) {
 	name, tlsEnabled, srv, ln := l.spec.name, l.settings.tls, l.srv, l.ln
+	served := ln
+	if ln.Addr().Network() == "unix" {
+		served = unixClientsListener{ln}
+	}
 	s.logger.Info("listening", "listener", name, "address", ln.Addr().String(), "tls", tlsEnabled)
 	s.serving.Add(1)
 	go func() {
 		defer s.serving.Done()
 		var err error
 		if tlsEnabled {
-			err = srv.ServeTLS(ln, "", "")
+			err = srv.ServeTLS(served, "", "")
 		} else {
-			err = srv.Serve(ln)
+			err = srv.Serve(served)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// Serve may fail before taking ownership of ln (HTTP/2 setup):
@@ -651,6 +827,7 @@ func (s *Server) serve(l *listener) {
 // upstream connections. Called with s.mu held.
 func (s *Server) drain(l *listener) {
 	name, srv, handler := l.spec.name, l.srv, l.handler
+	l.auth.retired.Store(true)
 	s.draining.Add(1)
 	go func() {
 		defer s.draining.Done()
@@ -663,6 +840,38 @@ func (s *Server) drain(l *listener) {
 		closeIdle(handler.cur.Load().h)
 	}()
 }
+
+// unixClientsListener gives every client of a Unix socket listener the
+// same remote address, "unix". A client may bind its socket to any path,
+// which would otherwise show as its remote address in logs and could
+// imitate the server-side handshake marker; those paths identify nothing.
+type unixClientsListener struct{ net.Listener }
+
+func (l unixClientsListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return unixClientConn{c}, nil
+}
+
+type unixClientConn struct{ net.Conn }
+
+func (unixClientConn) RemoteAddr() net.Addr { return unixRemote{} }
+
+// CloseWrite keeps net/http's graceful half-close before closing a
+// connection, which the wrapper would otherwise hide.
+func (c unixClientConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+type unixRemote struct{}
+
+func (unixRemote) Network() string { return "unix" }
+func (unixRemote) String() string  { return "unix" }
 
 // dupListener returns a new listener on the same socket as ln, so that
 // ln can be closed without closing the port.
@@ -751,23 +960,33 @@ func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Liste
 			wanted[name] = sp.name
 		}
 	}
-	if len(wanted) == 0 {
-		return nil, nil
-	}
-
+	// Called even when no listener uses systemd: sockets passed anyway are
+	// closed and reported below.
 	passed, err := systemdListeners()
 	if err != nil {
+		if len(wanted) == 0 {
+			logger.Warn("cannot read the sockets passed by systemd", "err", err)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("systemd socket activation: %w", err)
 	}
 	sockets := make(map[string]net.Listener, len(wanted))
 	var problems []string
 	for name, lns := range passed {
-		var stream []net.Listener
+		// Only TCP and Unix stream sockets can be served: datagram ones
+		// fail on Accept, and Unix seqpacket ones would show the path a
+		// client binds to as its address (see unixClientsListener).
+		var stream, other []net.Listener
 		for _, ln := range lns {
-			if ln != nil { // nil for non-stream sockets (datagram, FIFO)
+			switch {
+			case ln == nil:
+			case ln.Addr().Network() == "tcp" || ln.Addr().Network() == "unix":
 				stream = append(stream, ln)
+			default:
+				other = append(other, ln)
 			}
 		}
+		closeAll(nil, other...)
 		listener, used := wanted[name]
 		switch {
 		case !used:
@@ -783,7 +1002,8 @@ func takeSystemdSockets(specs []spec, logger *slog.Logger) (map[string]net.Liste
 	}
 	for name, listener := range wanted {
 		if _, ok := passed[name]; !ok {
-			problems = append(problems, fmt.Sprintf("listener %q: no systemd socket named %q (FileDescriptorName=)", listener, name))
+			problems = append(problems, fmt.Sprintf("listener %q: no systemd socket named %q (FileDescriptorName=; "+
+				"a UDP socket, ListenDatagram=, is not passed as a listener)", listener, name))
 		}
 	}
 	if len(problems) > 0 {

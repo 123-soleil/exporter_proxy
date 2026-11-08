@@ -7,6 +7,7 @@
 package webconfig
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 
 	"github.com/prometheus/exporter-toolkit/web"
 	"go.yaml.in/yaml/v2"
@@ -21,7 +23,15 @@ import (
 )
 
 // Load reads and parses the web configuration file at path.
-func Load(path string) (*web.Config, error) {
+func Load(path string) (*web.Config, error) { return load(path, true) }
+
+// LoadForRequest is Load without reading the client CA: requests on
+// connections already open do not use it (it is checked on every new TLS
+// connection), so a client CA file briefly missing while being rotated does
+// not fail them.
+func LoadForRequest(path string) (*web.Config, error) { return load(path, false) }
+
+func load(path string, checkCA bool) (*web.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -43,14 +53,21 @@ func Load(path string) (*web.Config, error) {
 	if err := validateAllowedSANs(&c.TLSConfig); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	// A rate_limit interval with no burst would refuse every request.
+	if rl := c.RateLimiterConfig; rl.Interval > 0 && rl.Burst < 1 {
+		return nil, fmt.Errorf("parse %s: rate_limit: burst must be at least 1 when interval is set", path)
+	}
 	// Paths are relative to the file, like exporter-toolkit: resolved
 	// before the checks that read them.
 	c.TLSConfig.SetDirectory(filepath.Dir(path))
 	if c.TLSConfig.IsEnabled() {
-		if err := validateClientCA(&c.TLSConfig); err != nil {
+		if c.TLSConfig.MinVersion > c.TLSConfig.MaxVersion {
+			return nil, fmt.Errorf("parse %s: min_version is above max_version: no TLS version left", path)
+		}
+		if err := validateClientCA(&c.TLSConfig, checkCA); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		if err := validateHTTP2Ciphers(c); err != nil {
+		if err := ValidateHTTP2Ciphers(c); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 	}
@@ -99,7 +116,13 @@ type Summary struct {
 	CertFile     string
 	KeyFile      string
 	ClientCAFile string
-	HasUsers     bool
+	// CertPEM and ClientCAPEM are the inline certificates (cert, client_ca).
+	CertPEM     string
+	ClientCAPEM string
+	HasUsers    bool
+	// MinBcryptCost and MaxBcryptCost are the lowest and highest costs of
+	// the basic_auth_users hashes (0 without users).
+	MinBcryptCost, MaxBcryptCost int
 }
 
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
@@ -111,12 +134,27 @@ func Read(path string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	minCost, maxCost := 0, 0
+	for _, h := range c.Users {
+		cost, err := bcrypt.Cost([]byte(h)) // checked by Load
+		if err != nil {
+			continue
+		}
+		if minCost == 0 || cost < minCost {
+			minCost = cost
+		}
+		maxCost = max(maxCost, cost)
+	}
 	return Summary{
-		TLSEnabled:   c.TLSConfig.IsEnabled(),
-		CertFile:     c.TLSConfig.TLSCertPath,
-		KeyFile:      c.TLSConfig.TLSKeyPath,
-		ClientCAFile: c.TLSConfig.ClientCAs,
-		HasUsers:     len(c.Users) > 0,
+		MinBcryptCost: minCost,
+		MaxBcryptCost: maxCost,
+		TLSEnabled:    c.TLSConfig.IsEnabled(),
+		CertFile:      c.TLSConfig.TLSCertPath,
+		KeyFile:       c.TLSConfig.TLSKeyPath,
+		ClientCAFile:  c.TLSConfig.ClientCAs,
+		CertPEM:       c.TLSConfig.TLSCert,
+		ClientCAPEM:   c.TLSConfig.ClientCAsText,
+		HasUsers:      len(c.Users) > 0,
 	}, nil
 }
 
@@ -147,11 +185,6 @@ func ClientCertPolicy(clientAuth string) (required, verified bool) {
 	return false, false // NoClientCert, RequestClientCert
 }
 
-// validateAllowedSANs rejects client_allowed_sans that would not restrict
-// clients as written: an empty list (exporter-toolkit then refuses every
-// certificate, and panics on clients without one), or a list with a
-// client_auth_type that does not verify certificates, since any client
-// could then present a self-signed certificate carrying an allowed name.
 // validateClientCA rejects a client_auth_type that verifies client
 // certificates without a client CA: crypto/tls would then verify them
 // against the system roots, accepting any client certificate from a CA the
@@ -162,7 +195,7 @@ func ClientCertPolicy(clientAuth string) (required, verified bool) {
 // RequireClientCert reads like "verify") is ignored, and any self-signed
 // certificate is accepted. A client CA without any certificate refuses
 // every client.
-func validateClientCA(tc *web.TLSConfig) error {
+func validateClientCA(tc *web.TLSConfig, checkContent bool) error {
 	hasCA := tc.ClientCAs != "" || tc.ClientCAsText != ""
 	_, verified := ClientCertPolicy(tc.ClientAuth)
 	switch {
@@ -172,9 +205,27 @@ func validateClientCA(tc *web.TLSConfig) error {
 	case !verified && hasCA:
 		return fmt.Errorf("client_auth_type %s does not verify client certificates, so the client CA would be ignored: "+
 			"use RequireAndVerifyClientCert", NormalizeClientAuth(tc.ClientAuth))
-	case !hasCA:
+	case !hasCA || !checkContent:
 		return nil
 	}
+	return checkClientCAContent(tc)
+}
+
+// caChecks caches the result of client CA checks by content hash: parsing
+// a large bundle on every new TLS connection would cost milliseconds.
+// Keyed by content, not file metadata, so that a file rewritten keeping its
+// size and modification time (cp -p, rsync -t) is checked again.
+var caChecks = struct {
+	sync.Mutex
+	m map[[sha256.Size]byte]error
+}{m: map[[sha256.Size]byte]error{}}
+
+// maxCACheckEntries bounds the cache (a few CA contents per process).
+const maxCACheckEntries = 64
+
+// checkClientCAContent rejects a client CA without any certificate, which
+// would refuse every client.
+func checkClientCAContent(tc *web.TLSConfig) error {
 	pemData := []byte(tc.ClientCAsText)
 	if tc.ClientCAs != "" {
 		data, err := os.ReadFile(tc.ClientCAs)
@@ -183,10 +234,23 @@ func validateClientCA(tc *web.TLSConfig) error {
 		}
 		pemData = data
 	}
-	if !x509.NewCertPool().AppendCertsFromPEM(pemData) {
-		return errors.New("the client CA contains no certificate: every client would be refused")
+	key := sha256.Sum256(pemData)
+	caChecks.Lock()
+	err, ok := caChecks.m[key]
+	caChecks.Unlock()
+	if ok {
+		return err
 	}
-	return nil
+	if !x509.NewCertPool().AppendCertsFromPEM(pemData) {
+		err = errors.New("the client CA contains no certificate: every client would be refused")
+	}
+	caChecks.Lock()
+	if len(caChecks.m) >= maxCACheckEntries {
+		clear(caChecks.m)
+	}
+	caChecks.m[key] = err
+	caChecks.Unlock()
+	return err
 }
 
 // http2RequiredCiphers are the cipher suites net/http requires for HTTP/2
@@ -196,10 +260,10 @@ var http2RequiredCiphers = []web.Cipher{
 	web.Cipher(tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 }
 
-// validateHTTP2Ciphers rejects a cipher_suites list net/http refuses to
+// ValidateHTTP2Ciphers rejects a cipher_suites list net/http refuses to
 // serve HTTP/2 with: the listener would stop right after starting,
 // stopping the whole process.
-func validateHTTP2Ciphers(c *web.Config) error {
+func ValidateHTTP2Ciphers(c *web.Config) error {
 	tc := c.TLSConfig
 	if !c.HTTPConfig.HTTP2 || len(tc.CipherSuites) == 0 || tc.MinVersion >= web.TLSVersion(tls.VersionTLS13) {
 		return nil
@@ -214,6 +278,11 @@ func validateHTTP2Ciphers(c *web.Config) error {
 		"(or set http_server_config.http2: false)")
 }
 
+// validateAllowedSANs rejects client_allowed_sans that would not restrict
+// clients as written: an empty list (exporter-toolkit then refuses every
+// certificate, and panics on clients without one), or a list with a
+// client_auth_type that does not verify certificates, since any client
+// could then present a self-signed certificate carrying an allowed name.
 func validateAllowedSANs(tc *web.TLSConfig) error {
 	if tc.ClientAllowedSans == nil {
 		return nil

@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/123-soleil/exporter_proxy/internal/config"
 )
 
@@ -128,10 +130,34 @@ func TestWebConfigs(t *testing.T) {
 	soonCert, soonKey := writeCert(t, dir, "soon", now.Add(-day), now.Add(10*day))
 	futureCert, futureKey := writeCert(t, dir, "future", now.Add(day), now.Add(365*day))
 	goodCA, _ := writeCert(t, dir, "ca", now.Add(-day), now.Add(365*day))
+	// A rotation bundle: the old, expired CA and the new one.
+	rotating := filepath.Join(dir, "rotating-ca.crt")
+	expiredPEM, err := os.ReadFile(expiredCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodCAPEM, err := os.ReadFile(goodCA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, rotating, string(expiredPEM)+string(goodCAPEM))
+	// An expired certificate written inline.
+	expiredKeyPEM, err := os.ReadFile(expiredKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inlineExpired := filepath.Join(dir, "inline-expired.yml")
+	writeFile(t, inlineExpired, "tls_server_config:\n  cert: |\n"+indent(string(expiredPEM))+"  key: |\n"+indent(string(expiredKeyPEM)))
 	emptyCA := filepath.Join(dir, "empty-ca.crt")
 	writeFile(t, emptyCA, "not a certificate\n")
 	basicOnly := filepath.Join(dir, "basic.yml")
 	writeFile(t, basicOnly, "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n")
+	mixedCosts := filepath.Join(dir, "mixed-costs.yml")
+	low, err := bcrypt.GenerateFromPassword([]byte("p"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, mixedCosts, "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n  v: "+string(low)+"\n")
 	invalid := filepath.Join(dir, "invalid.yml")
 	writeFile(t, invalid, "tls_server_config:\n  cert_fil: x\n")
 
@@ -148,13 +174,19 @@ func TestWebConfigs(t *testing.T) {
 		{"certificate not valid yet", tlsWebConfig(t, dir, futureCert, futureKey, ""),
 			[]want{{Problem, "is not valid before"}}},
 		{"expired client CA", tlsWebConfig(t, dir, goodCert, goodKey, expiredCert),
-			[]want{{Problem, "client_ca_file"}}},
+			[]want{{Warning, "expired on"}, {Problem, "no currently valid certificate"}}},
+		{"client CA bundle rotating", tlsWebConfig(t, dir, goodCert, goodKey, rotating),
+			[]want{{Warning, "expired on"}}},
+		{"expired inline certificate", inlineExpired,
+			[]want{{Problem, "cert (inline)"}}},
 		{"client CA without certificate", tlsWebConfig(t, dir, goodCert, goodKey, emptyCA),
 			[]want{{Problem, "contains no certificate"}}},
 		{"key does not match certificate", tlsWebConfig(t, dir, goodCert, expiredKey, ""),
 			[]want{{Problem, "X509KeyPair"}}},
 		{"basic auth without TLS", basicOnly,
 			[]want{{Warning, "credentials travel in clear text"}}},
+		{"bcrypt costs differ", mixedCosts,
+			[]want{{Warning, "credentials travel in clear text"}, {Warning, "different bcrypt costs (4 to 10)"}}},
 		{"unknown key", invalid, []want{{Problem, "cert_fil"}}},
 		{"missing file", filepath.Join(dir, "missing.yml"), []want{{Problem, "no such file"}}},
 	}
@@ -290,5 +322,47 @@ func TestCertificatesLeafOnly(t *testing.T) {
 	// A bundle reports every certificate.
 	c = &checker{now: now}
 	c.certificates("here", "client_ca_file", brokenLeaf, true)
-	expect(t, c.findings, want{Problem, "certificate 1"}, want{Problem, "expired on"})
+	expect(t, c.findings, want{Warning, "certificate 1"}, want{Warning, "expired on"},
+		want{Problem, "no currently valid certificate"})
+}
+
+// Unparseable certificates of a bundle are numbered by their position.
+func TestCertificateNumbering(t *testing.T) {
+	garbage := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("garbage")}))
+	c := &checker{now: time.Now()}
+	c.certificatesPEM("here", "client_ca", []byte(garbage+garbage), true)
+	expect(t, c.findings, want{Warning, "certificate 1:"}, want{Warning, "certificate 2:"},
+		want{Problem, "no currently valid certificate"})
+}
+
+// indent indents every line of s for a YAML block scalar.
+func indent(s string) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(s, "\n") {
+		if line != "" {
+			b.WriteString("    " + line)
+		}
+	}
+	return b.String()
+}
+
+// Intermediates of cert_file outside their dates are warnings (clients
+// usually skip an expired cross-signature); the leaf stays a problem.
+func TestCertFileIntermediateDates(t *testing.T) {
+	dir := t.TempDir()
+	goodCert, _ := writeCert(t, dir, "leaf", now.Add(-time.Hour), now.Add(365*24*time.Hour))
+	expiredCert, _ := writeCert(t, dir, "intermediate", now.Add(-48*time.Hour), now.Add(-time.Hour))
+	leafPEM, err := os.ReadFile(goodCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intPEM, err := os.ReadFile(expiredCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := filepath.Join(dir, "chain.crt")
+	writeFile(t, chain, string(leafPEM)+string(intPEM))
+	c := &checker{now: now}
+	c.certificates("here", "cert_file", chain, false)
+	expect(t, c.findings, want{Warning, `"CN=intermediate" expired on`})
 }

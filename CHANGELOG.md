@@ -94,12 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body `web configuration unreadable` (was a bare `500`), and sets the new
   gauge `exporter_proxy_web_config_read_error{listener}` to 1 until the file
   is read successfully again; TLS connections refused for the same reason
-  set it too.
+  set it too. A listener replaced by a reload no longer updates it for its
+  replacement, and a reload no longer clears a TLS failure seen after its
+  own check.
 - Client certificate settings fail closed too: `client_auth_type`, the
   presence of a client CA and `client_allowed_sans` are fixed while a TLS
   listener runs; a web configuration that differs (a file cut before
   `client_auth_type` let clients in without a certificate) refuses new
-  connections until a reload. The client CA content can still be rotated
+  connections until a reload (tighter settings) or a restart (looser). The client CA content can still be rotated
   without reload. A reload that changes these settings or the client CA
   content restarts the listener, closing connections opened under the
   previous settings.
@@ -115,22 +117,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plain HTTP listener whose web configuration enables TLS answers `518`
   until a reload, instead of serving in clear text.
 - `OPTIONS *` goes through authentication instead of net/http's automatic
-  empty `200`; HTTP/2 handler panics use the server log budget; a Unix
-  socket client cannot hide its handshake failures behind the server-side
-  marker.
+  empty `200`; HTTP/2 handler panics use the server log budget; Unix
+  socket clients all show as remote address `unix`, so a client cannot
+  shape it (with the path it binds to) to hide its handshake failures
+  behind the server-side marker.
+- A reload never weakens authentication: one that would remove basic
+  authentication, lower client certificate requirements or lose TLS (also
+  through renamed or swapped listeners) is refused, keeping the running
+  configuration; lowering authentication on purpose takes a restart. A web
+  configuration caught half-written by a reload can no longer open a
+  listener.
+- A server certificate (the leaf; an expired cross-signed intermediate is
+  left to clients, `--check` warns about it) outside its validity dates is
+  refused on every new TLS connection (TLS 1.3 session resumption
+  included, the certificate being checked and pinned per connection) as a
+  server-side failure (`web_config_read_error`), instead of being sent and
+  counted as client `tls_handshake` failures; found at startup or reload,
+  it is logged, reported in `web_config_read_error` once the startup or
+  reload is applied (an aborted reload raises no alarm), and only stops
+  that listener's TLS connections. `min_version` above `max_version` is
+  invalid. A file whose ciphers cannot carry the HTTP/2
+  the listener offers is refused at runtime too. Users found by a reload that
+  keeps a listener are required from then on (fail closed). The client CA
+  pool is checked as read once per connection (no second read a rewrite
+  could slip between). A reload that only finds new users in a web
+  configuration keeps the listener instead of restarting it.
+- Sockets passed by systemd are closed and reported even when no listener
+  uses `systemd:`; Unix socket connections keep net/http's graceful
+  half-close.
+- systemd datagram and sequential packet sockets are refused at startup
+  (they failed on Accept, or bypassed the Unix client address masking).
+- `web_config_read_error` returns to 0 when TLS settings load again, also
+  through requests on connections already open (at most one recheck per
+  second, never clearing a failure recorded meanwhile), without waiting for
+  a new handshake. Requests no longer read the client CA, so one briefly
+  missing during a rotation does not answer `518` on open connections.
+- `--check` judges client CA bundles like TLS does (expired or unparseable
+  certificates are warnings while one is valid, normal while rotating CAs)
+  and checks the dates of inline certificates; startup and reload report
+  every web configuration breaking exporter_proxy's rules at once.
+- The client CA check is cached by content hash (a rewrite keeping size
+  and modification time is checked again), instead of parsing the bundle
+  every time.
+- A `rate_limit` with an `interval` but no `burst` is invalid: it refused
+  every request.
 - `client_allowed_sans` requires a verifying `client_auth_type` (with an
   unverified certificate, names could be forged) and cannot be empty; it is
   also checked on TLS session resumption, and a client without a
   certificate is refused (exporter-toolkit panicked).
-- The reload warning covers basic authentication, client certificate
-  requirements and TLS, and compares with the previous listener of the
-  same address (renamed or swapped listeners).
 - Basic authentication fails closed: a listener started with
   `basic_auth_users`, or whose file gained users while running, answers
   `518` if its web configuration loses its users
   (emptied or truncated file) instead of serving without authentication;
-  removing authentication takes a reload, which restarts the listener and
-  logs a warning.
+  removing authentication takes a restart (a reload that would remove it
+  is refused).
 - Malformed bcrypt hashes in a web configuration changed while running make
   it invalid (`518`), like at startup.
 - Handshakes refused because of the server's own TLS settings are no longer
@@ -175,6 +215,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable from the code).
 - `--check` stops at the first certificate of `cert_file` even when it
   cannot be parsed, instead of checking the next one as the leaf.
+- `--check` warns when `basic_auth_users` hashes have different bcrypt
+  costs (response times would tell users apart), and numbers unparseable
+  certificates of a bundle by their position.
+- Passwords longer than 72 bytes are remembered by their first 72 bytes,
+  the only ones bcrypt uses: suffixes added to a valid long password no
+  longer fill the cache of verified credentials.
 - Idle upstream connections are closed when a handler is replaced or
   stopped; a second `SIGTERM` or `SIGINT` stops the process without waiting
   for the graceful shutdown.

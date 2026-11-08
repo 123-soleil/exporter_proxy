@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 	"github.com/123-soleil/exporter_proxy/internal/proxy"
@@ -876,8 +878,9 @@ func TestTLSWebConfigUnreadableIsRecorded(t *testing.T) {
 	}
 }
 
-// Users removed from the file of a listener started with basic auth: 518
-// until a reload, which then removes authentication on purpose.
+// Users removed from the file of a listener started with basic auth: 518,
+// and a reload is refused, since it would remove authentication; a
+// restart applies it.
 func TestUsersRemovedFailClosedUntilReload(t *testing.T) {
 	var gotAuth atomic.Value
 	up := upstream(t, &gotAuth)
@@ -886,8 +889,7 @@ func TestUsersRemovedFailClosedUntilReload(t *testing.T) {
 	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
 
 	l := withAddr(t, listenerConfig("node", web, up.URL))
-	logs := &syncBuffer{}
-	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
 	addr := s.Addr("node").String()
 	url := "http://" + addr + "/metrics"
 
@@ -897,21 +899,24 @@ func TestUsersRemovedFailClosedUntilReload(t *testing.T) {
 	}
 
 	l.Listen = addr
-	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
-		t.Fatalf("Reload: %v", err)
+	expectWeakeningRefused(t, s.Reload(&config.Config{Listeners: []config.Listener{l}}), "basic authentication")
+	if code, _ := get(t, url, "", ""); code != StatusWebConfigUnreadable {
+		t.Errorf("after the refused reload: code %d, want 518", code)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if code, _ := get(t, url, "", ""); code == http.StatusOK {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("authentication not removed by the reload")
-		}
-		time.Sleep(20 * time.Millisecond)
+
+	// A restart (a new server) applies the file without authentication.
+	l2 := withAddr(t, listenerConfig("node", web, up.URL))
+	s2 := startServer(t, &config.Config{Listeners: []config.Listener{l2}}, io.Discard)
+	if code, _ := get(t, "http://"+s2.Addr("node").String()+"/metrics", "", ""); code != http.StatusOK {
+		t.Errorf("after a restart: code %d, want 200", code)
 	}
-	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
-		t.Errorf("removal of authentication not warned: %s", logs.String())
+}
+
+// expectWeakeningRefused checks that err refuses a reload weakening what.
+func expectWeakeningRefused(t *testing.T, err error, what string) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "would weaken authentication") || !strings.Contains(err.Error(), what) {
+		t.Errorf("Reload error = %v, want a refusal weakening %s", err, what)
 	}
 }
 
@@ -953,8 +958,7 @@ func TestSuccessCacheKeptAcrossListenerRestart(t *testing.T) {
 	}
 }
 
-// Users added then removed while running: 518, and the reload the error
-// asks for removes authentication.
+// Users added then removed while running: 518, kept by a refused reload.
 func TestUsersSeenAtRuntimeClearedByReload(t *testing.T) {
 	var gotAuth atomic.Value
 	up := upstream(t, &gotAuth)
@@ -962,8 +966,7 @@ func TestUsersSeenAtRuntimeClearedByReload(t *testing.T) {
 	web := writeWeb(t, dir, "web.yml", "{}\n")
 
 	l := withAddr(t, listenerConfig("node", web, up.URL))
-	logs := &syncBuffer{}
-	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
 	addr := s.Addr("node").String()
 	url := "http://" + addr + "/metrics"
 
@@ -977,26 +980,20 @@ func TestUsersSeenAtRuntimeClearedByReload(t *testing.T) {
 	}
 
 	l.Listen = addr
+	expectWeakeningRefused(t, s.Reload(&config.Config{Listeners: []config.Listener{l}}), "basic authentication")
+	if code, _ := get(t, url, "", ""); code != StatusWebConfigUnreadable {
+		t.Errorf("after the refused reload: code %d, want 518", code)
+	}
+
+	// Users back: the reload is accepted again (nothing weakened).
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
 	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
-		t.Fatalf("Reload: %v", err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if code, _ := get(t, url, "", ""); code == http.StatusOK {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("still refused after the reload")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
-		t.Error("removal of authentication not warned")
+		t.Errorf("reload with the users back: %v", err)
 	}
 }
 
-// A renamed listener on the same address that loses its users is warned
-// about too.
+// A renamed listener on the same address that loses its users: the reload
+// is refused, and the port keeps its authentication.
 func TestRenamedListenerLosingAuthIsWarned(t *testing.T) {
 	var gotAuth atomic.Value
 	up := upstream(t, &gotAuth)
@@ -1006,15 +1003,13 @@ func TestRenamedListenerLosingAuthIsWarned(t *testing.T) {
 	plain := writeWeb(t, dir, "plain.yml", "{}\n")
 
 	l := withAddr(t, listenerConfig("node", auth, up.URL))
-	logs := &syncBuffer{}
-	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, logs)
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	addr := s.Addr("node").String()
 	renamed := listenerConfig("node2", plain, up.URL)
-	renamed.Listen = s.Addr("node").String()
-	if err := s.Reload(&config.Config{Listeners: []config.Listener{renamed}}); err != nil {
-		t.Fatalf("Reload: %v", err)
-	}
-	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") {
-		t.Error("renamed listener losing authentication not warned")
+	renamed.Listen = addr
+	expectWeakeningRefused(t, s.Reload(&config.Config{Listeners: []config.Listener{renamed}}), "basic authentication")
+	if code, _ := get(t, "http://"+addr+"/metrics", "", ""); code != http.StatusUnauthorized {
+		t.Errorf("port lost its authentication: code %d, want 401", code)
 	}
 }
 
@@ -1098,8 +1093,8 @@ func tlsGet(c *http.Client, url string) error {
 }
 
 // A web configuration that stops requiring client certificates while
-// running (half-written or weakened) refuses new connections until a
-// reload, which then applies it and warns.
+// running refuses new connections, and the reload that would apply it is
+// refused too.
 func TestClientAuthFailsClosedUntilReload(t *testing.T) {
 	m := newMTLSTest(t, "RequireAnyClientCert")
 	anonymous := m.client(t, false, false)
@@ -1122,16 +1117,9 @@ func TestClientAuthFailsClosedUntilReload(t *testing.T) {
 		t.Errorf("server-side refusal counted as a client failure: %v", got)
 	}
 
-	m.reload(t)
-	deadline := time.Now().Add(3 * time.Second)
-	for tlsGet(anonymous, m.url()) != nil {
-		if time.Now().After(deadline) {
-			t.Fatal("still refused after the reload")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: client certificate requirements") {
-		t.Errorf("weakening not warned: %s", m.logs.String())
+	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}), "client certificate requirements")
+	if err := tlsGet(anonymous, m.url()); err == nil {
+		t.Error("served without a client certificate after the refused reload")
 	}
 }
 
@@ -1316,18 +1304,15 @@ func TestClientCARemovedFailsClosed(t *testing.T) {
 	}
 }
 
-// A reload catching a TLS file emptied serves in clear text: warned.
+// A reload catching a TLS file emptied would serve in clear text: refused.
 func TestReloadLosingTLSIsWarned(t *testing.T) {
 	m := newMTLSTest(t, "")
 	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), "")
-	m.reload(t)
-	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: TLS") {
-		t.Errorf("loss of TLS not warned: %s", m.logs.String())
-	}
+	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}), "TLS")
 }
 
-// Listeners swapping addresses: the port that loses its protection is
-// warned about, whatever the listener names.
+// Listeners swapping addresses: the reload that removes the protection of
+// a port is refused, whatever the listener names.
 func TestSwappedListenersLosingAuthAreWarned(t *testing.T) {
 	var gotAuth atomic.Value
 	up := upstream(t, &gotAuth)
@@ -1338,15 +1323,12 @@ func TestSwappedListenersLosingAuthAreWarned(t *testing.T) {
 
 	a := withAddr(t, listenerConfig("a", auth, up.URL))
 	b := withAddr(t, listenerConfig("b", plain, up.URL))
-	logs := &syncBuffer{}
-	s := startServer(t, &config.Config{Listeners: []config.Listener{a, b}}, logs)
+	s := startServer(t, &config.Config{Listeners: []config.Listener{a, b}}, io.Discard)
 	a.Listen, b.Listen = s.Addr("b").String(), s.Addr("a").String() // swap
-	if err := s.Reload(&config.Config{Listeners: []config.Listener{a, b}}); err != nil {
-		t.Fatalf("Reload: %v", err)
-	}
-	if !strings.Contains(logs.String(), "authentication weakened by this reload: basic authentication") ||
-		!strings.Contains(logs.String(), "listener=b") {
-		t.Errorf("port losing basic authentication not warned: %s", logs.String())
+	err := s.Reload(&config.Config{Listeners: []config.Listener{a, b}})
+	expectWeakeningRefused(t, err, "basic authentication")
+	if err != nil && !strings.Contains(err.Error(), `listener "b"`) {
+		t.Errorf("refusal does not name the listener taking the protected port: %v", err)
 	}
 }
 
@@ -1359,7 +1341,7 @@ func (m *mtlsTest) writeWebRaw(t *testing.T, extra string) {
 
 // RequireAnyClientCert (required, not verified) and VerifyClientCertIfGiven
 // (verified, not required) are not ranked: going from one to the other
-// while running weakens what is required, and is refused.
+// weakens what is required, refused while running and by a reload.
 func TestClientCertRequiredNotTradedForVerified(t *testing.T) {
 	m := newMTLSTest(t, "RequireAnyClientCert")
 	ca, _, _ := testClientPKI(t, filepath.Dir(m.web), "scraper-a")
@@ -1369,12 +1351,7 @@ func TestClientCertRequiredNotTradedForVerified(t *testing.T) {
 	if err := tlsGet(anonymous, m.url()); err == nil {
 		t.Fatal("client without a certificate served after RequireAny became VerifyIfGiven")
 	}
-
-	// The same change applied by a reload restarts the listener and warns.
-	m.reload(t)
-	if !strings.Contains(m.logs.String(), "authentication weakened by this reload: client certificate requirements") {
-		t.Errorf("reload from RequireAny to VerifyIfGiven not warned: %s", m.logs.String())
-	}
+	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}), "client certificate requirements")
 }
 
 // The reverse: a verified certificate is not traded for any certificate.
@@ -1507,5 +1484,499 @@ func TestOptionsStarRequiresAuthentication(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("OPTIONS *: code %d, want 401", resp.StatusCode)
+	}
+}
+
+// After new TLS connections failed on the server certificate, a request on
+// a connection already open reports when the settings load again, instead
+// of keeping web_config_read_error at 1 until the next handshake.
+func TestTLSFailureClearedByRequestOnOpenConnection(t *testing.T) {
+	m := newMTLSTest(t, "")
+	open := m.client(t, false, true) // keep-alive
+	if err := tlsGet(open, m.url()); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	certPEM, err := os.ReadFile(m.cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeWeb(t, filepath.Dir(m.cert), filepath.Base(m.cert), "") // renewal in progress
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Fatal("new connection accepted without a server certificate")
+	}
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Fatalf("TLS failure not reported (ok=%v, any=%v)", ok, any)
+	}
+
+	writeWeb(t, filepath.Dir(m.cert), filepath.Base(m.cert), string(certPEM)) // renewed
+	if err := tlsGet(open, m.url()); err != nil {
+		t.Fatalf("request on the open connection: %v", err)
+	}
+	if ok, _ := m.rec.lastTLSRead(); !ok {
+		t.Error("TLS settings loading again not reported by a request on an open connection")
+	}
+}
+
+// Web configurations breaking exporter_proxy's own rules (accepted by
+// exporter-toolkit) are all reported at once.
+func TestStartReportsEveryWebConfigRuleViolation(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	// Verifying client certificates without a client CA.
+	a := writeWeb(t, dir, "a.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_auth_type: RequireAndVerifyClientCert\n", cert, key))
+	// A header exporter-toolkit forbids.
+	b := writeWeb(t, dir, "b.yml", "http_server_config:\n  headers:\n    Set-Cookie: x\n")
+	_, err := Start(&config.Config{Listeners: []config.Listener{
+		withAddr(t, listenerConfig("a", a, up.URL)),
+		withAddr(t, listenerConfig("b", b, up.URL)),
+	}}, Options{Logger: slog.New(slog.DiscardHandler)})
+	if err == nil || !strings.Contains(err.Error(), `listener "a"`) || !strings.Contains(err.Error(), `listener "b"`) {
+		t.Errorf("Start error = %v, want both listeners reported", err)
+	}
+}
+
+// otherNetworkListener is a listener reporting another network, like a
+// datagram or seqpacket socket passed by systemd.
+type otherNetworkListener struct {
+	net.Listener
+	network string
+}
+
+func (l otherNetworkListener) Addr() net.Addr { return otherNetworkAddr(l.network) }
+
+type otherNetworkAddr string
+
+func (a otherNetworkAddr) Network() string { return string(a) }
+func (a otherNetworkAddr) String() string  { return "/run/x.sock" }
+
+// systemd sockets that are not TCP or Unix stream sockets are refused at
+// startup, instead of failing on Accept or showing client-chosen paths.
+func TestSystemdNonStreamSocketsRefused(t *testing.T) {
+	for _, network := range []string{"unixgram", "unixpacket"} {
+		t.Run(network, func(t *testing.T) {
+			ln := otherNetworkListener{tcpListener(t), network}
+			fakeSystemd(t, map[string][]net.Listener{"node": {ln}})
+			web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+			l := listenerConfig("node", web, "http://127.0.0.1:1")
+			l.Listen = "systemd:node"
+			_, err := Start(&config.Config{Listeners: []config.Listener{l}}, Options{Logger: slog.New(slog.DiscardHandler)})
+			if err == nil || !strings.Contains(err.Error(), "stream socket") {
+				t.Errorf("Start error = %v, want a refused non-stream socket", err)
+			}
+			if !isClosed(ln.Listener) {
+				t.Error("refused socket left open")
+			}
+		})
+	}
+}
+
+func TestQuotedSANsUnambiguous(t *testing.T) {
+	if quotedSANs([]string{"a\nb"}) == quotedSANs([]string{"a", "b"}) {
+		t.Error(`["a\nb"] and ["a","b"] share an encoding`)
+	}
+	if quotedSANs([]string{"b", "a"}) != quotedSANs([]string{"a", "b"}) {
+		t.Error("order changes the encoding")
+	}
+	if quotedSANs(nil) != "" {
+		t.Error("unset list not empty")
+	}
+}
+
+// Sockets passed by systemd are closed and reported even when no listener
+// uses systemd.
+func TestUnusedSystemdSocketsClosedWithoutSystemdListeners(t *testing.T) {
+	ln := tcpListener(t)
+	fakeSystemd(t, map[string][]net.Listener{"leftover": {ln}})
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	logs := &syncBuffer{}
+	startServer(t, &config.Config{Listeners: []config.Listener{withAddr(t, listenerConfig("node", web, "http://127.0.0.1:1"))}}, logs)
+	if !isClosed(ln) {
+		t.Error("unused systemd socket left open")
+	}
+	if !strings.Contains(logs.String(), "systemd socket not used by any listener") {
+		t.Errorf("unused systemd socket not reported: %s", logs.String())
+	}
+}
+
+// The Unix client connection wrapper keeps the graceful half-close.
+func TestUnixClientConnCloseWrite(t *testing.T) {
+	var c net.Conn = unixClientConn{&halfCloser{}}
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("CloseWrite hidden by the wrapper")
+	}
+	_ = cw.CloseWrite()
+	if !c.(unixClientConn).Conn.(*halfCloser).closed {
+		t.Error("CloseWrite not forwarded")
+	}
+}
+
+type halfCloser struct {
+	net.Conn
+	closed bool
+}
+
+func (h *halfCloser) CloseWrite() error { h.closed = true; return nil }
+
+// writeExpiredServerCert overwrites cert and key with a self-signed
+// certificate that expired an hour ago.
+func writeExpiredServerCert(t *testing.T, cert, key string) {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "expired"},
+		DNSNames:  []string{"localhost"},
+		NotBefore: time.Now().Add(-48 * time.Hour), NotAfter: time.Now().Add(-time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWeb(t, filepath.Dir(cert), filepath.Base(cert), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
+	writeWeb(t, filepath.Dir(key), filepath.Base(key), string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})))
+}
+
+// An expired server certificate is refused as a server-side failure: not
+// counted as client tls_handshake failures, shown by web_config_read_error.
+func TestExpiredServerCertificateIsServerSide(t *testing.T) {
+	m := newMTLSTest(t, "")
+	if err := tlsGet(m.client(t, false, false), m.url()); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeExpiredServerCert(t, m.cert, m.key)
+	before := len(m.rec.got())
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Fatal("served with an expired server certificate")
+	}
+	if got := m.rec.got(); len(got) != before {
+		t.Errorf("expired server certificate counted as client failures: %v", got)
+	}
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("expired server certificate not reported (ok=%v, any=%v)", ok, any)
+	}
+}
+
+// Users added to the file, even before any request saw them, do not make
+// a reload restart the listener (requests enforce them anyway).
+func TestReloadAfterUsersAddedKeepsListener(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	web := writeWeb(t, t.TempDir(), "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	s.mu.Lock()
+	before := s.listeners["node"]
+	s.mu.Unlock()
+
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.mu.Lock()
+	after := s.listeners["node"]
+	s.mu.Unlock()
+	if after != before {
+		t.Error("listener restarted by a reload that only found new users")
+	}
+	if code, _ := get(t, "http://"+l.Listen+"/metrics", "", ""); code != http.StatusUnauthorized {
+		t.Errorf("users not enforced: code %d, want 401", code)
+	}
+}
+
+// With an expired server certificate, no handshake reports the TLS settings
+// as healthy: neither one stopping early (an old TLS version) nor a TLS 1.3
+// session resumption, which is refused too.
+func TestExpiredServerCertificateEveryHandshake(t *testing.T) {
+	m := newMTLSTest(t, "")
+	resuming := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{ //nolint:gosec // test certificate
+			InsecureSkipVerify: true, ClientSessionCache: tls.NewLRUClientSessionCache(4),
+		},
+		DisableKeepAlives: true,
+	}}
+	for range 2 { // get a session ticket
+		if err := tlsGet(resuming, m.url()); err != nil {
+			t.Fatalf("before: %v", err)
+		}
+	}
+
+	writeExpiredServerCert(t, m.cert, m.key)
+	if err := tlsGet(resuming, m.url()); err == nil {
+		t.Error("TLS 1.3 session resumed with an expired server certificate")
+	}
+	old := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{ //nolint:gosec // test
+		InsecureSkipVerify: true, MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS10,
+	}}}
+	_ = tlsGet(old, m.url())
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("TLS settings reported healthy with an expired certificate (ok=%v)", ok)
+	}
+}
+
+// An expired server certificate on one listener is logged at startup, and
+// only that listener's TLS connections are refused (as a server-side
+// failure): the service and its other listeners start.
+func TestStartWithExpiredServerCertificate(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	writeExpiredServerCert(t, cert, key)
+	web := writeWeb(t, dir, "web.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	logs := &syncBuffer{}
+	rec := &authRecorder{}
+	s, err := Start(&config.Config{Listeners: []config.Listener{
+		withAddr(t, listenerConfig("tls", web, up.URL)),
+		withAddr(t, listenerConfig("plain", plain, up.URL)),
+	}}, Options{Logger: slog.New(slog.NewTextHandler(logs, nil)), Recorder: rec})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+	if !strings.Contains(logs.String(), "server certificate outside its validity dates") {
+		t.Errorf("expired certificate not logged at startup: %s", logs.String())
+	}
+	if code, _ := get(t, "http://"+s.Addr("plain").String()+"/metrics", "", ""); code != http.StatusOK {
+		t.Errorf("other listener: code %d, want 200", code)
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // test
+	if _, err := client.Get("https://" + s.Addr("tls").String() + "/metrics"); err == nil {
+		t.Error("TLS listener served with an expired certificate")
+	}
+	if got := rec.got(); len(got) != 0 {
+		t.Errorf("refusal counted as client failures: %v", got)
+	}
+}
+
+// A file switched at runtime to ciphers that cannot carry HTTP/2, on a
+// listener that offers HTTP/2 since it started, is refused (as a
+// server-side failure) instead of breaking HTTP/2 clients.
+func TestHTTP2CiphersCheckedAgainstListener(t *testing.T) {
+	m := newMTLSTest(t, "")
+	m.writeWebRaw(t, "  max_version: TLS12\n  cipher_suites:\n    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\nhttp_server_config:\n  http2: false\n")
+	if err := tlsGet(m.client(t, false, false), m.url()); err == nil {
+		t.Error("connection accepted with ciphers the listener's HTTP/2 cannot use")
+	}
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("not reported as a server-side failure (ok=%v)", ok)
+	}
+}
+
+// Users found by a reload that keeps the listener are required from then
+// on: a file losing them afterwards answers 518.
+func TestUsersFoundByReloadStayRequired(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+
+	basicAuthWebConfig(t, web, "prometheus", "s3cret-test")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	writeWeb(t, dir, "web.yml", "") // truncated before any request
+	if code, _ := get(t, "http://"+l.Listen+"/metrics", "", ""); code != StatusWebConfigUnreadable {
+		t.Errorf("code %d, want 518", code)
+	}
+}
+
+// A successful handshake that started before another one failed does not
+// report the settings as healthy.
+func TestTLSHealthSucceededSince(t *testing.T) {
+	var reports []bool
+	h := newTLSHealth(func() error { return nil }, func(ok bool) { reports = append(reports, ok) })
+	gen := h.generation()
+	h.failed()            // another handshake fails meanwhile
+	h.succeededSince(gen) // the first one ends well
+	if !slices.Equal(reports, []bool{false}) {
+		t.Errorf("reports = %v, want [false]", reports)
+	}
+	h.succeededSince(h.generation())
+	if !slices.Equal(reports, []bool{false, true}) {
+		t.Errorf("reports = %v, want [false true]", reports)
+	}
+}
+
+// Only the leaf's dates refuse connections: an expired intermediate (an old
+// cross-signature) is skipped by clients building another path.
+func TestCheckCertDatesLeafOnly(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	good, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expCert, expKey := filepath.Join(dir, "e.pem"), filepath.Join(dir, "e.key")
+	writeExpiredServerCert(t, expCert, expKey)
+	expired, err := tls.LoadX509KeyPair(expCert, expKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := tls.Certificate{Certificate: [][]byte{good.Certificate[0], expired.Certificate[0]}}
+	if err := checkCertDates(&chain, time.Now()); err != nil {
+		t.Errorf("expired intermediate refused: %v", err)
+	}
+	if err := checkCertDates(&expired, time.Now()); !errors.Is(err, errCertDates) {
+		t.Errorf("expired leaf: err = %v, want errCertDates", err)
+	}
+	if err := checkCertDates(&good, time.Now()); err != nil {
+		t.Errorf("valid certificate: %v", err)
+	}
+}
+
+// A reload resetting the metrics does not hide that new TLS connections
+// still fail: the next request reports it again.
+func TestTLSFailureReportedAgainAfterReload(t *testing.T) {
+	m := newMTLSTest(t, "")
+	writeExpiredServerCert(t, m.cert, m.key)
+	_ = tlsGet(m.client(t, false, false), m.url()) // fails, reported
+	// The metrics reset by a reload is simulated by a healthy report.
+	m.rec.WebConfigRead("node", true, true)
+	if ok, _ := m.rec.lastTLSRead(); !ok {
+		t.Fatal("setup: reset not recorded")
+	}
+	// A plain request (no TLS: the listener refuses new handshakes, so use
+	// the auth handler directly) rechecks and reports the failure again.
+	m.s.mu.Lock()
+	auth := m.s.listeners["node"].auth
+	m.s.mu.Unlock()
+	auth.tlsHealth.limit = rate.NewLimiter(rate.Inf, 1)
+	w := httptest.NewRecorder()
+	auth.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if ok, _ := m.rec.lastTLSRead(); ok {
+		t.Error("TLS failure not reported again after the reset")
+	}
+}
+
+// An aborted reload raises no TLS alarm for a listener that keeps running;
+// a successful one reports its failing listeners through ReportTLSHealth.
+func TestTLSFailureReportedOnlyOnceApplied(t *testing.T) {
+	m := newMTLSTest(t, "")
+	dir := t.TempDir()
+	cert, key := testTLSFiles(t, dir)
+	writeExpiredServerCert(t, cert, key)
+	expired := writeWeb(t, dir, "expired.yml", fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+
+	// A second listener with basic authentication.
+	auth := filepath.Join(dir, "auth.yml")
+	basicAuthWebConfig(t, auth, "prometheus", "s3cret-test")
+	other := withAddr(t, listenerConfig("other", auth, "http://127.0.0.1:1"))
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{m.l, other}}); err != nil {
+		t.Fatalf("adding a listener: %v", err)
+	}
+	other.Listen = m.s.Addr("other").String()
+
+	// Aborted after the listeners are prepared: "other" would lose its
+	// authentication, while "node" moves to the expired certificate.
+	plain := writeWeb(t, dir, "plain.yml", "{}\n")
+	moved := m.l
+	moved.WebConfigFile = expired
+	weakened := other
+	weakened.WebConfigFile = plain
+	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{moved, weakened}}), "basic authentication")
+	if ok, any := m.rec.lastTLSRead(); any && !ok {
+		t.Error("aborted reload raised a TLS alarm for the running listener")
+	}
+
+	// Applied: the listener restarts on the expired certificate.
+	if err := m.s.Reload(&config.Config{Listeners: []config.Listener{moved, other}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	m.s.ReportTLSHealth()
+	if ok, any := m.rec.lastTLSRead(); !any || ok {
+		t.Errorf("failing listener not reported after the reload (ok=%v, any=%v)", ok, any)
+	}
+}
+
+// A reload re-checks the TLS settings of the listeners it keeps: a
+// certificate expired without any new connection since is reported, and a
+// failure fixed before the reload is no longer reported.
+func TestReloadRechecksKeptListenersTLS(t *testing.T) {
+	m := newMTLSTest(t, "")
+	certPEM, err := os.ReadFile(m.cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(m.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadAndReport := func() {
+		t.Helper()
+		m.s.mu.Lock()
+		before := m.s.listeners["node"]
+		m.s.mu.Unlock()
+		m.reload(t)
+		m.s.mu.Lock()
+		kept := m.s.listeners["node"] == before
+		m.s.mu.Unlock()
+		if !kept {
+			t.Fatal("listener restarted: this test is about kept listeners")
+		}
+		m.rec.WebConfigRead("node", true, true) // the metrics reset by ConfigLoaded
+		m.s.ReportTLSHealth()
+	}
+
+	writeExpiredServerCert(t, m.cert, m.key) // expired, no handshake since
+	reloadAndReport()
+	if ok, _ := m.rec.lastTLSRead(); ok {
+		t.Error("expired certificate of a kept listener not reported after the reload")
+	}
+
+	writeWeb(t, filepath.Dir(m.cert), filepath.Base(m.cert), string(certPEM)) // fixed
+	writeWeb(t, filepath.Dir(m.key), filepath.Base(m.key), string(keyPEM))
+	reloadAndReport()
+	if ok, _ := m.rec.lastTLSRead(); !ok {
+		t.Error("stale TLS alarm reported after a reload that found the settings fixed")
+	}
+}
+
+// A listener replaced by a reload stops reporting the web configuration
+// state of its name, which its replacement reports now.
+func TestReloadRetiresReplacedListener(t *testing.T) {
+	var gotAuth atomic.Value
+	up := upstream(t, &gotAuth)
+	dir := t.TempDir()
+	web := writeWeb(t, dir, "web.yml", "{}\n")
+	l := withAddr(t, listenerConfig("node", web, up.URL))
+	s := startServer(t, &config.Config{Listeners: []config.Listener{l}}, io.Discard)
+	l.Listen = s.Addr("node").String()
+	s.mu.Lock()
+	before := s.listeners["node"]
+	s.mu.Unlock()
+
+	writeWeb(t, dir, "web.yml", "rate_limit:\n  interval: 1ms\n  burst: 100\n")
+	if err := s.Reload(&config.Config{Listeners: []config.Listener{l}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.mu.Lock()
+	after := s.listeners["node"]
+	s.mu.Unlock()
+	if after == before {
+		t.Fatal("listener not restarted")
+	}
+	if !before.auth.retired.Load() || after.auth.retired.Load() {
+		t.Errorf("retired: replaced %v, serving %v; want true, false",
+			before.auth.retired.Load(), after.auth.retired.Load())
 	}
 }

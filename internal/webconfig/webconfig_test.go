@@ -20,14 +20,14 @@ func TestRead(t *testing.T) {
 		clearCreds bool
 	}{
 		{"empty", "{}\n", Summary{}, false},
-		{"users without TLS", "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{HasUsers: true}, true},
+		{"users without TLS", "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{HasUsers: true, MinBcryptCost: 10, MaxBcryptCost: 10}, true},
 		{
 			"users with TLS files, relative paths",
 			"tls_server_config:\n  cert_file: tls/c.crt\n  key_file: /etc/k.key\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n",
-			Summary{TLSEnabled: true, CertFile: "DIR/tls/c.crt", KeyFile: "/etc/k.key", HasUsers: true},
+			Summary{TLSEnabled: true, CertFile: "DIR/tls/c.crt", KeyFile: "/etc/k.key", HasUsers: true, MinBcryptCost: 10, MaxBcryptCost: 10},
 			false,
 		},
-		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{TLSEnabled: true, HasUsers: true}, false},
+		{"users with inline cert", "tls_server_config:\n  cert: x\nbasic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", Summary{TLSEnabled: true, CertPEM: "x", HasUsers: true, MinBcryptCost: 10, MaxBcryptCost: 10}, false},
 		{
 			"mTLS only",
 			"tls_server_config:\n  client_ca_file: ca.crt\n  client_auth_type: RequireAndVerifyClientCert\n",
@@ -253,5 +253,95 @@ func TestLoadRejectsHTTP2WithoutRequiredCipher(t *testing.T) {
 				t.Errorf("Load error = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The client CA check is cached until the file changes.
+func TestClientCACheckCachedUntilChange(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	writeTestCA(t, ca)
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: ca.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid CA: %v", err)
+	}
+	// A changed file (other size or modification time) is checked again.
+	if err := os.WriteFile(ca, []byte("no certificate any more\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "contains no certificate") {
+		t.Errorf("changed CA file not checked again: %v", err)
+	}
+}
+
+// Requests do not read the client CA: a file briefly missing while being
+// rotated fails new TLS connections (Load), not requests on open ones.
+func TestLoadForRequestSkipsClientCA(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: missing.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadForRequest(p); err != nil {
+		t.Errorf("LoadForRequest = %v, want nil", err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Error("Load accepted a missing client CA file")
+	}
+}
+
+// A CA file rewritten keeping its size and modification time is checked
+// again (the cache is keyed by content).
+func TestClientCACheckSeesSameSizeRewrite(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	writeTestCA(t, ca)
+	info, err := os.Stat(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: ca.crt\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid CA: %v", err)
+	}
+	junk := []byte(strings.Repeat("x", int(info.Size())))
+	if err := os.WriteFile(ca, junk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(ca, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "contains no certificate") {
+		t.Errorf("same-size rewrite not checked again: %v", err)
+	}
+}
+
+func TestLoadRejectsRateLimitWithoutBurst(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(p, []byte("rate_limit:\n  interval: 1s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "burst must be at least 1") {
+		t.Errorf("Load error = %v, want burst must be at least 1", err)
+	}
+}
+
+func TestLoadRejectsMinAboveMaxVersion(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "web.yml")
+	content := "tls_server_config:\n  cert_file: c.pem\n  key_file: k.pem\n  min_version: TLS13\n  max_version: TLS12\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "min_version is above max_version") {
+		t.Errorf("Load error = %v, want min_version is above max_version", err)
 	}
 }

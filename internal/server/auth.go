@@ -80,8 +80,11 @@ const (
 // purpose takes a reload.
 var errTLSAdded = errors.New("tls_server_config is set, while this listener serves plain HTTP: reload to enable TLS")
 
+// removeAuthHint completes errUsersRemoved.
+const removeAuthHint = "fix the file, or restart the service to remove authentication"
+
 var errUsersRemoved = errors.New("basic_auth_users is missing or empty, while this listener requires basic authentication: " +
-	"fix the file, or reload to remove authentication")
+	removeAuthHint)
 
 // fakeHash is compared against when the user does not exist and no
 // configured hash gives a cost: bcrypt hash of "fakepassword" at cost 10,
@@ -91,6 +94,9 @@ const fakeHash = "$2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi"
 // fakeHashes caches, by bcrypt cost, the hash compared against when the
 // user does not exist.
 var fakeHashes sync.Map // int -> []byte
+
+// bcryptMaxPassword is the length bcrypt cuts passwords to.
+const bcryptMaxPassword = 72
 
 // fakeHashFor returns a hash with the highest cost of the configured
 // hashes, so that an unknown user takes as long as a known one with a wrong
@@ -114,6 +120,122 @@ func fakeHashFor(users map[string]config_util.Secret) []byte {
 	}
 	v, _ := fakeHashes.LoadOrStore(cost, h)
 	return v.([]byte)
+}
+
+// tlsHealth tracks whether new TLS connections of a listener fail on its
+// TLS settings. While they do, requests on connections already open check,
+// at most once per second, whether the settings load again, so that the
+// failure is not reported until the next handshake only.
+type tlsHealth struct {
+	mu      sync.Mutex
+	failing bool
+	gen     uint64 // bumped by every failed handshake
+
+	limit *rate.Limiter
+	// recheck loads the web configuration and its TLS settings like a new
+	// connection would.
+	recheck func() error
+	// report records the state in the metrics. It is called with mu held,
+	// so that the metric always follows the state.
+	report func(ok bool)
+}
+
+func newTLSHealth(recheck func() error, report func(ok bool)) *tlsHealth {
+	return &tlsHealth{limit: rate.NewLimiter(1, 1), recheck: recheck, report: report}
+}
+
+func (t *tlsHealth) failed() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = true
+	t.gen++
+	t.report(false)
+}
+
+// markFailing records a failure without reporting it: the listener is not
+// serving yet (its start or reload may still be aborted). ReportTLSHealth
+// reports it once applied.
+func (t *tlsHealth) markFailing() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = true
+	t.gen++
+}
+
+// markHealthySince records that the TLS settings loaded when checked at
+// generation gen, without reporting it (ReportTLSHealth only reports
+// failures; a configuration load resets the metric). A handshake failing
+// since keeps the failure: the file may have broken after the check. A
+// failure from a handshake that read the file before the check keeps it
+// too, until the next request rechecks it (recover) or the next handshake
+// succeeds.
+func (t *tlsHealth) markHealthySince(gen uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gen != gen {
+		return
+	}
+	t.failing = false
+	t.gen++
+}
+
+// reportFailing reports the failure again, if any.
+func (t *tlsHealth) reportFailing() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failing {
+		t.report(false)
+	}
+}
+
+// generation returns the count of failed handshakes, to pass to
+// succeededSince.
+func (t *tlsHealth) generation() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gen
+}
+
+// succeededSince records a successful handshake that started at generation
+// gen, unless another handshake failed meanwhile: the file may have broken
+// after this one read it.
+func (t *tlsHealth) succeededSince(gen uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gen != gen {
+		return
+	}
+	t.failing = false
+	t.report(true)
+}
+
+// recover rechecks the TLS settings while handshakes fail, and reports
+// whether the failure is cleared. A handshake failing during the recheck
+// keeps it: the recheck may have read the file before it broke.
+func (t *tlsHealth) recover() bool {
+	t.mu.Lock()
+	failing, gen := t.failing, t.gen
+	t.mu.Unlock()
+	if !failing || !t.limit.Allow() {
+		return false
+	}
+	err := t.recheck()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err != nil {
+		if t.failing {
+			// Still failing: report it again, so that a reload resetting
+			// the metrics does not hide it until the next handshake.
+			t.report(false)
+		}
+		return false
+	}
+	if !t.failing || t.gen != gen {
+		return false
+	}
+	t.failing = false
+	t.report(true)
+	return true
 }
 
 // logGate lowers log lines to debug level beyond logRate per listener.
@@ -179,6 +301,13 @@ type authHandler struct {
 	// waiting for it.
 	verifyMu sync.Mutex
 	pending  chan struct{}
+	// tlsHealth is set on TLS listeners.
+	tlsHealth *tlsHealth
+	// retired is set once the listener is replaced or stopped: requests
+	// and handshakes it still finishes no longer report the web
+	// configuration state, which belongs to the listener of the same name
+	// now serving.
+	retired atomic.Bool
 	// flights runs a single verification for identical credentials sent
 	// at the same time (several routes or scrapers starting together). The
 	// per-client limit is charged to the first of them only: the others
@@ -237,7 +366,7 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := webconfig.Load(h.webConfig)
+	c, err := webconfig.LoadForRequest(h.webConfig)
 	if err == nil && !h.tls && c.TLSConfig.IsEnabled() {
 		err = errTLSAdded
 	}
@@ -248,7 +377,16 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err = errUsersRemoved
 		}
 	}
-	h.rec.WebConfigRead(h.listener, false, err == nil)
+	if !h.retired.Load() {
+		h.rec.WebConfigRead(h.listener, false, err == nil)
+	}
+	if err == nil && h.tlsHealth != nil {
+		// While new TLS connections fail, check whether the settings load
+		// again and report it now (recover records it), rather than at the
+		// next handshake, which a scraper keeping its connection open may
+		// not make for a long time.
+		h.tlsHealth.recover()
+	}
 	if err != nil {
 		h.logger.Log(r.Context(), h.serverLogs.level(slog.LevelError), "cannot load web configuration",
 			"web_config_file", h.webConfig, "code", StatusWebConfigUnreadable, "err", errfmt.OneLine(err))
@@ -272,6 +410,12 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, known := c.Users[user]
 
+	// bcrypt only uses the first 72 bytes of a password: longer ones are
+	// cut the same way here, so that suffixes added to a valid password do
+	// not each fill an entry of the success cache.
+	if len(pass) > bcryptMaxPassword {
+		pass = pass[:bcryptMaxPassword]
+	}
 	// The key covers the stored hash: a password change in the web
 	// configuration invalidates the cached success. The password itself is
 	// never kept in memory.
@@ -468,9 +612,10 @@ func (l *serverErrorLog) Write(p []byte) (int, error) {
 		// A prefix match: the marker starts the error returned by
 		// GetConfigForClient, while client-chosen text (such as an ALPN
 		// protocol name) can only appear later in other errors.
-		// The remote must be an IP address: a Unix socket client chooses its
-		// own path, and could put the marker in it.
-		if _, ipErr := netip.ParseAddrPort(remote); ipErr == nil && strings.HasPrefix(detail, serverTLSUnavailable+": ") {
+		// The remote address is never client-chosen text (an IP address,
+		// or "unix" for Unix socket clients, see unixClientsListener), so
+		// the client cannot put the marker at the start of the detail.
+		if strings.HasPrefix(detail, serverTLSUnavailable+": ") {
 			// Already logged and shown by exporter_proxy_web_config_read_error:
 			// not a client failure.
 			l.logger.Debug("TLS handshake refused, server TLS settings unavailable",
