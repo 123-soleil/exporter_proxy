@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 
 	"github.com/123-soleil/exporter_proxy/internal/config"
 )
+
+// ScrapeTimeoutHeader carries a scrape timeout in seconds: sent by
+// Prometheus to the proxy, and by the proxy to HTTP upstreams.
+const ScrapeTimeoutHeader = "X-Prometheus-Scrape-Timeout-Seconds"
 
 // acceptHeader requests the Prometheus text exposition format.
 const acceptHeader = "text/plain;version=0.0.4;q=1,*/*;q=0.1"
@@ -130,6 +135,14 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", version.ComponentUserAgent("exporter_proxy"))
+	// The time this read may take, computed here (never copied from the
+	// client): exporters such as blackbox_exporter or snmp_exporter bound
+	// their work with it.
+	if d, ok := ctx.Deadline(); ok {
+		if left := time.Until(d); left > 0 {
+			req.Header.Set(ScrapeTimeoutHeader, strconv.FormatFloat(left.Seconds(), 'f', 3, 64))
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

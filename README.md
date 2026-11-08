@@ -101,7 +101,11 @@ Each route has exactly one source:
   example `max_age: 15m` for a file written every 5 minutes).
 - Upstream requests are sent with `Accept: text/plain;version=0.0.4` (or
   the delimited protobuf format first, when the scraper prefers it: see
-  "Formats") and a `User-Agent: exporter_proxy/<version>`; no client header is forwarded
+  "Formats"), a `User-Agent: exporter_proxy/<version>` and
+  `X-Prometheus-Scrape-Timeout-Seconds` with the time the read may take
+  (the route timeout, computed by the proxy, never copied from the
+  client), which exporters such as blackbox_exporter and snmp_exporter use
+  to bound their work; no client header is forwarded
   (`Authorization` in particular), redirects are not followed and any status
   other than `200` is a failure.
 - The `HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored: scrapes

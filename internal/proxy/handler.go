@@ -294,7 +294,7 @@ func truncate(s string, n int) string {
 
 // scrapeTimeoutHeader is sent by Prometheus and vmagent with the scrape
 // timeout of the target, in seconds.
-const scrapeTimeoutHeader = "X-Prometheus-Scrape-Timeout-Seconds"
+const scrapeTimeoutHeader = source.ScrapeTimeoutHeader
 
 // scrapeMargin is kept from the scraper's timeout to validate the content
 // and send the answer.
