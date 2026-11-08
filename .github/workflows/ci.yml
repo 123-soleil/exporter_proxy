@@ -109,6 +109,36 @@ jobs:
       - name: Build the release binary
         run: make build
 
+  cross-build:
+    name: Cross build (release platforms)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      # Every platform release.yml builds: a dependency that does not build
+      # on one of them (go-systemd's daemon package on NetBSD) fails here,
+      # not at release time.
+      - name: Build for every release platform
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -e
+          for target in linux/386 linux/amd64 linux/arm64 linux/arm/5 linux/arm/6 linux/arm/7 \
+            darwin/amd64 darwin/arm64 \
+            freebsd/386 freebsd/amd64 freebsd/arm64 freebsd/arm/5 freebsd/arm/6 freebsd/arm/7 \
+            netbsd/386 netbsd/amd64 netbsd/arm64 netbsd/arm/5 netbsd/arm/6 netbsd/arm/7 \
+            openbsd/386 openbsd/amd64 openbsd/arm64 openbsd/arm/5 openbsd/arm/6 openbsd/arm/7; do
+            IFS=/ read -r os arch arm <<< "$target"
+            echo "== $target"
+            GOOS=$os GOARCH=$arch GOARM=$arm go build -o /dev/null ./cmd/exporter_proxy
+          done
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The NetBSD binaries did not build: go-systemd's daemon package, used
+  for the `Type=notify` readiness of 0.4.1, does not support NetBSD. The
+  notification is now sent by a few lines of portable code. CI builds
+  every release platform on each pull request.
+
 ## [0.4.1] - 2026-11-08
 
 ### Changed
