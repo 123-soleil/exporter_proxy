@@ -677,6 +677,52 @@ needed by the service or depend on the site:
 Connecting to a Unix socket works under `ProtectSystem=strict`: only the
 permission of the socket file matters, not the read-only mount.
 
+### Docker
+
+The `Dockerfile` builds a minimal image: a static binary on
+[distroless](https://github.com/GoogleContainerTools/distroless)
+`static-debian13:nonroot`, with no shell or package manager, running as
+uid/gid `65532`. The entrypoint is `exporter_proxy`, and the configuration
+is read from `/etc/exporter_proxy/config.yml` by default. Base images are
+pinned by digest and kept up to date by Dependabot.
+
+Build the image (no registry image is published yet):
+
+```sh
+docker build -t exporter_proxy:0.1.0 \
+  --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" .
+# Other platforms, cross-compiled without emulation:
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t exporter_proxy:0.1.0 .
+```
+
+Run it:
+
+```sh
+docker run -d --name exporter_proxy --restart unless-stopped \
+  --network host \
+  --user 65532:"$(getent group exporter_proxy | cut -d: -f3)" \
+  -v /etc/exporter_proxy:/etc/exporter_proxy:ro \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --stop-timeout 30 \
+  exporter_proxy:0.1.0
+```
+
+`deploy/docker/compose.yml.exemple` is the same with Docker Compose.
+
+| Topic | In a container |
+|-------|----------------|
+| Configuration | Mount the **directory** (`/etc/exporter_proxy`), read-only, not single files: a file replaced atomically (editors, configuration management) would stay the old one in the container, and a reload would not see the change. Paths in `config.yml` and in the web configurations (certificates, keys, metric files) are paths inside the container. |
+| File permissions | The process runs as uid `65532`. Give it read access through its group: files `root:<gid>` mode `0640`, and `--user 65532:<gid>` (the `exporter_proxy` group of the host, for example). |
+| Network: exporters on the host | `--network host`: the proxy reaches exporters listening on `127.0.0.1` of the host, as with the systemd unit, and binds the `listen` addresses of `config.yml` on the host. Without capabilities, listen ports must be 1024 or above. |
+| Network: exporters in containers | A bridge network shared with the exporters, upstreams by service name (`http://node-exporter:9100/metrics`), and only the proxy's ports published (`-p 443:9443`). The exporters' ports stay unpublished. |
+| File routes, Unix socket upstreams | Mount their directories (read-only for files; the socket's directory for Unix sockets, with the socket file writable by the container's uid or gid). |
+| Reload | `docker kill --signal HUP exporter_proxy` (`systemctl reload` equivalent): same all-or-nothing rules, see "Configuration reload". |
+| Stop | `docker stop` sends `SIGTERM`; `--stop-timeout 30` (`stop_grace_period: 30s`) leaves the 15 s graceful shutdown time to finish (Docker's default is 10 s). |
+| Logs | On stderr: `docker logs exporter_proxy`. Options as arguments after the image name: `exporter_proxy:0.1.0 --log.format=json`. |
+| Check | `docker run --rm --user 65532:<gid> -v /etc/exporter_proxy:/etc/exporter_proxy:ro exporter_proxy:0.1.0 --check` |
+| Health | No shell in the image, so no `HEALTHCHECK`: Prometheus scraping the metrics endpoint (`up`) is the health check. |
+| Not available | systemd socket activation (`listen: "systemd:<name>"`). |
+
 ## Usage
 
 Command line:
@@ -1022,13 +1068,13 @@ GitHub Actions (`.github/workflows/`):
 
 | Workflow | When | What |
 |----------|------|------|
-| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`. |
+| `ci.yml` | Pull requests to `main`, pushes to `main` | Code checks (`gofmt`, `go mod tidy`, `go vet`, golangci-lint); dependency checks (`go mod verify`, `govulncheck`, and on pull requests GitHub's dependency review, which refuses a new dependency with a known vulnerability); tests with the race detector on Linux, Go 1.26 and the latest Go, and `make build`; the Docker image built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`, then run as documented in "Docker" (`test/docker/run.sh`: hardened, uid 65532, serving, reload with `SIGHUP` after an atomic file replacement, clean stop). |
 | `integration.yml` | Pull requests to `main`, pushes to `main` | `test/systemd/run.sh` under the runner's real systemd: installation from `deploy/` as described above, the hardened unit, socket activation on port 443 (no capability), TLS and basic auth, `--check`, reload (successful and failed) without restarting the process, clean stop. |
 | `codeql.yml` | Pull requests to `main`, pushes to `main`, every Monday | CodeQL static analysis of the code (`security-and-quality` queries), results in the Security tab. |
 | `security.yml` | Every Monday, or by hand | `go mod verify` and `govulncheck` on `main`, for vulnerabilities published after a merge. |
 | `release.yml` | A GitHub release is published | Tests and `govulncheck`, then `make build` for Linux, macOS, FreeBSD, NetBSD and OpenBSD (386, amd64, arm64, armv5/6/7 where supported), each packaged as `exporter_proxy_<tag>_<os>_<arch>.tar.gz` (binary, README, CHANGELOG, LICENSE, `deploy/`) and uploaded to the release with `sha256sums.txt` and a build provenance attestation. |
 
-Dependabot proposes Go module and GitHub Actions updates every week, a
+Dependabot proposes Go module, GitHub Actions and Docker base image updates every week, a
 week after their release. Actions are pinned by commit SHA.
 
 `make test` includes end-to-end tests (`cmd/exporter_proxy/e2e_test.go`)

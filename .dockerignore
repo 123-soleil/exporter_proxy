@@ -1,0 +1,17 @@
+# Only the Go sources and the Makefile are needed to build the image.
+.git
+.github
+bin
+deploy
+test
+*.md
+!README.md
+coverage.out
+coverage.html
+*.test
+# Local configuration and key material (see .gitignore).
+*.key
+*.pem
+*.crt
+*.yml
+!.golangci.yml
