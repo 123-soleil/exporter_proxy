@@ -240,6 +240,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	hdr := rw.Header()
 	hdr.Set("Content-Type", contentType)
+	// The response depends on Accept-Encoding: caches must key on it.
+	hdr.Set("Vary", "Accept-Encoding")
+	if len(body) >= gzipMinSize && acceptsGzip(req.Header.Get("Accept-Encoding")) {
+		body = gzipBytes(body)
+		hdr.Set("Content-Encoding", "gzip")
+	}
 	hdr.Set("Content-Length", strconv.Itoa(len(body)))
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Content-Type-Options", "nosniff")

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (uid 65532), cross-compiled for amd64, arm64 and arm/v7, base images
   pinned by digest; `deploy/docker/compose.yml.exemple` and a "Docker"
   section in the README; CI builds the image and runs it as documented.
+- Responses are compressed with gzip when the scraper accepts it
+  (`Accept-Encoding`) and the body is 1 KiB or more.
 
 ## [0.1.0] - 2026-11-08
 
