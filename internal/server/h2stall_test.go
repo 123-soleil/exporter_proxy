@@ -69,18 +69,36 @@ func TestHTTP2StalledClientReleasesItsSlot(t *testing.T) {
 	}
 	start := time.Now()
 	_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
-	// From now on, never read the socket.
+	// Read until the answer's headers: the source read is over and the
+	// answer is being written, holding the slot. From then on, never read
+	// the socket.
+	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("waiting for the answer's headers: %v", err)
+		}
+		if h, ok := f.(*http2.HeadersFrame); ok && h.StreamID == 1 {
+			break
+		}
+	}
 
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test server
 		DisableKeepAlives: true, DisableCompression: true,
 	}}
-	time.Sleep(500 * time.Millisecond)
+	refused := false
 	for {
 		if resp, err := client.Get("https://" + addr + "/metrics"); err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			switch resp.StatusCode {
+			case http.StatusServiceUnavailable:
+				refused = true // the stalled answer holds the slot
+			case http.StatusOK:
+				if !refused {
+					t.Fatal("the stalled answer did not hold the slot: the test proves nothing")
+				}
 				t.Logf("slot free after %s", time.Since(start).Round(time.Second))
 				return
 			}
