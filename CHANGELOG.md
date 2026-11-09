@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `401` and `429` answers close their connection: a client could hold
   connections (one goroutine and file descriptor each) open indefinitely
   with one refused request every minute, without ever authenticating.
+- Failed upstream requests are logged without their URL: its path or query
+  could hold a token, or credentials that a URL such as
+  `http://user:1234/secret@host` makes look like a path.
 - An invalid upstream URL is reported without quoting it: its credentials
   ended up in the validation error logged at startup, reload and `--check`.
   Credentials are refused whenever `@` appears in the authority of the URL
@@ -58,7 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-encoding them: re-encoding added `_sum 0` and `_count 0` lines to
   histograms and summaries sent without them (a count of 0 next to a
   `+Inf` bucket of 5), and `_bucket{le="+Inf"}` to histograms sent with
-  only `_sum` and `_count`. The output keeps the source's order.
+  only `_sum` and `_count`. The output keeps the source's order. It is
+  parsed again and must hold exactly the kept families, unchanged;
+  otherwise (odd syntax the line assignment reads differently from the
+  parser) the kept families are re-encoded, so a dropped family is never
+  served.
 - Filtering a protobuf body (`metrics_filter`) reads the name of each
   family without decoding it again: about 8 times faster.
 - Documentation: `process_start_time_seconds` is missing under the shipped

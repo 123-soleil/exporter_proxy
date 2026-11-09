@@ -70,7 +70,7 @@ func TestTLSCacheConfigExpiry(t *testing.T) {
 			if tt.crlNext > 0 {
 				set, crl = crlSetUntil(clock.t.Add(tt.crlNext)), "/crl.pem"
 			}
-			c.storeConfig(cfg, crl, set)
+			c.storeConfig(c.begin(), cfg, crl, set)
 
 			clock.t = clock.t.Add(tt.validFor - time.Second)
 			if c.config(crl) != cfg {
@@ -87,13 +87,13 @@ func TestTLSCacheConfigExpiry(t *testing.T) {
 func TestTLSCacheDisabledFlushAndPath(t *testing.T) {
 	off, clock := newTestTLSCache(0)
 	cfg := tlsConfigValidUntil(t, clock.t.Add(time.Hour))
-	off.storeConfig(cfg, "", nil)
+	off.storeConfig(off.begin(), cfg, "", nil)
 	if off.config("") != nil {
 		t.Error("tls_cache_ttl 0 cached a configuration")
 	}
 
 	c, clock := newTestTLSCache(time.Hour)
-	c.storeConfig(tlsConfigValidUntil(t, clock.t.Add(24*time.Hour)), "/a.crl", nil)
+	c.storeConfig(c.begin(), tlsConfigValidUntil(t, clock.t.Add(24*time.Hour)), "/a.crl", nil)
 	if c.config("/b.crl") != nil {
 		t.Error("configuration built for another client_crl_file served")
 	}
@@ -135,5 +135,33 @@ func TestTLSCacheCRL(t *testing.T) {
 	}
 	if failing != 2 {
 		t.Errorf("failure cached: loaded %d times, want 2", failing)
+	}
+}
+
+// A read that started before a flush (a reload) does not store what it
+// read: the files of before the reload would be served for tls_cache_ttl.
+func TestTLSCacheFlushDuringRead(t *testing.T) {
+	c, clock := newTestTLSCache(time.Hour)
+
+	// CRL read by a request, a reload flushing meanwhile.
+	old := crlSetUntil(clock.t.Add(24 * time.Hour))
+	if _, err := c.crlSet("/a.crl", func() (*crlSet, error) {
+		c.flush() // the reload commits while the file is being read
+		return old, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := crlSetUntil(clock.t.Add(24 * time.Hour))
+	if got, _ := c.crlSet("/a.crl", func() (*crlSet, error) { return fresh, nil }); got != fresh {
+		t.Error("CRL read before the reload served after it")
+	}
+
+	// TLS configuration built by a handshake, a reload flushing meanwhile.
+	epoch := c.begin()
+	cfg := tlsConfigValidUntil(t, clock.t.Add(24*time.Hour))
+	c.flush()
+	c.storeConfig(epoch, cfg, "", nil)
+	if c.config("") != nil {
+		t.Error("TLS configuration built before the reload served after it")
 	}
 }

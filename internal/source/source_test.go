@@ -569,3 +569,20 @@ func TestHTTPSourceHeaderFlood(t *testing.T) {
 		t.Errorf("err = %v, want unavailable", err)
 	}
 }
+
+// Fetch errors do not quote the upstream URL: its path or query may hold a
+// token, or credentials mistaken for a path (http://user:1234/secret@host).
+func TestFetchErrorsDoNotQuoteTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u := srv.URL
+	srv.Close()
+	s := mustNew(t, config.Route{Upstream: u + "/S3cret@exporter/metrics?token=T0ken", Limits: limits(time.Second, 1<<20)})
+	_, err := s.Fetch(context.Background(), Request{})
+	checkErr(t, err, ReasonUnavailable)
+	if strings.Contains(err.Error(), "S3cret") || strings.Contains(err.Error(), "T0ken") {
+		t.Errorf("error quotes the URL: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connect") && !strings.Contains(err.Error(), "refused") {
+		t.Errorf("error lost its cause: %v", err)
+	}
+}

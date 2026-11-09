@@ -2,33 +2,92 @@ package content
 
 import (
 	"bytes"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/123-soleil/exporter_proxy/internal/source"
 )
 
 // Filter keeps the metric families of an already validated body whose name
-// keep accepts. Kept protobuf messages and text lines are copied byte for
-// byte, in their order: nothing is re-encoded, so nothing is added (a
-// histogram without _sum or _count lines gets none).
+// keep accepts. Kept protobuf messages are copied byte for byte. Text keeps
+// the source's lines of the kept families (filterChecked).
 func Filter(body []byte, protobuf bool, keep func(name string) bool) ([]byte, error) {
 	if protobuf {
 		return filterProtobuf(body, keep)
 	}
-	return filterText(body, keep), nil
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
+	if err != nil {
+		return nil, source.NewError(source.ReasonInvalid, "not in Prometheus text format: %s", safeMessage(err))
+	}
+	return filterChecked(body, families, keep)
+}
+
+// filterChecked filters a text body whose parsed families are families.
+// It copies the lines of the kept families (filterText), then parses the
+// result and checks that it holds exactly the kept families, unchanged.
+// When it does not, which only odd bodies cause (a line the resolver
+// assigns differently from the parser), the kept families are re-encoded
+// instead: re-encoding adds _sum and _count lines to incomplete histograms
+// and summaries, but never serves a dropped family.
+func filterChecked(body []byte, families map[string]*dto.MetricFamily, keep func(name string) bool) ([]byte, error) {
+	out := filterText(body, keep)
+	if sameKept(out, families, keep) {
+		return out, nil
+	}
+	return encodeText(families, keep)
+}
+
+// sameKept reports whether out parses to exactly the families keep accepts
+// among families, each unchanged.
+func sameKept(out []byte, families map[string]*dto.MetricFamily, keep func(name string) bool) bool {
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	got, err := parser.TextToMetricFamilies(bytes.NewReader(out))
+	if err != nil {
+		return false
+	}
+	kept := 0
+	for name, mf := range families {
+		if !keep(name) {
+			continue
+		}
+		kept++
+		if !proto.Equal(got[name], mf) {
+			return false
+		}
+	}
+	return len(got) == kept
+}
+
+// encodeText encodes the families keep accepts, sorted by name.
+func encodeText(families map[string]*dto.MetricFamily, keep func(name string) bool) ([]byte, error) {
+	var out bytes.Buffer
+	for _, name := range slices.Sorted(maps.Keys(families)) {
+		if !keep(name) {
+			continue
+		}
+		if _, err := expfmt.MetricFamilyToText(&out, families[name]); err != nil {
+			return nil, source.NewError(source.ReasonInvalid, "cannot re-encode metric family: %v", err)
+		}
+	}
+	return out.Bytes(), nil
 }
 
 // filterText copies the lines of the families keep accepts: their HELP and
 // TYPE comments and their sample lines. Other comments and blank lines are
-// dropped. Lines are assigned to families exactly like the text parser does
-// (see resolve), so the result holds the same families as the original,
-// minus the dropped ones.
+// dropped. Lines are assigned to families like the text parser does (see
+// familyResolver); filterChecked verifies the result.
 func filterText(body []byte, keep func(name string) bool) []byte {
 	out := make([]byte, 0, len(body))
-	r := familyResolver{exists: map[string]bool{}, types: map[string]string{}}
+	r := familyResolver{exists: map[string]bool{}, types: map[string]dto.MetricType{}}
 	for len(body) > 0 {
 		line := body
 		if i := bytes.IndexByte(body, '\n'); i >= 0 {
@@ -50,18 +109,18 @@ func filterText(body []byte, keep func(name string) bool) []byte {
 // which it is the _sum, _count or _bucket, else a new family.
 type familyResolver struct {
 	exists map[string]bool
-	types  map[string]string // TYPE keyword of a family, when declared
+	types  map[string]dto.MetricType // declared by a TYPE line
 }
 
 func (r *familyResolver) resolve(name string) string {
 	if r.exists[name] {
 		return name
 	}
-	if base, ok := cutSuffixes(name, "_count", "_sum"); ok && r.exists[base] && r.types[base] == "summary" {
+	if base, ok := cutSuffixes(name, "_count", "_sum"); ok && r.exists[base] && r.types[base] == dto.MetricType_SUMMARY {
 		return base
 	}
 	if base, ok := cutSuffixes(name, "_count", "_sum", "_bucket"); ok && r.exists[base] &&
-		(r.types[base] == "histogram" || r.types[base] == "gaugehistogram") {
+		(r.types[base] == dto.MetricType_HISTOGRAM || r.types[base] == dto.MetricType_GAUGE_HISTOGRAM) {
 		return base
 	}
 	r.exists[name] = true
@@ -90,15 +149,20 @@ func (r *familyResolver) lineFamily(line []byte) (string, bool) {
 			return "", false
 		}
 		name, after, ok := metricName(bytes.TrimLeft(rest, " \t"))
-		if !ok {
+		// Like the parser: a HELP or TYPE name not followed by a blank is
+		// ignored, no family is created.
+		if !ok || len(after) == 0 || (after[0] != ' ' && after[0] != '\t') {
 			return "", false
 		}
 		family := r.resolve(name)
 		if keyword == "TYPE" {
 			if _, set := r.types[family]; !set {
-				// The parser reads the type case-insensitively.
+				// Like the parser: strings.ToUpper, then the protobuf
+				// enum names (GAUGE_HISTOGRAM included).
 				typ, _ := firstWord(bytes.TrimLeft(after, " \t"))
-				r.types[family] = strings.ToLower(typ)
+				if v, known := dto.MetricType_value[strings.ToUpper(typ)]; known {
+					r.types[family] = dto.MetricType(v)
+				}
 			}
 		}
 		return family, true

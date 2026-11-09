@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -166,7 +168,7 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, classify(ctx, err, limit)
+		return nil, classify(ctx, withoutURL(err), limit)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -187,4 +189,17 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	// Anything but delimited protobuf is validated as text.
 	proto := r.Protobuf && expfmt.ResponseFormat(resp.Header).FormatType() == expfmt.TypeProtoDelim
 	return &Result{Body: body, Protobuf: proto}, nil
+}
+
+// withoutURL drops the URL that net/http quotes in its errors ("Get
+// \"http://...\": ..."): logged on every failed scrape, it would copy its
+// path and query (tokens, or credentials mistaken for a path by a URL like
+// http://user:1234/secret@host) into the logs. The route identifies the
+// source; the method and cause are kept.
+func withoutURL(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("%s upstream: %w", uerr.Op, uerr.Err)
+	}
+	return err
 }

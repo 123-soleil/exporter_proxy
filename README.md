@@ -300,8 +300,14 @@ routes:
   in the source's order, so nothing is added either (a histogram without
   `_sum` or `_count` lines is served without them). In text, a family's
   lines are its `# HELP` and `# TYPE` comments and its sample lines,
-  assigned to families exactly like the Prometheus parser does; other
-  comments and blank lines are dropped.
+  assigned to families like the Prometheus parser does; other comments and
+  blank lines are dropped. The result is parsed again and must hold
+  exactly the kept families, unchanged: if it does not (odd syntax, such
+  as a metric name placed after the labels inside the braces), the kept
+  families are re-encoded instead, which never serves a dropped family
+  but adds `_sum` and `_count` lines to incomplete histograms and
+  summaries. A filtered text route therefore costs one more parse, of the
+  kept part.
 
 ### Route concurrency limit
 
@@ -1428,6 +1434,12 @@ tls_cache_ttl: 5m   # default; 0 reads them for every connection; at most 6h
   update of a CRL: the cache never serves an expired certificate nor a
   stale CRL, which still refuse clients (fail closed).
 - Failures are not cached: the next connection reads the files again.
+  The other way round, a TLS file that breaks (deleted, unreadable, a bad
+  renewal) goes unnoticed while the cached entry lives: handshakes keep
+  succeeding and the failure shows (`error` log, metrics) within
+  `tls_cache_ttl`, or at once with `--check` or a reload.
+- A reload that starts while a connection is reading the files is not
+  undone by it: what was read before the reload is never cached after it.
 - A reload (`SIGHUP`) empties the cache: a renewed certificate, a new
   client CA or a newly published CRL apply at once. Without reload, they
   apply within `tls_cache_ttl`: **a certificate revoked in the CRL is

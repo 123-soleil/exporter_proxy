@@ -19,7 +19,11 @@ type tlsCache struct {
 	ttl *atomic.Int64 // tls_cache_ttl of the server, in nanoseconds
 	now func() time.Time
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// epoch is incremented by flush: a read started before a flush (a
+	// reload) must not store what it read, or the files of before the
+	// reload would be served for a whole tls_cache_ttl.
+	epoch    uint64
 	cfg      *tls.Config
 	cfgCRL   string // client_crl_file the configuration was built with
 	cfgUntil time.Time
@@ -46,6 +50,14 @@ func (c *tlsCache) until(notAfter time.Time) (time.Time, bool) {
 	return u, true
 }
 
+// begin returns the current epoch, to pass to the store methods after
+// reading the files.
+func (c *tlsCache) begin() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.epoch
+}
+
 // config returns the cached TLS configuration built with the
 // client_crl_file crl, or nil.
 func (c *tlsCache) config(crl string) *tls.Config {
@@ -58,14 +70,17 @@ func (c *tlsCache) config(crl string) *tls.Config {
 }
 
 // storeConfig caches cfg, built with the client_crl_file crl whose lists
-// are set (nil for none).
-func (c *tlsCache) storeConfig(cfg *tls.Config, crl string, set *crlSet) {
+// are set (nil for none), from files read since epoch.
+func (c *tlsCache) storeConfig(epoch uint64, cfg *tls.Config, crl string, set *crlSet) {
 	u, ok := c.until(earliest(certNotAfter(cfg), set.nextUpdate()))
 	if !ok {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.epoch != epoch {
+		return // flushed meanwhile: what was read may be outdated
+	}
 	c.cfg, c.cfgCRL, c.cfgUntil = cfg, crl, u
 }
 
@@ -77,6 +92,7 @@ func (c *tlsCache) crlSet(path string, load func() (*crlSet, error)) (*crlSet, e
 		c.mu.Unlock()
 		return set, nil
 	}
+	epoch := c.epoch
 	c.mu.Unlock()
 	set, err := load()
 	if err != nil {
@@ -84,7 +100,9 @@ func (c *tlsCache) crlSet(path string, load func() (*crlSet, error)) (*crlSet, e
 	}
 	if u, ok := c.until(set.nextUpdate()); ok {
 		c.mu.Lock()
-		c.crl, c.crlPath, c.crlUntil = set, path, u
+		if c.epoch == epoch {
+			c.crl, c.crlPath, c.crlUntil = set, path, u
+		}
 		c.mu.Unlock()
 	}
 	return set, nil
@@ -95,6 +113,7 @@ func (c *tlsCache) crlSet(path string, load func() (*crlSet, error)) (*crlSet, e
 func (c *tlsCache) flush() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.epoch++
 	c.cfg, c.crl = nil, nil
 }
 

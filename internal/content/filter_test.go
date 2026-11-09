@@ -95,6 +95,17 @@ var filterCases = []string{
 	"# TYPE x histogram\nx_bucket{le=\"+Inf\"} 1\n# HELP x_count help\nx_count 1\nx_sum 2\n",
 	// Summary and histogram suffixes, gauge named like a suffix.
 	"# TYPE s summary\ns{quantile=\"0.9\"} 1\ns_sum 2\ns_count 3\n# TYPE g_count gauge\ng_count 7\n",
+	// Found by review: the name after labels inside braces, quotes inside
+	// a name, a HELP without text, types spelled or cased differently.
+	"{zone=\"a\",\"secret\"} 1\nzone 2\n",
+	"{zone=\"a\",secret} 1\nzone 2\n",
+	"foo\"bar\" 1\nfoo 2\n",
+	"# HELP foo\"bar\" secret help\nfoo\"bar\" 1\nfoo 2\n",
+	"# HELP h_sum\n# TYPE h histogram\nh_bucket{le=\"+Inf\"} 1\nh_sum 3\nh_count 1\n",
+	"# TYPE g gauge_histogram\ng_bucket{le=\"+Inf\"} 1\ng_sum 3\ng_count 1\n",
+	"# TYPE s \u017fummary\ns{quantile=\"0.5\"} 1\ns_sum 2\ns_count 3\n",
+	"# TYPE h h\u0131stogram\nh_bucket{le=\"+Inf\"} 1\nh_sum 3\nh_count 1\n",
+	"A\"0\"0\n",
 	// Blank lines, other comments, leading blanks, timestamps.
 	"\n# just a comment\n  a 1 1700000000000\n\n# TYPE b counter\nb_total 2\nb 3\n",
 }
@@ -110,38 +121,50 @@ func TestFilterTextKeepsFamiliesIntact(t *testing.T) {
 	}
 }
 
+// checkFilterEquivalence checks Filter on a body for several keep
+// functions, among them dropping each family in turn: the output parses,
+// serves no dropped family and every kept one; when it is the copy of the
+// source's lines, every kept family is unchanged.
 func checkFilterEquivalence(t *testing.T, body []byte) {
 	t.Helper()
 	_, orig, err := parseText(body, 1<<30)
 	if err != nil {
 		return // only validated bodies are filtered
 	}
-	for _, keep := range []func(string) bool{
+	keeps := []func(string) bool{
 		func(string) bool { return true },
 		func(string) bool { return false },
 		func(n string) bool { return len(n)%2 == 0 },
 		func(n string) bool { return strings.Contains(n, "_") },
-	} {
-		out := filterText(body, keep)
+	}
+	for name := range orig {
+		keeps = append(keeps, func(n string) bool { return n != name })
+	}
+	for _, keep := range keeps {
+		out, err := Filter(body, false, keep)
+		if err != nil {
+			t.Fatalf("Filter: %v", err)
+		}
 		_, got, err := parseText(out, 1<<30)
 		if err != nil {
-			t.Fatalf("filtered body invalid: %v\ninput:\n%s\noutput:\n%s", err, body, out)
+			t.Fatalf("filtered body invalid: %v\ninput:\n%q\noutput:\n%q", err, body, out)
 		}
-		want := 0
-		for name, mf := range orig {
-			if !keep(name) {
-				if _, ok := got[name]; ok {
-					t.Errorf("dropped family %q served:\n%s", name, out)
+		for name := range got {
+			if _, known := orig[name]; !known || !keep(name) {
+				t.Fatalf("family %q served although dropped or unknown\ninput:\n%q\noutput:\n%q", name, body, out)
+			}
+		}
+		for name := range orig {
+			if _, served := got[name]; keep(name) && !served {
+				t.Errorf("kept family %q missing\ninput:\n%q\noutput:\n%q", name, body, out)
+			}
+		}
+		if string(out) == string(filterText(body, keep)) {
+			for name, mf := range got {
+				if !proto.Equal(mf, orig[name]) {
+					t.Errorf("copied family %q changed\ninput:\n%q\noutput:\n%q", name, body, out)
 				}
-				continue
 			}
-			want++
-			if !proto.Equal(got[name], mf) {
-				t.Errorf("family %q changed:\n got %v\nwant %v\ninput:\n%s\noutput:\n%s", name, got[name], mf, body, out)
-			}
-		}
-		if len(got) != want {
-			t.Errorf("filtered body has %d families, want %d:\n%s", len(got), want, out)
 		}
 	}
 }

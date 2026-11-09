@@ -212,24 +212,33 @@ func (l *listener) tlsConfigFor(c *web.Config) (*tls.Config, error) {
 // tlsConfigWithCRL is tlsConfigFor with the client_crl_file path given: a
 // reload checks the TLS settings with the CRL it is about to apply.
 func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, error) {
+	cfg, _, err := l.tlsConfigAndCRL(c, path)
+	return cfg, err
+}
+
+// tlsConfigAndCRL is tlsConfigWithCRL also returning the CRLs it checks
+// (nil without client_crl_file), read once.
+func (l *listener) tlsConfigAndCRL(c *web.Config, path string) (*tls.Config, *crlSet, error) {
 	if err := l.checkClientAuth(&c.TLSConfig); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// The listener offers HTTP/2 as set when it started, whatever the file
 	// says now: its ciphers must carry it.
 	withListenerHTTP2 := *c
 	withListenerHTTP2.HTTPConfig.HTTP2 = l.settings.http2
 	if err := webconfig.ValidateHTTP2Ciphers(&withListenerHTTP2); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg, err := serverTLSConfig(c)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var set *crlSet
 	if path != "" {
-		set, err := loadCRL(path, time.Now())
+		var err error
+		set, err = loadCRL(path, time.Now())
 		if err != nil {
-			return nil, err // server side: refuses the handshake
+			return nil, nil, err // server side: refuses the handshake
 		}
 		// On every handshake, TLS 1.3 session resumption included.
 		prev := cfg.VerifyConnection
@@ -242,7 +251,7 @@ func (l *listener) tlsConfigWithCRL(c *web.Config, path string) (*tls.Config, er
 			return set.check(cs.VerifiedChains)
 		}
 	}
-	return cfg, nil
+	return cfg, set, nil
 }
 
 // keeps reports whether next holds every pattern of old, as written.
@@ -777,6 +786,8 @@ func (s *Server) Reload(cfg *config.Config) error {
 			} else {
 				retire(l.handler.store(spec{handler: removedListener{}, writeTimeout: writeMargin}))
 			}
+			// Its remaining connections check the files of now too.
+			l.tlsCache.flush()
 			s.drain(l)
 		}
 	}
@@ -1045,6 +1056,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		epoch := l.tlsCache.begin() // before reading anything
 		crl := *l.crl.Load()
 		if cfg := l.tlsCache.config(crl); cfg != nil {
 			return cfg, nil
@@ -1056,20 +1068,15 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		if err != nil {
 			return nil, fail(err)
 		}
-		cfg, err := l.tlsConfigWithCRL(c, crl)
+		cfg, set, err := l.tlsConfigAndCRL(c, crl)
 		if err != nil {
 			return nil, fail(err)
 		}
 		health.succeededSince(gen)
 		cfg.NextProtos = nextProtos
-		var set *crlSet
-		if crl != "" {
-			// Parsed already by tlsConfigWithCRL: from the content cache.
-			if set, err = loadCRL(crl, time.Now()); err != nil {
-				return cfg, nil // not cached: read again next time
-			}
-		}
-		l.tlsCache.storeConfig(cfg, crl, set)
+		// Cached until the CRLs checked by cfg expire, not those of a
+		// later read.
+		l.tlsCache.storeConfig(epoch, cfg, crl, set)
 		return cfg, nil
 	}
 	srv.TLSConfig = tlsCfg
