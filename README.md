@@ -850,7 +850,7 @@ together on one log line (each prefixed with its location, e.g.
 | Routes     | At least one per listener. |
 | `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
 | Source     | Exactly one: `upstream` or `file`. `unix_socket` only together with `upstream`. |
-| `upstream` | `http://` or `https://`, with a host, without fragment, and without any `@`: credentials (`user:password@`) are refused, and so is a literal `@` (write it `%40` in a path), since a password containing `/`, `?` or `#` would otherwise be read as a host, port or path. An invalid URL is reported without quoting it. `unix_socket` requires `http://`. |
+| `upstream` | `http://` or `https://`, with a host, without credentials (`user:password@`, refused whenever `@` appears between `//` and the first `/`, `?` or `#`) or fragment. A `@` in the path or query is allowed. An invalid URL is reported without quoting it (a password containing `/`, `?` or `#` makes the URL invalid). `unix_socket` requires `http://`. |
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |

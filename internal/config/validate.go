@@ -315,11 +315,11 @@ func (v *validator) checkAuthorize(where string, a *fileAuthorize) {
 }
 
 func (v *validator) checkUpstream(where, raw string) {
-	// No '@' anywhere: credentials are refused, and a password containing
-	// '/', '?' or '#' would otherwise end the authority early and be read
-	// as a host, a port or a path (and quoted by errors and logs).
-	if strings.Contains(raw, "@") {
-		v.addf(where, "upstream must not contain '@': credentials are not allowed in it (write a literal '@' of a path as %%40)")
+	// Credentials are refused, also when url.Parse would not see them:
+	// any '@' in the authority (between "//" and the first '/', '?' or
+	// '#'). A '@' in the path or query is allowed.
+	if strings.Contains(authority(raw), "@") {
+		v.addf(where, "upstream must not contain credentials")
 		return
 	}
 	u, err := url.Parse(raw)
@@ -339,6 +339,19 @@ func (v *validator) checkUpstream(where, raw string) {
 	case u.Fragment != "":
 		v.addf(where, "upstream must not contain a fragment")
 	}
+}
+
+// authority returns the authority of a URL as written: after "//", up to
+// the first '/', '?' or '#'. Empty when there is no "//".
+func authority(raw string) string {
+	_, rest, ok := strings.Cut(raw, "//")
+	if !ok {
+		return ""
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
 }
 
 // MetricsListenerName names the metrics endpoint in logs; listeners cannot

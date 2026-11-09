@@ -38,6 +38,8 @@ func TestValidateAcceptsValidConfigs(t *testing.T) {
 		yaml string
 	}{
 		{"http upstream", withRoutes(okRoute)},
+		{"@ in the upstream path", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/probe/a@b/metrics\n")},
+		{"@ in the upstream query", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/metrics?target=user@host\n")},
 		{"upstream with query", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/metrics?collect=x\n")},
 		{"unix socket", withRoutes("      - path: /m\n        upstream: http://localhost/metrics\n        unix_socket: /run/app/metrics.sock\n")},
 		{"file", withRoutes("      - path: /m\n        file: /var/lib/batch/metrics.prom\n        max_age: 15m\n")},
@@ -233,17 +235,12 @@ func TestValidateRejects(t *testing.T) {
 		{
 			name:    "malformed upstream with credentials",
 			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:S3cret%zz@h/m\"\n"),
-			wantErr: "upstream must not contain '@'",
+			wantErr: "upstream must not contain credentials",
 		},
 		{
 			name:    "password with a slash read as a port",
 			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:S3cret/x@h/m\"\n"),
-			wantErr: "upstream must not contain '@'",
-		},
-		{
-			name:    "numeric password read as a port",
-			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:12345/x@h/m\"\n"),
-			wantErr: "upstream must not contain '@'",
+			wantErr: "upstream is not a valid URL",
 		},
 		{
 			name:    "invalid URL quotes nothing",
@@ -253,7 +250,7 @@ func TestValidateRejects(t *testing.T) {
 		{
 			name:    "upstream with credentials",
 			yaml:    withRoutes("      - path: /m\n        upstream: http://user:CHANGE_ME@h/m\n"),
-			wantErr: "upstream must not contain '@'",
+			wantErr: "upstream must not contain credentials",
 		},
 		{
 			name:    "upstream with fragment",
