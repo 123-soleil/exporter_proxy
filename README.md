@@ -307,7 +307,9 @@ routes:
   families are re-encoded instead, which never serves a dropped family
   but adds `_sum` and `_count` lines to incomplete histograms and
   summaries. A filtered text route therefore costs one more parse, of the
-  kept part.
+  kept part (skipped when the filter keeps every family), which
+  `exporter_proxy_parse_duration_seconds` does not include: count up to
+  twice that time for such routes.
 
 ### Route concurrency limit
 

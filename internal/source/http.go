@@ -144,7 +144,7 @@ func (s *httpSource) Fetch(parent context.Context, r Request) (*Result, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return nil, &Error{Reason: ReasonUnavailable, Err: err}
+		return nil, &Error{Reason: ReasonUnavailable, Err: withoutURL(err)}
 	}
 	// Only these headers are sent: nothing from the client request
 	// (Authorization in particular) is forwarded.

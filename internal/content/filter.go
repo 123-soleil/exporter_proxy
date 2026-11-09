@@ -39,6 +39,18 @@ func Filter(body []byte, protobuf bool, keep func(name string) bool) ([]byte, er
 // instead: re-encoding adds _sum and _count lines to incomplete histograms
 // and summaries, but never serves a dropped family.
 func filterChecked(body []byte, families map[string]*dto.MetricFamily, keep func(name string) bool) ([]byte, error) {
+	// Every family kept, as the parser sees them: the source as it is.
+	// (Deciding on the copied lines instead would trust the resolver.)
+	allKept := true
+	for name := range families {
+		if !keep(name) {
+			allKept = false
+			break
+		}
+	}
+	if allKept {
+		return body, nil
+	}
 	out := filterText(body, keep)
 	if sameKept(out, families, keep) {
 		return out, nil
@@ -75,7 +87,9 @@ func encodeText(families map[string]*dto.MetricFamily, keep func(name string) bo
 			continue
 		}
 		if _, err := expfmt.MetricFamilyToText(&out, families[name]); err != nil {
-			return nil, source.NewError(source.ReasonInvalid, "cannot re-encode metric family: %v", err)
+			// The error quotes the family (labels, values, HELP): not
+			// logged.
+			return nil, source.NewError(source.ReasonInvalid, "cannot re-encode a metric family")
 		}
 	}
 	return out.Bytes(), nil
@@ -160,8 +174,11 @@ func (r *familyResolver) lineFamily(line []byte) (string, bool) {
 				// Like the parser: strings.ToUpper, then the protobuf
 				// enum names (GAUGE_HISTOGRAM included).
 				typ, _ := firstWord(bytes.TrimLeft(after, " \t"))
-				if v, known := dto.MetricType_value[strings.ToUpper(typ)]; known {
+				upper := strings.ToUpper(typ)
+				if v, known := dto.MetricType_value[upper]; known {
 					r.types[family] = dto.MetricType(v)
+				} else if upper == "GAUGEHISTOGRAM" { // OpenMetrics spelling, accepted by the parser
+					r.types[family] = dto.MetricType_GAUGE_HISTOGRAM
 				}
 			}
 		}

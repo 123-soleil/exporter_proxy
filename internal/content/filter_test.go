@@ -103,6 +103,7 @@ var filterCases = []string{
 	"# HELP foo\"bar\" secret help\nfoo\"bar\" 1\nfoo 2\n",
 	"# HELP h_sum\n# TYPE h histogram\nh_bucket{le=\"+Inf\"} 1\nh_sum 3\nh_count 1\n",
 	"# TYPE g gauge_histogram\ng_bucket{le=\"+Inf\"} 1\ng_sum 3\ng_count 1\n",
+	"# TYPE g gaugehistogram\ng_bucket{le=\"+Inf\"} 1\ng_sum 3\ng_count 1\nother 1\n",
 	"# TYPE s \u017fummary\ns{quantile=\"0.5\"} 1\ns_sum 2\ns_count 3\n",
 	"# TYPE h h\u0131stogram\nh_bucket{le=\"+Inf\"} 1\nh_sum 3\nh_count 1\n",
 	"A\"0\"0\n",
@@ -176,4 +177,18 @@ func FuzzFilterText(f *testing.F) {
 	f.Fuzz(func(t *testing.T, body []byte) {
 		checkFilterEquivalence(t, body)
 	})
+}
+
+// A gauge histogram spelled the OpenMetrics way keeps its lines: the copy
+// path, not the re-encoding fallback (which would change its type).
+func TestFilterGaugeHistogramCopied(t *testing.T) {
+	in := "# TYPE g gaugehistogram\ng_bucket{le=\"+Inf\"} 1\ng_sum 3\ng_count 1\nother 1\n"
+	out, err := Filter([]byte(in), false, func(n string) bool { return n == "g" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# TYPE g gaugehistogram\ng_bucket{le=\"+Inf\"} 1\ng_sum 3\ng_count 1\n"
+	if string(out) != want {
+		t.Errorf("filtered:\n%s\nwant the source's lines:\n%s", out, want)
+	}
 }
