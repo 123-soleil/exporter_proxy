@@ -233,12 +233,27 @@ func TestValidateRejects(t *testing.T) {
 		{
 			name:    "malformed upstream with credentials",
 			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:S3cret%zz@h/m\"\n"),
+			wantErr: "upstream must not contain '@'",
+		},
+		{
+			name:    "password with a slash read as a port",
+			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:S3cret/x@h/m\"\n"),
+			wantErr: "upstream must not contain '@'",
+		},
+		{
+			name:    "numeric password read as a port",
+			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:12345/x@h/m\"\n"),
+			wantErr: "upstream must not contain '@'",
+		},
+		{
+			name:    "invalid URL quotes nothing",
+			yaml:    withRoutes("      - path: /m\n        upstream: \"http://h:S3cret/m\"\n"),
 			wantErr: "upstream is not a valid URL",
 		},
 		{
 			name:    "upstream with credentials",
 			yaml:    withRoutes("      - path: /m\n        upstream: http://user:CHANGE_ME@h/m\n"),
-			wantErr: "upstream must not contain credentials",
+			wantErr: "upstream must not contain '@'",
 		},
 		{
 			name:    "upstream with fragment",

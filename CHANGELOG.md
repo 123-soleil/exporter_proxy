@@ -12,24 +12,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `401` and `429` answers close their connection: a client could hold
   connections (one goroutine and file descriptor each) open indefinitely
   with one refused request every minute, without ever authenticating.
-- An invalid upstream URL no longer copies the URL, credentials included,
-  into the validation error logged at startup, reload and `--check`.
-- A protobuf body with a few series of many empty buckets or quantiles is
-  refused as `too_many_samples` before decoding: decoding allocated up to
-  60 times the body size first.
+- An invalid upstream URL is reported without quoting it: its credentials
+  ended up in the validation error logged at startup, reload and `--check`.
+- Protobuf bodies are checked before decoding for what decoding inflates:
+  samples counted with classic buckets and quantiles, at most 256 labels
+  per series (like text lines), and at most one label, bucket, quantile,
+  span or exemplar per 6 bytes of body (+ 65536). Bodies of empty buckets,
+  spans or labels made decoding allocate 55 to 83 times their size.
+
+### Changed
+
+- `upstream` may not contain `@` at all: credentials were refused, but a
+  password containing `/`, `?` or `#` ended the authority early and was
+  read as a host, port or path. Write a literal `@` of a path as `%40`.
 
 ### Added
 
-- Startup, reload and `--check` warning for a listener with neither TLS,
-  basic authentication nor `allowed_networks`, listening beyond loopback
-  (an empty web configuration file serves in plain HTTP to anyone).
+- Startup, reload and `--check` warning for a listener that authenticates
+  nobody (neither basic authentication nor a required and verified client
+  certificate) and has no `allowed_networks`, listening beyond loopback: an
+  empty web configuration file serves in plain HTTP, and TLS alone only
+  encrypts.
 - `--check` reports a `client_crl_file` with no CRL signed by the client
-  CAs (every client certificate would be refused), also logged at startup
-  and reload, and `file` or `unix_socket` paths hidden from the service by
+  CAs (a problem when no CA has one: every client certificate would be
+  refused; a warning when some do not), also logged at startup and reload, and `file` or `unix_socket` paths hidden from the service by
   the systemd unit (`PrivateTmp=`, `ProtectHome=`).
 
 ### Fixed
 
+- Filtering a protobuf body (`metrics_filter`) reads the name of each
+  family without decoding it again: about 8 times faster.
 - Documentation: `process_start_time_seconds` is missing under the shipped
   unit (`ProcSubset=pid`); the configuration example now mentions
   `https://` upstreams.

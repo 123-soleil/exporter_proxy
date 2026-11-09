@@ -1,13 +1,21 @@
 package webconfig
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/exporter-toolkit/web"
 )
@@ -31,7 +39,7 @@ func TestRead(t *testing.T) {
 		{
 			"mTLS only",
 			"tls_server_config:\n  client_ca_file: ca.crt\n  client_auth_type: RequireAndVerifyClientCert\n",
-			Summary{TLSEnabled: true, ClientCAFile: "DIR/ca.crt", ClientCertsVerified: true},
+			Summary{TLSEnabled: true, ClientCAFile: "DIR/ca.crt", ClientCertsVerified: true, ClientCertsRequired: true},
 			false,
 		},
 		{"unknown keys ignored", "http_server_config:\n  http2: false\n", Summary{}, false},
@@ -343,5 +351,112 @@ func TestLoadRejectsMinAboveMaxVersion(t *testing.T) {
 	}
 	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "min_version is above max_version") {
 		t.Errorf("Load error = %v, want min_version is above max_version", err)
+	}
+}
+
+func TestUnprotected(t *testing.T) {
+	tests := []struct {
+		name  string
+		yaml  string
+		unpro bool
+	}{
+		{"empty file", "", true},
+		{"empty object", "{}\n", true},
+		{"basic auth without TLS", "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "web.yml")
+			if err := os.WriteFile(p, []byte(tt.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Read(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.Unprotected() != tt.unpro {
+				t.Errorf("Unprotected = %v, want %v", s.Unprotected(), tt.unpro)
+			}
+		})
+	}
+	// TLS policies: only a required and verified client certificate
+	// authenticates.
+	for auth, unpro := range map[string]bool{
+		"": true, "NoClientCert": true, "RequestClientCert": true, "RequireAnyClientCert": true,
+		"VerifyClientCertIfGiven": true, "RequireAndVerifyClientCert": false,
+	} {
+		s := Summary{TLSEnabled: true, ClientCertsRequired: requiresVerified(auth)}
+		if s.Unprotected() != unpro {
+			t.Errorf("client_auth_type %q: Unprotected = %v, want %v", auth, s.Unprotected(), unpro)
+		}
+	}
+}
+
+func TestCRLMissing(t *testing.T) {
+	now := time.Now()
+	newKey := func() *ecdsa.PrivateKey {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	issue := func(name string, isCA bool, parent *x509.Certificate, parentKey, key *ecdsa.PrivateKey) *x509.Certificate {
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(now.UnixNano()), Subject: pkix.Name{CommonName: name},
+			NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: isCA, BasicConstraintsValid: true,
+			KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature}
+		if parent == nil {
+			parent, parentKey = tmpl, key
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _ := x509.ParseCertificate(der)
+		return c
+	}
+	crl := func(issuer *x509.Certificate, key *ecdsa.PrivateKey) *x509.RevocationList {
+		der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1),
+			ThisUpdate: now.Add(-time.Hour), NextUpdate: now.Add(time.Hour)}, issuer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l, _ := x509.ParseRevocationList(der)
+		return l
+	}
+	pemOf := func(certs ...*x509.Certificate) []byte {
+		var b []byte
+		for _, c := range certs {
+			b = append(b, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})...)
+		}
+		return b
+	}
+
+	rootKey, interKey, otherKey, leafKey := newKey(), newKey(), newKey(), newKey()
+	root := issue("root", true, nil, nil, rootKey)
+	inter := issue("intermediate", true, root, rootKey, interKey)
+	other := issue("other", true, nil, nil, otherKey)
+	pinned := issue("pinned-client", false, nil, nil, leafKey)
+
+	tests := []struct {
+		name        string
+		bundle      []byte
+		lists       []*x509.RevocationList
+		wantMissing []string
+		wantTotal   int
+	}{
+		{"root covered", pemOf(root), []*x509.RevocationList{crl(root, rootKey)}, nil, 1},
+		{"root not covered", pemOf(root), []*x509.RevocationList{crl(other, otherKey)}, []string{"CN=root"}, 1},
+		{"intermediate covered, root above it skipped", pemOf(root, inter), []*x509.RevocationList{crl(inter, interKey)}, nil, 2},
+		{"two unrelated CAs, one covered", pemOf(root, other), []*x509.RevocationList{crl(root, rootKey)}, []string{"CN=other"}, 2},
+		{"pinned client certificate skipped", pemOf(pinned, root), []*x509.RevocationList{crl(root, rootKey)}, nil, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			missing, total := CRLMissing(tt.bundle, tt.lists)
+			if fmt.Sprint(missing) != fmt.Sprint(tt.wantMissing) || total != tt.wantTotal {
+				t.Errorf("CRLMissing = %v, %d; want %v, %d", missing, total, tt.wantMissing, tt.wantTotal)
+			}
+		})
 	}
 }

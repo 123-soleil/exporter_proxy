@@ -120,17 +120,22 @@ func validateProtobuf(body []byte, maxSamples int) (Result, error) {
 		return Result{Samples: n, Duration: time.Since(start)},
 			source.NewError(source.ReasonInvalid, "not in delimited protobuf format: metric family %d", families+1)
 	}
-	// Decoding allocates far more than the body for empty series: bodies
-	// with more series than max_samples (each is at least one sample) are
-	// refused before decoding.
-	series, bad := protobufSeries(body, maxSamples)
-	if bad > 0 {
-		families = bad - 1
+	// Decoding allocates far more than the wire size of empty series,
+	// labels, buckets or spans: such bodies are refused before decoding.
+	scan := scanProtobuf(body, maxSamples)
+	switch {
+	case scan.bad > 0:
+		families = scan.bad - 1
 		return invalid()
-	}
-	if series > maxSamples {
-		return Result{Samples: series, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
+	case scan.tooManyLabels > 0:
+		return Result{Duration: time.Since(start)}, source.NewError(source.ReasonInvalid,
+			"metric family %d: a series has more than %d labels", scan.tooManyLabels, MaxLabelsPerLine)
+	case scan.samples > maxSamples:
+		return Result{Samples: scan.samples, Duration: time.Since(start)}, source.NewError(source.ReasonTooManySamples,
 			"more than %d samples (max_samples)", maxSamples)
+	case scan.entries > entryBudget(len(body)):
+		return Result{Duration: time.Since(start)}, source.NewError(source.ReasonInvalid,
+			"too many labels, buckets or spans for the body size (%d, at most %d)", scan.entries, entryBudget(len(body)))
 	}
 	for rest := body; len(rest) > 0; {
 		size, prefix := protowire.ConsumeVarint(rest)
@@ -222,97 +227,137 @@ func labelCount(line []byte) int {
 // metricField is the field number of MetricFamily.metric.
 const metricField = 4
 
-// protobufSeries counts a lower bound of the samples of a delimited
-// protobuf body (one per series, or its buckets or quantiles when more) by
-// walking the wire format, without decoding.
-// It stops counting past limit; bad is the 1-based position of a
-// malformed family, 0 when none.
-func protobufSeries(body []byte, limit int) (n, bad int) {
+// entryBudget bounds the sub-messages (labels, buckets, quantiles, spans,
+// exemplars) of a protobuf body of size bytes. Each one decodes into a Go
+// struct of about a hundred bytes; real ones take more than 6 bytes on the
+// wire (a label carries a name, a bucket a bound and a count), empty ones
+// made to inflate decoding take 2.
+func entryBudget(size int) int { return size/6 + 1<<16 }
+
+// protobufScan is what scanProtobuf found in a delimited protobuf body.
+type protobufScan struct {
+	samples       int // lower bound of the samples, counted up to the limit
+	entries       int // labels, buckets, quantiles, spans and exemplars
+	bad           int // 1-based position of a malformed family, 0 if none
+	tooManyLabels int // 1-based family with a series of more than MaxLabelsPerLine labels
+}
+
+// Field numbers of client_model's messages.
+const (
+	labelField     = 1  // Metric.label
+	summaryField   = 4  // Metric.summary
+	histogramField = 7  // Metric.histogram
+	entriesField   = 3  // Summary.quantile, Histogram.bucket
+	negSpanField   = 9  // Histogram.negative_span
+	posSpanField   = 12 // Histogram.positive_span
+	exemplarsField = 16 // Histogram.exemplars
+)
+
+// scanProtobuf walks the wire format of a delimited protobuf body without
+// decoding it: a lower bound of its samples (the same rule as familySamples,
+// stopping past limit), its sub-messages and its labels per series.
+func scanProtobuf(body []byte, limit int) protobufScan {
+	var sc protobufScan
 	family := 0
-	for rest := body; len(rest) > 0 && n <= limit; {
+	for rest := body; len(rest) > 0 && sc.samples <= limit; {
 		family++
 		size, prefix := protowire.ConsumeVarint(rest)
 		if prefix < 0 || size > uint64(len(rest)-prefix) {
-			return n, family
+			sc.bad = family
+			return sc
 		}
 		msg := rest[prefix : prefix+int(size)]
 		rest = rest[prefix+int(size):]
-		for len(msg) > 0 {
-			num, typ, tagLen := protowire.ConsumeTag(msg)
-			if tagLen < 0 {
-				return n, family
+		ok := eachField(msg, func(num protowire.Number, v []byte) bool {
+			if num != metricField {
+				return true
 			}
-			valLen := protowire.ConsumeFieldValue(num, typ, msg[tagLen:])
-			if valLen < 0 {
-				return n, family
-			}
-			if num == metricField && typ == protowire.BytesType {
-				v, _ := protowire.ConsumeBytes(msg[tagLen:])
-				c, ok := seriesSamples(v)
-				if !ok {
-					return n, family
-				}
-				n += c
-			}
-			msg = msg[tagLen+valLen:]
-		}
-	}
-	return n, 0
-}
-
-// Field numbers of client_model's Metric, Summary and Histogram messages.
-const (
-	summaryField   = 4 // Metric.summary
-	histogramField = 7 // Metric.histogram
-	entriesField   = 3 // Summary.quantile, Histogram.bucket
-)
-
-// seriesSamples returns a lower bound of the samples of one encoded Metric
-// without decoding it: one, or its quantiles or classic buckets when more
-// (familySamples counts them plus _sum and _count). Decoding allocates far
-// more than the wire size of empty buckets, so they count before decoding.
-func seriesSamples(metric []byte) (int, bool) {
-	entries := 0
-	for len(metric) > 0 {
-		num, typ, tagLen := protowire.ConsumeTag(metric)
-		if tagLen < 0 {
-			return 0, false
-		}
-		valLen := protowire.ConsumeFieldValue(num, typ, metric[tagLen:])
-		if valLen < 0 {
-			return 0, false
-		}
-		if (num == summaryField || num == histogramField) && typ == protowire.BytesType {
-			sub, _ := protowire.ConsumeBytes(metric[tagLen:])
-			k, ok := countField(sub, entriesField)
+			m, ok := scanMetric(v)
 			if !ok {
-				return 0, false
+				return false
 			}
-			entries += k
+			if m.labels > MaxLabelsPerLine && sc.tooManyLabels == 0 {
+				sc.tooManyLabels = family
+			}
+			sc.samples += m.samples
+			sc.entries += m.entries
+			return true
+		})
+		if !ok {
+			sc.bad = family
+			return sc
 		}
-		metric = metric[tagLen+valLen:]
 	}
-	return max(1, entries), true
+	return sc
 }
 
-// countField counts the length-delimited occurrences of field num in msg.
-func countField(msg []byte, num protowire.Number) (int, bool) {
-	n := 0
+// metricScan is what scanMetric found in one encoded Metric.
+type metricScan struct{ samples, entries, labels int }
+
+// scanMetric counts the samples of one encoded Metric like familySamples
+// (a lower bound: a histogram's classic buckets or a summary's quantiles,
+// at least one) and its sub-messages.
+func scanMetric(metric []byte) (metricScan, bool) {
+	var m metricScan
+	hasHistogram, buckets, quantiles := false, 0, 0
+	ok := eachField(metric, func(num protowire.Number, v []byte) bool {
+		switch num {
+		case labelField:
+			m.labels++
+			m.entries++
+		case summaryField:
+			return eachField(v, func(f protowire.Number, _ []byte) bool {
+				if f == entriesField {
+					quantiles++
+					m.entries++
+				}
+				return true
+			})
+		case histogramField:
+			hasHistogram = true
+			return eachField(v, func(f protowire.Number, _ []byte) bool {
+				switch f {
+				case entriesField:
+					buckets++
+					m.entries++
+				case negSpanField, posSpanField, exemplarsField:
+					m.entries++
+				}
+				return true
+			})
+		}
+		return true
+	})
+	if hasHistogram {
+		m.samples = max(1, buckets)
+	} else {
+		m.samples = max(1, quantiles)
+	}
+	return m, ok
+}
+
+// eachField calls fn with the number and content of every length-delimited
+// field of msg, until fn returns false. It reports false for a malformed
+// message or when fn stopped.
+func eachField(msg []byte, fn func(num protowire.Number, v []byte) bool) bool {
 	for len(msg) > 0 {
-		f, typ, tagLen := protowire.ConsumeTag(msg)
+		num, typ, tagLen := protowire.ConsumeTag(msg)
 		if tagLen < 0 {
-			return 0, false
+			return false
 		}
-		valLen := protowire.ConsumeFieldValue(f, typ, msg[tagLen:])
+		valLen := protowire.ConsumeFieldValue(num, typ, msg[tagLen:])
 		if valLen < 0 {
-			return 0, false
+			return false
 		}
-		if f == num && typ == protowire.BytesType {
-			n++
+		if typ == protowire.BytesType {
+			v, _ := protowire.ConsumeBytes(msg[tagLen:])
+			if !fn(num, v) {
+				return false
+			}
 		}
 		msg = msg[tagLen+valLen:]
 	}
-	return n, true
+	return true
 }
 
 // validFamily checks the names and label values of a decoded family, like

@@ -408,11 +408,14 @@ page) from being exposed through the proxy.
 - The parser allocates about **10 times the body size** for typical
   exporters, and up to about 50 times for bodies made of very small
   series, labels or buckets (the cost is per series and per label). Before
-  parsing, bodies with more sample lines (text) or series (protobuf) than
-  `max_samples` are refused (`too_many_samples`), and so are text lines
-  with more than 256 labels and bodies whose lines hold many tiny labels
-  (the sum over lines of labels² above 8 × the body size + 65536,
-  `invalid`): the text parser's cost grows with the square of a line's
+  parsing, bodies with more sample lines (text) or samples (protobuf:
+  series, or their classic buckets or quantiles when more) than
+  `max_samples` are refused (`too_many_samples`), and so are lines or
+  series with more than 256 labels, text bodies whose lines hold many tiny
+  labels (the sum over lines of labels² above 8 × the body size + 65536)
+  and protobuf bodies with more labels, buckets, quantiles, spans and
+  exemplars than one per 6 bytes of body + 65536 (`invalid`; real ones take
+  more than 6 bytes each, empty ones made to inflate decoding take 2): the text parser's cost grows with the square of a line's
   labels, and one line with thousands of them would take minutes of CPU
   while holding the listener's slots. Real exporters, which spend tens of
   bytes per label, stay far below. Upstream answers may carry at most
@@ -497,12 +500,19 @@ client cannot keep connections open indefinitely with one cheap refused
 request each, without ever authenticating. A scraper reconnects at its next
 scrape.
 
-A listener with neither TLS nor basic authentication (for example an empty
-or truncated web configuration file) serves the exporters to anyone who can
-reach it. When it listens beyond the loopback interface and has no
+These closes also apply to legitimate scrapers refused by the `rate_limit`
+of a web configuration: they reconnect with a new TLS handshake. On HTTP/2,
+net/http turns `Connection: close` into a graceful GOAWAY.
+
+A listener that authenticates nobody, neither by basic authentication nor
+by a required and verified client certificate (`client_auth_type:
+RequireAndVerifyClientCert`), serves the exporters to anyone who can reach
+it: an empty or truncated web configuration file, or TLS alone, which only
+encrypts. When it listens beyond the loopback interface and has no
 `allowed_networks`, a `warn` line says so at startup and reload
-(`msg="listener without TLS, authentication or allowed_networks: anyone
-reaching it can read the metrics"`), and `--check` reports a warning.
+(`msg="listener without authentication (basic auth or required client
+certificates) nor allowed_networks: anyone reaching it can read the
+metrics"`), and `--check` reports a warning.
 
 ### Route authorization
 
@@ -840,7 +850,7 @@ together on one log line (each prefixed with its location, e.g.
 | Routes     | At least one per listener. |
 | `path`     | Required, starts with `/`, clean (no `.`, `..`, `//` or trailing `/`), no `?` or `#`, unique within its listener (the same path may exist on another listener). |
 | Source     | Exactly one: `upstream` or `file`. `unix_socket` only together with `upstream`. |
-| `upstream` | `http://` or `https://`, with a host, without credentials (`user:password@`) or fragment. `unix_socket` requires `http://`. |
+| `upstream` | `http://` or `https://`, with a host, without fragment, and without any `@`: credentials (`user:password@`) are refused, and so is a literal `@` (write it `%40` in a path), since a password containing `/`, `?` or `#` would otherwise be read as a host, port or path. An invalid URL is reported without quoting it. `unix_socket` requires `http://`. |
 | `upstream_tls` | Optional, `https://` upstreams only: `ca_file`, `cert_file` with `key_file`, `server_name`; absolute paths; not empty. No option disables certificate verification. |
 | Paths      | `file`, `unix_socket` and `web_config_file` are absolute and clean (`filepath.Clean` leaves them unchanged), so `/var/lib/../../etc/shadow` is rejected. |
 | `max_age`  | Required on `file` routes, forbidden on other routes. |
@@ -1280,11 +1290,16 @@ otherwise; warnings do not fail the check:
   reload" and "Refused authentications") are checked too, like at startup;
 - an `authorize` list that cannot match on its listener is a warning;
 - each `client_crl_file` parses and is within its dates (a warning 7 days
-  before its next update), and holds a CRL signed by each client CA: client
-  certificates issued by a CA without one are refused at runtime, so it is
-  a problem when no client CA has one, a warning when some do not (the
-  same is logged at `error` level at startup and reload);
-- a listener with neither TLS, basic authentication nor `allowed_networks`,
+  before its next update), and holds a CRL signed by each CA of the client
+  CA bundle: client certificates issued by a CA without one are refused at
+  runtime, so it is a problem when no CA has one (logged at `error` level
+  at startup and reload), a warning when some do not (`warn`). Bundle
+  certificates that are not CAs (pinned client certificates) are skipped,
+  and so is a CA whose intermediate in the bundle has a CRL. An issuing
+  intermediate that is not in the bundle (sent by the clients) cannot be
+  seen: its CRL must be in the file too;
+- a listener that authenticates nobody (neither basic authentication nor a
+  required and verified client certificate) and has no `allowed_networks`,
   listening beyond the loopback interface, is a warning;
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times

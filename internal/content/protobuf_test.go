@@ -2,6 +2,7 @@ package content
 
 import (
 	"bytes"
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -234,5 +235,148 @@ func TestProtobufBucketFloodRefusedBeforeDecoding(t *testing.T) {
 	ok := append(protowire.AppendVarint(nil, uint64(len(msg))), msg...)
 	if _, err := ValidateFormat(ok, 24000, true); err != nil {
 		t.Errorf("100 buckets refused: %v", err)
+	}
+}
+
+// familyName reads the name like proto.Unmarshal would, last occurrence
+// included, so filtering keeps the same families as before.
+func TestFamilyNameMatchesUnmarshal(t *testing.T) {
+	one, _ := proto.Marshal(&dto.MetricFamily{Name: proto.String("first"), Type: dto.MetricType_GAUGE.Enum(),
+		Metric: []*dto.Metric{{Gauge: &dto.Gauge{Value: proto.Float64(1)}}}})
+	two, _ := proto.Marshal(&dto.MetricFamily{Name: proto.String("second")})
+	repeated := append(append([]byte{}, one...), two...) // name field twice: the last wins
+	for _, msg := range [][]byte{one, two, repeated, nil} {
+		var mf dto.MetricFamily
+		if err := proto.Unmarshal(msg, &mf); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := familyName(msg)
+		if !ok || got != mf.GetName() {
+			t.Errorf("familyName = %q, %v; proto.Unmarshal reads %q", got, ok, mf.GetName())
+		}
+	}
+	if _, ok := familyName([]byte{0x0a, 0x05, 'a'}); ok {
+		t.Error("truncated message accepted")
+	}
+}
+
+func BenchmarkFilterProtobuf(b *testing.B) {
+	var body []byte
+	for i := 0; i < 500; i++ {
+		msg, _ := proto.Marshal(&dto.MetricFamily{Name: proto.String(fmt.Sprintf("family_%d", i)), Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{{Label: []*dto.LabelPair{{Name: proto.String("l"), Value: proto.String("v")}},
+				Gauge: &dto.Gauge{Value: proto.Float64(1)}}}})
+		body = append(protowire.AppendVarint(body, uint64(len(msg))), msg...)
+	}
+	keep := func(name string) bool { return len(name)%2 == 0 }
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := filterProtobuf(body, keep); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// delimited encodes families in the delimited protobuf format.
+func delimited(t *testing.T, families ...*dto.MetricFamily) []byte {
+	t.Helper()
+	var body []byte
+	for _, mf := range families {
+		msg, err := proto.Marshal(mf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = append(protowire.AppendVarint(body, uint64(len(msg))), msg...)
+	}
+	return body
+}
+
+// Sub-messages that decode to far more than their wire size are refused
+// before decoding: empty spans, empty labels, too many labels per series.
+func TestProtobufInflationRefusedBeforeDecoding(t *testing.T) {
+	spans := make([]*dto.BucketSpan, 200000)
+	for i := range spans {
+		spans[i] = &dto.BucketSpan{}
+	}
+	native := &dto.MetricFamily{Name: proto.String("spans"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{Histogram: &dto.Histogram{Schema: proto.Int32(0), PositiveSpan: spans}}}}
+
+	manyLabels := make([]*dto.LabelPair, MaxLabelsPerLine+1)
+	for i := range manyLabels {
+		manyLabels[i] = &dto.LabelPair{Name: proto.String(fmt.Sprintf("l%d", i)), Value: proto.String("v")}
+	}
+	wide := &dto.MetricFamily{Name: proto.String("wide"), Type: dto.MetricType_GAUGE.Enum(),
+		Metric: []*dto.Metric{{Label: manyLabels, Gauge: &dto.Gauge{Value: proto.Float64(1)}}}}
+
+	// Many series of empty labels: under max_samples and under the labels
+	// per series, but far over the sub-messages the body size allows.
+	var series []*dto.Metric
+	for i := 0; i < 2000; i++ {
+		labels := make([]*dto.LabelPair, 200)
+		for j := range labels {
+			labels[j] = &dto.LabelPair{}
+		}
+		series = append(series, &dto.Metric{Label: labels, Gauge: &dto.Gauge{}})
+	}
+	emptyLabels := &dto.MetricFamily{Name: proto.String("empty"), Type: dto.MetricType_GAUGE.Enum(), Metric: series}
+
+	for name, tt := range map[string]struct {
+		mf   *dto.MetricFamily
+		want string
+	}{
+		"200k empty spans":                 {native, "too many labels, buckets or spans for the body size"},
+		"more than 256 labels in a series": {wide, "has more than 256 labels"},
+		"400k empty labels":                {emptyLabels, "too many labels, buckets or spans for the body size"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := delimited(t, tt.mf)
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			_, err := ValidateFormat(body, 24000, true)
+			runtime.ReadMemStats(&after)
+			if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want invalid %q", err, tt.want)
+			}
+			if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(4*len(body)) {
+				t.Errorf("allocated %d bytes for a %d byte body: decoded before refusing", alloc, len(body))
+			}
+		})
+	}
+}
+
+// The pre-scan never counts more than the decoded count: a series with a
+// summary and a native histogram counts as its histogram, like
+// familySamples, and real native histograms pass.
+func TestProtobufPrescanIsALowerBound(t *testing.T) {
+	quantiles := make([]*dto.Quantile, 50)
+	for i := range quantiles {
+		quantiles[i] = &dto.Quantile{Quantile: proto.Float64(float64(i) / 50), Value: proto.Float64(1)}
+	}
+	both := &dto.MetricFamily{Name: proto.String("both"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Summary:   &dto.Summary{SampleCount: proto.Uint64(1), SampleSum: proto.Float64(1), Quantile: quantiles},
+			Histogram: &dto.Histogram{Schema: proto.Int32(3), SampleCount: proto.Uint64(1), SampleSum: proto.Float64(1)},
+		}}}
+	real := &dto.MetricFamily{Name: proto.String("latency_seconds"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Label: []*dto.LabelPair{{Name: proto.String("job"), Value: proto.String("api")}},
+			Histogram: &dto.Histogram{Schema: proto.Int32(3), ZeroThreshold: proto.Float64(1e-128),
+				SampleCount: proto.Uint64(10), SampleSum: proto.Float64(2.5),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: proto.Int32(-4), Length: proto.Uint32(3)}, {Offset: proto.Int32(2), Length: proto.Uint32(2)}},
+				PositiveDelta: []int64{1, 2, -1, 3, 0}},
+		}}}
+	for name, mf := range map[string]*dto.MetricFamily{"summary and native histogram": both, "native histogram": real} {
+		t.Run(name, func(t *testing.T) {
+			body := delimited(t, mf)
+			sc := scanProtobuf(body, 1000)
+			res, err := ValidateFormat(body, 10, true)
+			if err != nil {
+				t.Fatalf("refused: %v (pre-scan %+v)", err, sc)
+			}
+			if sc.samples > res.Samples {
+				t.Errorf("pre-scan counted %d samples, decoding %d: not a lower bound", sc.samples, res.Samples)
+			}
+		})
 	}
 }

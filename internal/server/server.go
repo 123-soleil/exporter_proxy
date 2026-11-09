@@ -284,8 +284,12 @@ func checkCRLSpec(sp spec, wc *web.Config, logger *slog.Logger) string {
 	}
 	if lists, err := webconfig.ParseCRLs(data); err == nil {
 		if caPEM, err := webconfig.ClientCAPEM(wc); err == nil {
-			if missing, _ := webconfig.CRLMissing(caPEM, lists); len(missing) > 0 {
-				logger.Error("client_crl_file has no CRL from some client CAs: client certificates they issue will be refused",
+			switch missing, total := webconfig.CRLMissing(caPEM, lists); {
+			case total > 0 && len(missing) == total:
+				logger.Error("client_crl_file has no CRL signed by any client CA: every client certificate will be refused",
+					"listener", sp.name, "client_crl_file", sp.clientCRL, "client_cas", strings.Join(missing, "; "))
+			case len(missing) > 0:
+				logger.Warn("client_crl_file has no CRL signed by some client CAs: client certificates they issue directly will be refused",
 					"listener", sp.name, "client_crl_file", sp.clientCRL, "client_cas", strings.Join(missing, "; "))
 			}
 		}
@@ -887,7 +891,7 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 			s.logger.Warn("basic authentication without TLS: credentials travel in clear text",
 				"listener", sp.name, "web_config_file", sp.webConfig)
 		case wc.Unprotected() && sp.allowed == nil && !config.LoopbackListen(sp.listen):
-			s.logger.Warn("listener without TLS, authentication or allowed_networks: anyone reaching it can read the metrics",
+			s.logger.Warn("listener without authentication (basic auth or required client certificates) nor allowed_networks: anyone reaching it can read the metrics",
 				"listener", sp.name, "web_config_file", sp.webConfig)
 		}
 	}

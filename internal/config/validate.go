@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -316,15 +315,17 @@ func (v *validator) checkAuthorize(where string, a *fileAuthorize) {
 }
 
 func (v *validator) checkUpstream(where, raw string) {
+	// No '@' anywhere: credentials are refused, and a password containing
+	// '/', '?' or '#' would otherwise end the authority early and be read
+	// as a host, a port or a path (and quoted by errors and logs).
+	if strings.Contains(raw, "@") {
+		v.addf(where, "upstream must not contain '@': credentials are not allowed in it (write a literal '@' of a path as %%40)")
+		return
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		// A *url.Error quotes the whole URL, credentials included: report
-		// only the cause.
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			err = uerr.Err
-		}
-		v.addf(where, "upstream is not a valid URL: %v", err)
+		// Parse errors quote parts of the URL: say nothing about it.
+		v.addf(where, "upstream is not a valid URL")
 		return
 	}
 	switch {

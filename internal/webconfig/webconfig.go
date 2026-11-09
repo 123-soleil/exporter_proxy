@@ -123,6 +123,9 @@ type Summary struct {
 	CertPEM     string
 	ClientCAPEM string
 	HasUsers    bool
+	// ClientCertsRequired: TLS with a client_auth_type that requires and
+	// verifies a client certificate (RequireAndVerifyClientCert).
+	ClientCertsRequired bool
 	// ClientCertsVerified: TLS with a client_auth_type that verifies
 	// client certificates against the client CA.
 	ClientCertsVerified bool
@@ -134,37 +137,54 @@ type Summary struct {
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
 func (s Summary) BasicAuthWithoutTLS() bool { return s.HasUsers && !s.TLSEnabled }
 
-// Unprotected reports a web configuration with neither TLS nor basic
-// authentication: an empty file, for example, serves in plain HTTP to
-// anyone.
-func (s Summary) Unprotected() bool { return !s.HasUsers && !s.TLSEnabled }
+// Unprotected reports a web configuration that authenticates nobody:
+// neither basic authentication nor a required and verified client
+// certificate. An empty file serves in plain HTTP to anyone; TLS without
+// client certificates only encrypts.
+func (s Summary) Unprotected() bool { return !s.HasUsers && !s.ClientCertsRequired }
 
-// CRLMissing returns the subjects of the certificates of the client CA
-// bundle caPEM that no CRL of lists is signed by. At runtime the revocation
-// of a client certificate is checked against a CRL of each issuer of its
-// chain, and a missing one refuses the certificate.
+// CRLMissing returns the subjects of the CAs of the client CA bundle caPEM
+// that no CRL of lists is signed by, and the number of CAs in the bundle.
+// At runtime a client certificate is refused unless a CRL of each issuer of
+// its verified chain is in the file. Certificates that are not CAs (pinned
+// client certificates) are skipped, and so is a CA that issued another CA
+// of the bundle which has a CRL: chains end at that intermediate, a trust
+// anchor too, and do not need the CRL of the CA above it.
 func CRLMissing(caPEM []byte, lists []*x509.RevocationList) (missing []string, total int) {
+	var cas []*x509.Certificate
 	for block, rest := pem.Decode(caPEM); block != nil; block, rest = pem.Decode(rest) {
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		ca, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
+		if c, err := x509.ParseCertificate(block.Bytes); err == nil && c.IsCA {
+			cas = append(cas, c)
 		}
-		total++
-		covered := false
+	}
+	covered := make([]bool, len(cas))
+	for i, ca := range cas {
 		for _, l := range lists {
 			if bytes.Equal(l.RawIssuer, ca.RawSubject) && l.CheckSignatureFrom(ca) == nil {
-				covered = true
+				covered[i] = true
 				break
 			}
 		}
-		if !covered {
+	}
+	for i, ca := range cas {
+		if covered[i] {
+			continue
+		}
+		issuedCovered := false
+		for j, other := range cas {
+			if j != i && covered[j] && bytes.Equal(other.RawIssuer, ca.RawSubject) && other.CheckSignatureFrom(ca) == nil {
+				issuedCovered = true
+				break
+			}
+		}
+		if !issuedCovered {
 			missing = append(missing, ca.Subject.String())
 		}
 	}
-	return missing, total
+	return missing, len(cas)
 }
 
 // ClientCAPEM returns the client CA bundle of c: the client_ca_file
@@ -204,7 +224,13 @@ func Read(path string) (Summary, error) {
 		ClientCAPEM:         c.TLSConfig.ClientCAsText,
 		HasUsers:            len(c.Users) > 0,
 		ClientCertsVerified: c.TLSConfig.IsEnabled() && verifies(c.TLSConfig.ClientAuth),
+		ClientCertsRequired: c.TLSConfig.IsEnabled() && requiresVerified(c.TLSConfig.ClientAuth),
 	}, nil
+}
+
+func requiresVerified(clientAuth string) bool {
+	required, verified := ClientCertPolicy(clientAuth)
+	return required && verified
 }
 
 func verifies(clientAuth string) bool {

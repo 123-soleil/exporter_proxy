@@ -551,3 +551,33 @@ func TestExposure(t *testing.T) {
 		})
 	}
 }
+
+// TLS alone only encrypts: without required client certificates or basic
+// authentication, anyone can read the metrics.
+func TestExposureTLSPolicies(t *testing.T) {
+	dir := t.TempDir()
+	day := 24 * time.Hour
+	cert, key := writeCert(t, dir, "srv", now.Add(-day), now.Add(365*day))
+	ca, _ := writeCert(t, dir, "ca", now.Add(-day), now.Add(365*day))
+	tlsOnly := tlsWebConfig(t, dir, cert, key, "")
+	ifGiven := filepath.Join(dir, "ifgiven.yml")
+	writeFile(t, ifGiven, fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_ca_file: %s\n  client_auth_type: VerifyClientCertIfGiven\n", cert, key, ca))
+	mtls := tlsWebConfig(t, dir, cert, key, ca)
+
+	for name, tt := range map[string]struct {
+		web  string
+		warn bool
+	}{
+		"TLS without client certificates": {tlsOnly, true},
+		"client certificate optional":     {ifGiven, true},
+		"client certificate required":     {mtls, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &checker{}
+			c.exposure("listener", tt.web, ":9100", false)
+			if got := len(c.findings) == 1; got != tt.warn {
+				t.Errorf("warning = %v (%+v), want %v", got, c.findings, tt.warn)
+			}
+		})
+	}
+}

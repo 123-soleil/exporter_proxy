@@ -94,7 +94,8 @@ func (c *checker) add(sev Severity, where, format string, args ...any) {
 }
 
 // exposure warns about a listener that anyone able to reach it can read:
-// no TLS, no basic authentication, no allowed_networks, not loopback only.
+// no basic authentication, no required client certificate, no
+// allowed_networks, not loopback only.
 func (c *checker) exposure(where, webConfig, listen string, restricted bool) {
 	wc, err := webconfig.Read(webConfig)
 	// An empty listen only occurs in configurations built by tests: a
@@ -102,8 +103,9 @@ func (c *checker) exposure(where, webConfig, listen string, restricted bool) {
 	if err != nil || !wc.Unprotected() || restricted || listen == "" || config.LoopbackListen(listen) {
 		return
 	}
-	c.add(Warning, where, "web_config_file %s has neither TLS nor basic_auth_users and allowed_networks is not set: "+
-		"anyone reaching %s can read the metrics", webConfig, listen)
+	c.add(Warning, where, "web_config_file %s requires neither basic authentication nor verified client certificates "+
+		"(client_auth_type RequireAndVerifyClientCert) and allowed_networks is not set: anyone reaching %s can read the metrics",
+		webConfig, listen)
 }
 
 // sandboxed lists the directories the systemd unit hides from the service:
