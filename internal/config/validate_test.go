@@ -38,6 +38,8 @@ func TestValidateAcceptsValidConfigs(t *testing.T) {
 		yaml string
 	}{
 		{"http upstream", withRoutes(okRoute)},
+		{"tls_cache_ttl 0 disables the cache", withRoutes(okRoute) + "tls_cache_ttl: 0s\n"},
+		{"tls_cache_ttl at its maximum", withRoutes(okRoute) + "tls_cache_ttl: 6h\n"},
 		{"@ in the upstream path", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/probe/a@b/metrics\n")},
 		{"@ in the upstream query", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/metrics?target=user@host\n")},
 		{"upstream with query", withRoutes("      - path: /m\n        upstream: http://127.0.0.1:9187/metrics?collect=x\n")},
@@ -231,6 +233,16 @@ func TestValidateRejects(t *testing.T) {
 			name:    "upstream without host",
 			yaml:    withRoutes("      - path: /m\n        upstream: http:///metrics\n"),
 			wantErr: "upstream must have a host",
+		},
+		{
+			name:    "tls_cache_ttl above 6h",
+			yaml:    withRoutes(okRoute) + "tls_cache_ttl: 7h\n",
+			wantErr: "tls_cache_ttl: must be between 0 (no cache) and 6h0m0s",
+		},
+		{
+			name:    "negative tls_cache_ttl",
+			yaml:    withRoutes(okRoute) + "tls_cache_ttl: -1s\n",
+			wantErr: "tls_cache_ttl: must be between 0",
 		},
 		{
 			name:    "malformed upstream with credentials",

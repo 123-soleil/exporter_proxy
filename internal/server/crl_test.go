@@ -279,3 +279,37 @@ func TestClientCRLUnsupportedExtensions(t *testing.T) {
 		t.Errorf("non-critical extension: %v", err)
 	}
 }
+
+// With tls_cache_ttl, a CRL published while running applies when the cache
+// expires or at the next reload, which reads the files again.
+func TestClientCRLCachedUntilReload(t *testing.T) {
+	pki := newCRLPKI(t)
+	goodSerial, good := pki.client("good")
+	crlPath := filepath.Join(pki.dir, "clients.crl")
+	pki.crl(crlPath, time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+	s, _, m := crlServer(t, pki, crlPath)
+	s.tlsTTL.Store(int64(time.Hour))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if code, err := status(good, m.url()); err == nil && code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client refused before any revocation")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Revoked in the file, but the cached CRL is still the previous one.
+	pki.crl(crlPath, time.Now().Add(-time.Minute), time.Now().Add(time.Hour), goodSerial)
+	if code, err := status(good, m.url()); err != nil || code != http.StatusOK {
+		t.Fatalf("within tls_cache_ttl: code %d err %v, want the cached CRL to apply (200)", code, err)
+	}
+
+	// A reload reads the files again: the revocation applies at once.
+	m.reload(t)
+	if code, err := status(good, m.url()); err == nil {
+		t.Errorf("revoked client answered %d after a reload", code)
+	}
+}

@@ -16,6 +16,13 @@ metrics:
   # endpoint. Required.
   web_config_file: /etc/exporter_proxy/web-mtls.yml
 
+# Optional. How long the TLS files of the listeners (certificate, key,
+# client CA, client_crl_file) are kept in memory before being read again for
+# new connections. 0 reads them for every connection; at most 6h. A reload
+# (systemctl reload exporter_proxy) empties the cache: do one after
+# publishing a CRL that must apply at once. Default: 5m.
+# tls_cache_ttl: 5m
+
 # Optional. Limits applied to every route (and to every listener for
 # max_concurrent_requests); each one can be overridden on a route or
 # listener. The values below are the built-in defaults.

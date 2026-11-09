@@ -29,6 +29,12 @@ const (
 	DefaultMaxSamples                  = 24000   // node_exporter: a few thousand samples
 	DefaultMaxConcurrentRequests       = 2
 
+	// DefaultTLSCacheTTL is how long the TLS settings of a listener
+	// (certificate, key, client CA, client_crl_file) are kept before being
+	// read again; MaxTLSCacheTTL bounds it.
+	DefaultTLSCacheTTL = 5 * time.Minute
+	MaxTLSCacheTTL     = 6 * time.Hour
+
 	// MaxMaxBodyBytes bounds max_body_bytes: the whole body is held in
 	// memory, and larger values would overflow size computations.
 	MaxMaxBodyBytes int64 = 1 << 30 // 1 GiB
@@ -38,6 +44,10 @@ const (
 type Config struct {
 	Metrics   MetricsEndpoint
 	Listeners []Listener
+
+	// TLSCacheTTL is how long the TLS settings read for new connections
+	// are reused; 0 reads them for every connection.
+	TLSCacheTTL time.Duration
 
 	// Hash identifies the configuration file content: the first 48 bits of
 	// the SHA-256 of the raw bytes. 48 bits fit exactly in a float64, so the
@@ -191,9 +201,10 @@ type Limits struct {
 // unset value (inherit) from an explicit one.
 
 type fileConfig struct {
-	Metrics   fileMetrics    `yaml:"metrics"`
-	Defaults  fileDefaults   `yaml:"defaults"`
-	Listeners []fileListener `yaml:"listeners"`
+	Metrics     fileMetrics    `yaml:"metrics"`
+	Defaults    fileDefaults   `yaml:"defaults"`
+	Listeners   []fileListener `yaml:"listeners"`
+	TLSCacheTTL *time.Duration `yaml:"tls_cache_ttl"`
 }
 
 type fileMetrics struct {
@@ -322,6 +333,7 @@ func resolve(fc *fileConfig) *Config {
 		sd = &ServiceDiscovery{Host: f.Host, Labels: f.Labels}
 	}
 	cfg := &Config{
+		TLSCacheTTL: valueOr(fc.TLSCacheTTL, DefaultTLSCacheTTL),
 		Metrics: MetricsEndpoint{
 			Listen:           fc.Metrics.Listen,
 			WebConfigFile:    fc.Metrics.WebConfigFile,

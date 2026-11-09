@@ -47,6 +47,10 @@ func validate(fc *fileConfig) error {
 
 	listens := map[string]string{} // listen address -> where it is used
 
+	if t := fc.TLSCacheTTL; t != nil && (*t < 0 || *t > MaxTLSCacheTTL) {
+		v.addf("tls_cache_ttl", "must be between 0 (no cache) and %s", MaxTLSCacheTTL)
+	}
+
 	// metrics section: mandatory.
 	v.checkListen("metrics", fc.Metrics.Listen, listens)
 	v.checkWebConfigFile("metrics", fc.Metrics.WebConfigFile)

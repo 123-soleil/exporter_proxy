@@ -79,6 +79,10 @@ type Server struct {
 
 	serving  sync.WaitGroup // web.Serve goroutines
 	draining sync.WaitGroup // listeners stopped by a reload
+
+	// tlsTTL is tls_cache_ttl, in nanoseconds, shared by the TLS caches
+	// of the listeners.
+	tlsTTL atomic.Int64
 }
 
 type listener struct {
@@ -103,6 +107,9 @@ type listener struct {
 	// crl is the client_crl_file path ("" for none), read on every
 	// handshake and request. A reload keeping the listener replaces it.
 	crl atomic.Pointer[string]
+	// tlsCache keeps the TLS settings and CRLs read for new connections
+	// and requests for tls_cache_ttl.
+	tlsCache *tlsCache
 }
 
 // listenerSettings are the parts of a web configuration that apply when a
@@ -305,7 +312,7 @@ func (l *listener) revoked(cs *tls.ConnectionState) error {
 	if path == "" || cs == nil || len(cs.VerifiedChains) == 0 {
 		return nil
 	}
-	set, err := loadCRL(path, time.Now())
+	set, err := l.tlsCache.crlSet(path, func() (*crlSet, error) { return loadCRL(path, time.Now()) })
 	if err != nil {
 		return err
 	}
@@ -541,6 +548,7 @@ func Start(cfg *config.Config, opts Options) (*Server, error) {
 		listeners: map[string]*listener{},
 		successes: map[string]*successCache{},
 	}
+	s.tlsTTL.Store(int64(cfg.TLSCacheTTL))
 
 	specs, err := s.prepare(cfg)
 	if err != nil {
@@ -774,6 +782,12 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 	s.listeners = next
 	s.pruneSuccesses()
+	// A reload applies the TLS files as they are now: certificates renewed
+	// or CRLs published since the last read take effect at once.
+	s.tlsTTL.Store(int64(cfg.TLSCacheTTL))
+	for _, l := range s.listeners {
+		l.tlsCache.flush()
+	}
 	return nil
 }
 
@@ -972,6 +986,7 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 		accept: &handoffListener{Listener: ln}, fresh: fresh, served: make(chan struct{})}
 	l.allowed.Store(&sp.allowed)
 	l.crl.Store(&sp.clientCRL)
+	l.tlsCache = newTLSCache(&s.tlsTTL)
 	auth.allows = func(remote string) bool { return l.allowsRemote(remote) }
 	auth.revoked = l.revoked
 	logger := s.logger.With("listener", sp.name)
@@ -1030,19 +1045,31 @@ func (s *Server) newListener(sp spec, ln net.Listener) (*listener, error) {
 	// Certificates, key and client CA are re-read on every new connection,
 	// like exporter-toolkit: renewed files apply without restart.
 	tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		crl := *l.crl.Load()
+		if cfg := l.tlsCache.config(crl); cfg != nil {
+			return cfg, nil
+		}
 		gen := health.generation()
 		// The client CA is checked on the pool built from a single read of
-		// it (tlsConfigFor), not read twice.
+		// it (tlsConfigWithCRL), not read twice.
 		c, err := webconfig.LoadForRequest(webConfig)
 		if err != nil {
 			return nil, fail(err)
 		}
-		cfg, err := l.tlsConfigFor(c)
+		cfg, err := l.tlsConfigWithCRL(c, crl)
 		if err != nil {
 			return nil, fail(err)
 		}
 		health.succeededSince(gen)
 		cfg.NextProtos = nextProtos
+		var set *crlSet
+		if crl != "" {
+			// Parsed already by tlsConfigWithCRL: from the content cache.
+			if set, err = loadCRL(crl, time.Now()); err != nil {
+				return cfg, nil // not cached: read again next time
+			}
+		}
+		l.tlsCache.storeConfig(cfg, crl, set)
 		return cfg, nil
 	}
 	srv.TLSConfig = tlsCfg

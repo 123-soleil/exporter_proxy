@@ -564,10 +564,12 @@ listeners:
     client_crl_file: /etc/exporter_proxy/tls/clients.crl   # PEM or DER, several CRLs allowed
 ```
 
-- The file is read on every new connection and every request (parsed only
-  when it changes): publishing a new CRL applies without reload, and a
-  certificate revoked while its connection is open gets `403` at its next
-  request, the connection being closed.
+- The file is read on new connections and requests once the TLS cache has
+  expired (`tls_cache_ttl`, 5 minutes by default; parsed only when it
+  changes): publishing a new CRL applies without reload within
+  `tls_cache_ttl`, or at once with a reload, and a certificate revoked
+  while its connection is open gets `403` at its next request, the
+  connection being closed.
 - Checked on every handshake, TLS 1.3 session resumption included. A
   revoked certificate fails the handshake (`tls_handshake`); on an open
   connection, the refusal is counted as `certificate_revoked`.
@@ -886,6 +888,7 @@ Each limit is resolved in this order, the first one set wins:
 | `max_samples`             | defaults, route  | `24000`          | Responses with more samples are rejected (`too_many_samples`). |
 | `max_concurrent_requests` | defaults, listener | `2`            | Extra requests get `503`. |
 | `max_age`                 | route (`file`)   | none, required   | Older files are rejected (`stale`). |
+| `tls_cache_ttl`           | top level        | `5m`             | How long TLS files and CRLs are kept (see "TLS cache"); `0` disables the cache, at most `6h`. |
 
 Other built-in defaults:
 
@@ -1403,10 +1406,35 @@ while running, like exporter-toolkit does:
   hashes and headers are checked like at startup (a malformed hash, or a
   header or value outside exporter-toolkit's list, makes the file invalid,
   so requests get `518`);
-- TLS settings (certificate, key, client CA content) on every new
-  connection, so a renewed certificate or CA is picked up without restart.
-  Connections already open are not checked again: to cut off clients after
-  replacing a client CA, reload (the listener restarts and closes them).
+- TLS settings (certificate, key, client CA content) when a new connection
+  arrives and the TLS cache has expired (`tls_cache_ttl`, see below), so a
+  renewed certificate or CA is picked up without restart, at the latest
+  `tls_cache_ttl` later, or at once with a reload. Connections already
+  open are not checked again: to cut off clients after replacing a client
+  CA, reload (the listener restarts and closes them).
+
+### TLS cache (`tls_cache_ttl`)
+
+Reading and parsing the certificate, key, client CA and `client_crl_file`
+of a listener for every new connection and every request costs CPU and
+disk reads, before the client is even authenticated. They are kept in
+memory for `tls_cache_ttl`, a top-level key of the main configuration:
+
+```yaml
+tls_cache_ttl: 5m   # default; 0 reads them for every connection; at most 6h
+```
+
+- An entry never outlives the server certificate's validity nor the next
+  update of a CRL: the cache never serves an expired certificate nor a
+  stale CRL, which still refuse clients (fail closed).
+- Failures are not cached: the next connection reads the files again.
+- A reload (`SIGHUP`) empties the cache: a renewed certificate, a new
+  client CA or a newly published CRL apply at once. Without reload, they
+  apply within `tls_cache_ttl`: **a certificate revoked in the CRL is
+  still accepted for up to `tls_cache_ttl`**. Reload after publishing a
+  CRL that revokes a certificate in a hurry, or lower `tls_cache_ttl`.
+- Basic authentication users and HTTP headers are not cached: they are
+  read on every request.
 
 Whether a listener uses TLS at all, HTTP/2 (`http_server_config.http2`),
 `rate_limit`, whether it requires basic authentication and its client

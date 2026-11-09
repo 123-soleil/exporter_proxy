@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- TLS cache: the certificate, key, client CA and `client_crl_file` of a
+  listener, read for every new connection and request, are kept for
+  `tls_cache_ttl` (top level, default 5 minutes, `0` to disable, at most
+  6 hours), never past the server certificate's validity nor a CRL's next
+  update. A reload empties it. A certificate revoked in the CRL is
+  accepted for up to `tls_cache_ttl` unless the service is reloaded.
 - Startup, reload and `--check` warning for a listener that authenticates
   nobody (neither basic authentication nor a required and verified client
   certificate) and has no `allowed_networks`, listening beyond loopback: a

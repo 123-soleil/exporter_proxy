@@ -2,8 +2,10 @@
 # (mTLS). Install as /etc/exporter_proxy/web-mtls.yml, owner
 # root:exporter_proxy, mode 0640.
 #
-# Re-read on every new connection: renewed certificates are used without
-# restart. Replace files atomically (temporary file + rename).
+# Re-read for new connections once the TLS cache expires (tls_cache_ttl in
+# config.yml, 5 minutes by default) or at a reload: renewed certificates
+# are used without restart. Replace files atomically (temporary file +
+# rename).
 # Reference: https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md
 
 tls_server_config:

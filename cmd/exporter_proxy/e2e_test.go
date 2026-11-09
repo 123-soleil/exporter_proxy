@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -127,6 +128,12 @@ const e2ePassword = "e2e-s3cret"
 
 func startE2E(t *testing.T) *e2e {
 	t.Helper()
+	return startE2EWith(t, "")
+}
+
+// startE2EWith is startE2E with extra top-level configuration keys.
+func startE2EWith(t *testing.T, extra string) *e2e {
+	t.Helper()
 	dir := t.TempDir()
 	ca := newCA(t, "test-ca")
 	e := &e2e{dir: dir, ca: ca, upstreamReq: make(chan *http.Request, 16)}
@@ -187,9 +194,9 @@ listeners:
     routes:
       - path: /metrics
         upstream: %s/metrics
-`, metricsPort, filepath.Join(dir, "web-mtls.yml"),
+%s`, metricsPort, filepath.Join(dir, "web-mtls.yml"),
 		mtlsPort, filepath.Join(dir, "web-mtls.yml"), up.URL,
-		basicPort, filepath.Join(dir, "web-basic.yml"), up.URL)))
+		basicPort, filepath.Join(dir, "web-basic.yml"), up.URL, extra)))
 
 	e.mtlsURL = fmt.Sprintf("https://127.0.0.1:%d/metrics", mtlsPort)
 	e.basicURL = fmt.Sprintf("https://127.0.0.1:%d/metrics", basicPort)
@@ -395,31 +402,60 @@ func TestE2EMetricsEndpointUsesItsWebConfig(t *testing.T) {
 
 // A renewed server certificate is used for new connections, without reload
 // or restart.
-func TestE2ECertificateRotation(t *testing.T) {
-	e := startE2E(t)
-
-	serial := func() *big.Int {
-		t.Helper()
-		roots := x509.NewCertPool()
-		roots.AddCert(e.ca.cert)
-		conn, err := tls.Dial("tcp", strings.TrimSuffix(strings.TrimPrefix(e.mtlsURL, "https://"), "/metrics"),
-			&tls.Config{RootCAs: roots, Certificates: []tls.Certificate{e.clientCert}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = conn.Close() }()
-		return conn.ConnectionState().PeerCertificates[0].SerialNumber
+// serverSerial returns the serial number of the server certificate served
+// to a new mTLS connection.
+func (e *e2e) serverSerial(t *testing.T) *big.Int {
+	t.Helper()
+	roots := x509.NewCertPool()
+	roots.AddCert(e.ca.cert)
+	conn, err := tls.Dial("tcp", strings.TrimSuffix(strings.TrimPrefix(e.mtlsURL, "https://"), "/metrics"),
+		&tls.Config{RootCAs: roots, Certificates: []tls.Certificate{e.clientCert}})
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer func() { _ = conn.Close() }()
+	return conn.ConnectionState().PeerCertificates[0].SerialNumber
+}
 
-	before := serial()
+// renewServerCert replaces the server certificate and key files.
+func (e *e2e) renewServerCert(t *testing.T) {
+	t.Helper()
 	certPEM, keyPEM := e.ca.issue(t, "server-renewed", x509.ExtKeyUsageServerAuth, time.Now().Add(48*time.Hour))
 	// Between the two writes a new connection would see a mismatched pair
 	// and fail; no connection is made here until both files are written.
 	mustWrite(t, e.serverKey, keyPEM)
 	mustWrite(t, e.serverCert, certPEM)
+}
 
-	if after := serial(); after.Cmp(before) == 0 {
+// Without TLS cache, a renewed server certificate is used for the next
+// connection, without reload or restart.
+func TestE2ECertificateRotation(t *testing.T) {
+	e := startE2EWith(t, "tls_cache_ttl: 0s\n")
+	before := e.serverSerial(t)
+	e.renewServerCert(t)
+	if after := e.serverSerial(t); after.Cmp(before) == 0 {
 		t.Errorf("server certificate not renewed for new connections (serial %v)", after)
+	}
+}
+
+// With the TLS cache (default 5 minutes), the TLS files are not read again
+// before it expires; a reload (SIGHUP) applies them at once.
+func TestE2ECertificateRotationCached(t *testing.T) {
+	e := startE2E(t)
+	before := e.serverSerial(t)
+	e.renewServerCert(t)
+	if after := e.serverSerial(t); after.Cmp(before) != 0 {
+		t.Fatalf("renewed certificate served before the cache expired or a reload (serial %v)", after)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for e.serverSerial(t).Cmp(before) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("renewed certificate not served after a reload")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

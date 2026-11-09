@@ -100,6 +100,7 @@ func TestParseResolvesDefaultsAndOverrides(t *testing.T) {
 		t.Error("Hash not computed")
 	}
 	want.Hash = cfg.Hash
+	want.TLSCacheTTL = DefaultTLSCacheTTL
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("resolved config mismatch\n got: %+v\nwant: %+v", cfg, want)
 	}
