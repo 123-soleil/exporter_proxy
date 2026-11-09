@@ -380,3 +380,52 @@ func TestProtobufPrescanIsALowerBound(t *testing.T) {
 		})
 	}
 }
+
+// Exemplar labels and the series themselves count too: empty ones inflate
+// decoding as much as empty metric labels.
+func TestProtobufExemplarAndSeriesInflation(t *testing.T) {
+	emptyLabels := func(n int) []*dto.LabelPair {
+		l := make([]*dto.LabelPair, n)
+		for i := range l {
+			l[i] = &dto.LabelPair{}
+		}
+		return l
+	}
+	const n = 300000
+	counter := &dto.MetricFamily{Name: proto.String("c"), Type: dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: proto.Float64(1), Exemplar: &dto.Exemplar{Label: emptyLabels(n)}}}}}
+	bucket := &dto.MetricFamily{Name: proto.String("b"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{Histogram: &dto.Histogram{Bucket: []*dto.Bucket{{Exemplar: &dto.Exemplar{Label: emptyLabels(n)}}}}}}}
+	native := &dto.MetricFamily{Name: proto.String("n"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{Histogram: &dto.Histogram{Schema: proto.Int32(0), Exemplars: []*dto.Exemplar{{Label: emptyLabels(n)}}}}}}
+	var series []*dto.Metric
+	for i := 0; i < n; i++ {
+		series = append(series, &dto.Metric{Gauge: &dto.Gauge{}})
+	}
+	emptySeries := &dto.MetricFamily{Name: proto.String("s"), Type: dto.MetricType_GAUGE.Enum(), Metric: series}
+
+	for name, tt := range map[string]struct {
+		mf         *dto.MetricFamily
+		maxSamples int
+	}{
+		"counter exemplar labels":          {counter, 24000},
+		"bucket exemplar labels":           {bucket, 24000},
+		"histogram exemplar labels":        {native, 24000},
+		"empty series, max_samples raised": {emptySeries, 1 << 30},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := delimited(t, tt.mf)
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			_, err := ValidateFormat(body, tt.maxSamples, true)
+			runtime.ReadMemStats(&after)
+			if source.ReasonOf(err) != source.ReasonInvalid || !strings.Contains(err.Error(), "for the body size") {
+				t.Fatalf("err = %v, want invalid: too many sub-messages for the body size", err)
+			}
+			if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(4*len(body)) {
+				t.Errorf("allocated %d bytes for a %d byte body: decoded before refusing", alloc, len(body))
+			}
+		})
+	}
+}

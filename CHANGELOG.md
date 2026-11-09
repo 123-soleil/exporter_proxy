@@ -16,9 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended up in the validation error logged at startup, reload and `--check`.
 - Protobuf bodies are checked before decoding for what decoding inflates:
   samples counted with classic buckets and quantiles, at most 256 labels
-  per series (like text lines), and at most one label, bucket, quantile,
-  span or exemplar per 6 bytes of body (+ 65536). Bodies of empty buckets,
-  spans or labels made decoding allocate 55 to 83 times their size.
+  per series (like text lines), and at most one series, label, bucket,
+  quantile, span, exemplar or exemplar label per 6 bytes of body
+  (+ 65536). Bodies of empty buckets, spans, series or labels, exemplar
+  labels included, made decoding allocate 50 to 83 times their size.
 
 ### Changed
 
@@ -35,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encrypts.
 - `--check` reports a `client_crl_file` with no CRL signed by the client
   CAs (a problem when no CA has one: every client certificate would be
-  refused; a warning when some do not), also logged at startup and reload, and `file` or `unix_socket` paths hidden from the service by
+  refused; a warning when some do not), also logged at startup and reload,
+  and `file` or `unix_socket` paths hidden from the service by
   the systemd unit (`PrivateTmp=`, `ProtectHome=`).
 
 ### Fixed

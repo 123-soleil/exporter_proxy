@@ -413,26 +413,26 @@ page) from being exposed through the proxy.
   `max_samples` are refused (`too_many_samples`), and so are lines or
   series with more than 256 labels, text bodies whose lines hold many tiny
   labels (the sum over lines of labels² above 8 × the body size + 65536)
-  and protobuf bodies with more labels, buckets, quantiles, spans and
-  exemplars than one per 6 bytes of body + 65536 (`invalid`; real ones take
-  more than 6 bytes each, empty ones made to inflate decoding take 2): the text parser's cost grows with the square of a line's
-  labels, and one line with thousands of them would take minutes of CPU
-  while holding the listener's slots. Real exporters, which spend tens of
-  bytes per label, stay far below. Upstream answers may carry at most
-  64 KiB of headers. Peak memory is
-  therefore bounded by roughly `11 × max_body_bytes ×` the sum of
-  `max_concurrent_requests` over all listeners for typical content (with
-  the defaults, 2 MiB and 2 requests, about 45 MiB for one listener), and
-  about five times that against a hostile source: size `MemoryMax=` for
-  the sources you do not trust. Routes with `cache_ttl` add up to two
-  kept answers each (text and protobuf, with their gzip copies), and
-  answers served from the cache take no slot: an answer replaced in the
-  cache stays in memory while slow clients are still reading it (at most
-  the write time above). The
-  defaults fit common exporters; raise
-  `max_body_bytes` (and `max_concurrent_requests`) only on the routes or
-  listeners that need it (see `exporter_proxy_response_size_bytes`), and
-  size `MemoryMax=` in the systemd unit accordingly.
+  and protobuf bodies with more series, labels, buckets, quantiles, spans,
+  exemplars and exemplar labels than one per 6 bytes of body + 65536
+  (`invalid`; real ones take more than 6 bytes each, empty ones made to
+  inflate decoding take 2): the text parser's cost grows with the square
+  of a line's labels, and one line with thousands of them would take
+  minutes of CPU while holding the listener's slots. Real exporters, which
+  spend tens of bytes per label, stay far below. Upstream answers may
+  carry at most 64 KiB of headers. Peak memory is therefore bounded by
+  roughly `11 × max_body_bytes ×` the sum of `max_concurrent_requests`
+  over all listeners for typical content (with the defaults, 2 MiB and 2
+  requests, about 45 MiB for one listener), and about five times that
+  against a hostile source: size `MemoryMax=` for the sources you do not
+  trust. Routes with `cache_ttl` add up to two kept answers each (text and
+  protobuf, with their gzip copies), and answers served from the cache
+  take no slot: an answer replaced in the cache stays in memory while slow
+  clients are still reading it (at most the write time above). The
+  defaults fit common exporters; raise `max_body_bytes` (and
+  `max_concurrent_requests`) only on the routes or listeners that need it
+  (see `exporter_proxy_response_size_bytes`), and size `MemoryMax=` in the
+  systemd unit accordingly.
 - Parse cost is exposed as `exporter_proxy_parse_duration_seconds`.
   Reference measurements on synthetic node_exporter-like data (single
   parse on a laptop, Intel Core 7 150U, `go test -bench=Validate -benchmem
@@ -1295,9 +1295,12 @@ otherwise; warnings do not fail the check:
   runtime, so it is a problem when no CA has one (logged at `error` level
   at startup and reload), a warning when some do not (`warn`). Bundle
   certificates that are not CAs (pinned client certificates) are skipped,
-  and so is a CA whose intermediate in the bundle has a CRL. An issuing
-  intermediate that is not in the bundle (sent by the clients) cannot be
-  seen: its CRL must be in the file too;
+  and so is a CA whose intermediate in the bundle has a CRL. Three cases
+  cannot be seen and need care: an issuing intermediate that is not in the
+  bundle (sent by the clients) needs its CRL in the file too; a CA that
+  issues both an intermediate of the bundle and client certificates
+  directly needs its own CRL for the latter; an old root without the CA
+  flag is taken for a pinned client certificate;
 - a listener that authenticates nobody (neither basic authentication nor a
   required and verified client certificate) and has no `allowed_networks`,
   listening beyond the loopback interface, is a warning;

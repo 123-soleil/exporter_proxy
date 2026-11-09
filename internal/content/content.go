@@ -244,13 +244,16 @@ type protobufScan struct {
 
 // Field numbers of client_model's messages.
 const (
-	labelField     = 1  // Metric.label
-	summaryField   = 4  // Metric.summary
-	histogramField = 7  // Metric.histogram
-	entriesField   = 3  // Summary.quantile, Histogram.bucket
-	negSpanField   = 9  // Histogram.negative_span
-	posSpanField   = 12 // Histogram.positive_span
-	exemplarsField = 16 // Histogram.exemplars
+	labelField      = 1  // Metric.label, Exemplar.label
+	counterField    = 3  // Metric.counter
+	summaryField    = 4  // Metric.summary
+	histogramField  = 7  // Metric.histogram
+	entriesField    = 3  // Summary.quantile, Histogram.bucket
+	counterExemplar = 2  // Counter.exemplar
+	bucketExemplar  = 3  // Bucket.exemplar
+	negSpanField    = 9  // Histogram.negative_span
+	posSpanField    = 12 // Histogram.positive_span
+	exemplarsField  = 16 // Histogram.exemplars
 )
 
 // scanProtobuf walks the wire format of a delimited protobuf body without
@@ -296,15 +299,23 @@ type metricScan struct{ samples, entries, labels int }
 
 // scanMetric counts the samples of one encoded Metric like familySamples
 // (a lower bound: a histogram's classic buckets or a summary's quantiles,
-// at least one) and its sub-messages.
+// at least one) and its sub-messages: the series itself, its labels,
+// buckets, quantiles, spans, and exemplars with their labels.
 func scanMetric(metric []byte) (metricScan, bool) {
-	var m metricScan
+	m := metricScan{entries: 1}
 	hasHistogram, buckets, quantiles := false, 0, 0
 	ok := eachField(metric, func(num protowire.Number, v []byte) bool {
 		switch num {
 		case labelField:
 			m.labels++
 			m.entries++
+		case counterField:
+			return eachField(v, func(f protowire.Number, e []byte) bool {
+				if f == counterExemplar {
+					return m.exemplar(e)
+				}
+				return true
+			})
 		case summaryField:
 			return eachField(v, func(f protowire.Number, _ []byte) bool {
 				if f == entriesField {
@@ -315,13 +326,21 @@ func scanMetric(metric []byte) (metricScan, bool) {
 			})
 		case histogramField:
 			hasHistogram = true
-			return eachField(v, func(f protowire.Number, _ []byte) bool {
+			return eachField(v, func(f protowire.Number, sub []byte) bool {
 				switch f {
 				case entriesField:
 					buckets++
 					m.entries++
-				case negSpanField, posSpanField, exemplarsField:
+					return eachField(sub, func(bf protowire.Number, e []byte) bool {
+						if bf == bucketExemplar {
+							return m.exemplar(e)
+						}
+						return true
+					})
+				case negSpanField, posSpanField:
 					m.entries++
+				case exemplarsField:
+					return m.exemplar(sub)
 				}
 				return true
 			})
@@ -334,6 +353,17 @@ func scanMetric(metric []byte) (metricScan, bool) {
 		m.samples = max(1, quantiles)
 	}
 	return m, ok
+}
+
+// exemplar counts an encoded Exemplar and its labels as entries.
+func (m *metricScan) exemplar(e []byte) bool {
+	m.entries++
+	return eachField(e, func(f protowire.Number, _ []byte) bool {
+		if f == labelField {
+			m.entries++
+		}
+		return true
+	})
 }
 
 // eachField calls fn with the number and content of every length-delimited
