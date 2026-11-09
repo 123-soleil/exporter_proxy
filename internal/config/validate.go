@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -317,6 +318,12 @@ func (v *validator) checkAuthorize(where string, a *fileAuthorize) {
 func (v *validator) checkUpstream(where, raw string) {
 	u, err := url.Parse(raw)
 	if err != nil {
+		// A *url.Error quotes the whole URL, credentials included: report
+		// only the cause.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
 		v.addf(where, "upstream is not a valid URL: %v", err)
 		return
 	}
@@ -339,6 +346,24 @@ const MetricsListenerName = "metrics"
 
 // systemdPrefix marks a listen value taken from systemd socket activation.
 const systemdPrefix = "systemd:"
+
+// LoopbackListen reports a "host:port" listen value bound to a loopback
+// address only (127.0.0.0/8, ::1 or localhost): reachable from this host
+// only. An empty host, a wildcard or a systemd socket is not.
+func LoopbackListen(listen string) bool {
+	if _, ok := SystemdSocketName(listen); ok {
+		return false
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
+}
 
 // SystemdSocketName returns the socket name of a "systemd:<name>" listen
 // value: the FileDescriptorName= of the socket unit.

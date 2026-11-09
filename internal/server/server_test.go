@@ -2041,3 +2041,30 @@ func TestReloadRestartServesEveryRequest(t *testing.T) {
 		t.Errorf("%d of %d requests failed during reloads, first: %v", n, sent.Load(), firstErr.Load())
 	}
 }
+
+// A listener with neither TLS nor authentication, reachable beyond this
+// host, is reported at startup: an empty web configuration file serves the
+// exporters to anyone.
+func TestStartWarnsOnUnprotectedListener(t *testing.T) {
+	dir := t.TempDir()
+	empty := writeWeb(t, dir, "empty.yml", "")
+	tests := []struct {
+		name   string
+		listen string
+		warn   bool
+	}{
+		{"all interfaces", ":0", true},
+		{"loopback only", "127.0.0.1:0", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := listenerConfig("open", empty, "http://127.0.0.1:1")
+			l.Listen = tt.listen
+			var logs syncBuffer
+			startServer(t, &config.Config{Listeners: []config.Listener{l}}, &logs)
+			if got := strings.Contains(logs.String(), "anyone reaching it can read the metrics"); got != tt.warn {
+				t.Errorf("warning logged = %v, want %v: %s", got, tt.warn, logs.String())
+			}
+		})
+	}
+}

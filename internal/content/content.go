@@ -222,8 +222,9 @@ func labelCount(line []byte) int {
 // metricField is the field number of MetricFamily.metric.
 const metricField = 4
 
-// protobufSeries counts the series (MetricFamily.metric entries) of a
-// delimited protobuf body by walking the wire format, without decoding.
+// protobufSeries counts a lower bound of the samples of a delimited
+// protobuf body (one per series, or its buckets or quantiles when more) by
+// walking the wire format, without decoding.
 // It stops counting past limit; bad is the 1-based position of a
 // malformed family, 0 when none.
 func protobufSeries(body []byte, limit int) (n, bad int) {
@@ -246,12 +247,72 @@ func protobufSeries(body []byte, limit int) (n, bad int) {
 				return n, family
 			}
 			if num == metricField && typ == protowire.BytesType {
-				n++
+				v, _ := protowire.ConsumeBytes(msg[tagLen:])
+				c, ok := seriesSamples(v)
+				if !ok {
+					return n, family
+				}
+				n += c
 			}
 			msg = msg[tagLen+valLen:]
 		}
 	}
 	return n, 0
+}
+
+// Field numbers of client_model's Metric, Summary and Histogram messages.
+const (
+	summaryField   = 4 // Metric.summary
+	histogramField = 7 // Metric.histogram
+	entriesField   = 3 // Summary.quantile, Histogram.bucket
+)
+
+// seriesSamples returns a lower bound of the samples of one encoded Metric
+// without decoding it: one, or its quantiles or classic buckets when more
+// (familySamples counts them plus _sum and _count). Decoding allocates far
+// more than the wire size of empty buckets, so they count before decoding.
+func seriesSamples(metric []byte) (int, bool) {
+	entries := 0
+	for len(metric) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(metric)
+		if tagLen < 0 {
+			return 0, false
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, metric[tagLen:])
+		if valLen < 0 {
+			return 0, false
+		}
+		if (num == summaryField || num == histogramField) && typ == protowire.BytesType {
+			sub, _ := protowire.ConsumeBytes(metric[tagLen:])
+			k, ok := countField(sub, entriesField)
+			if !ok {
+				return 0, false
+			}
+			entries += k
+		}
+		metric = metric[tagLen+valLen:]
+	}
+	return max(1, entries), true
+}
+
+// countField counts the length-delimited occurrences of field num in msg.
+func countField(msg []byte, num protowire.Number) (int, bool) {
+	n := 0
+	for len(msg) > 0 {
+		f, typ, tagLen := protowire.ConsumeTag(msg)
+		if tagLen < 0 {
+			return 0, false
+		}
+		valLen := protowire.ConsumeFieldValue(f, typ, msg[tagLen:])
+		if valLen < 0 {
+			return 0, false
+		}
+		if f == num && typ == protowire.BytesType {
+			n++
+		}
+		msg = msg[tagLen+valLen:]
+	}
+	return n, true
 }
 
 // validFamily checks the names and label values of a decoded family, like

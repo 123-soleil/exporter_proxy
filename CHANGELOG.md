@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `401` and `429` answers close their connection: a client could hold
+  connections (one goroutine and file descriptor each) open indefinitely
+  with one refused request every minute, without ever authenticating.
+- An invalid upstream URL no longer copies the URL, credentials included,
+  into the validation error logged at startup, reload and `--check`.
+- A protobuf body with a few series of many empty buckets or quantiles is
+  refused as `too_many_samples` before decoding: decoding allocated up to
+  60 times the body size first.
+
+### Added
+
+- Startup, reload and `--check` warning for a listener with neither TLS,
+  basic authentication nor `allowed_networks`, listening beyond loopback
+  (an empty web configuration file serves in plain HTTP to anyone).
+- `--check` reports a `client_crl_file` with no CRL signed by the client
+  CAs (every client certificate would be refused), also logged at startup
+  and reload, and `file` or `unix_socket` paths hidden from the service by
+  the systemd unit (`PrivateTmp=`, `ProtectHome=`).
+
+### Fixed
+
+- Documentation: `process_start_time_seconds` is missing under the shipped
+  unit (`ProcSubset=pid`); the configuration example now mentions
+  `https://` upstreams.
+
 ## [0.4.2] - 2026-11-09
 
 ### Fixed

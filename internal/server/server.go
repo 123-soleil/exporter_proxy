@@ -282,6 +282,14 @@ func checkCRLSpec(sp spec, wc *web.Config, logger *slog.Logger) string {
 		logger.Error("client_crl_file outside its dates: client certificates will be refused",
 			"listener", sp.name, "err", errfmt.OneLine(err))
 	}
+	if lists, err := webconfig.ParseCRLs(data); err == nil {
+		if caPEM, err := webconfig.ClientCAPEM(wc); err == nil {
+			if missing, _ := webconfig.CRLMissing(caPEM, lists); len(missing) > 0 {
+				logger.Error("client_crl_file has no CRL from some client CAs: client certificates they issue will be refused",
+					"listener", sp.name, "client_crl_file", sp.clientCRL, "client_cas", strings.Join(missing, "; "))
+			}
+		}
+	}
 	return ""
 }
 
@@ -872,8 +880,14 @@ func (s *Server) prepare(cfg *config.Config) ([]spec, error) {
 		return nil, fmt.Errorf("invalid web configuration: %s", strings.Join(problems, "; "))
 	}
 	for _, sp := range specs {
-		if wc, err := webconfig.Read(sp.webConfig); err == nil && wc.BasicAuthWithoutTLS() {
+		wc, err := webconfig.Read(sp.webConfig)
+		switch {
+		case err != nil:
+		case wc.BasicAuthWithoutTLS():
 			s.logger.Warn("basic authentication without TLS: credentials travel in clear text",
+				"listener", sp.name, "web_config_file", sp.webConfig)
+		case wc.Unprotected() && sp.allowed == nil && !config.LoopbackListen(sp.listen):
+			s.logger.Warn("listener without TLS, authentication or allowed_networks: anyone reaching it can read the metrics",
 				"listener", sp.name, "web_config_file", sp.webConfig)
 		}
 	}

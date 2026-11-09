@@ -492,6 +492,18 @@ net/http errors clients can cause, never hides them.
 | `network_not_allowed` | Client address outside the listener's `allowed_networks` (see below) | connection closed right after it is accepted, before the TLS handshake | `warn` `msg="connection refused: client address not in allowed_networks"` with `remote` |
 | `rate_limited` | Too many password checks (see below), or the `rate_limit` of the web configuration reached | `429` with `Retry-After: 1` | `debug` only, to avoid flooding the logs during an attack |
 
+`401` and `429` answers close their connection (`Connection: close`): a
+client cannot keep connections open indefinitely with one cheap refused
+request each, without ever authenticating. A scraper reconnects at its next
+scrape.
+
+A listener with neither TLS nor basic authentication (for example an empty
+or truncated web configuration file) serves the exporters to anyone who can
+reach it. When it listens beyond the loopback interface and has no
+`allowed_networks`, a `warn` line says so at startup and reload
+(`msg="listener without TLS, authentication or allowed_networks: anyone
+reaching it can read the metrics"`), and `--check` reports a warning.
+
 ### Route authorization
 
 By default, every client a listener authenticates may read all its routes.
@@ -654,7 +666,10 @@ paths get `404`) and is named `metrics` in logs, so no listener may use that
 name. It is a long-running daemon with per-route counters, so an HTTP
 endpoint is used rather than the node_exporter textfile collector.
 
-Besides the standard `go_*`, `process_*` and
+Besides the standard `go_*`, `process_*` (except
+`process_start_time_seconds` under the shipped systemd unit: it needs
+`/proc/stat`, hidden by `ProcSubset=pid`; use
+`exporter_proxy_build_info` or `up` resets to detect restarts) and
 `promhttp_metric_handler_errors_total` metrics, it exports:
 
 - `exporter_proxy_requests_total{listener,route,code}`: requests served;
@@ -1265,14 +1280,23 @@ otherwise; warnings do not fail the check:
   reload" and "Refused authentications") are checked too, like at startup;
 - an `authorize` list that cannot match on its listener is a warning;
 - each `client_crl_file` parses and is within its dates (a warning 7 days
-  before its next update);
+  before its next update), and holds a CRL signed by each client CA: client
+  certificates issued by a CA without one are refused at runtime, so it is
+  a problem when no client CA has one, a warning when some do not (the
+  same is logged at `error` level at startup and reload);
+- a listener with neither TLS, basic authentication nor `allowed_networks`,
+  listening beyond the loopback interface, is a warning;
 - basic authentication without TLS is a warning, and so are
   `basic_auth_users` hashes with different bcrypt costs (response times
   would tell users apart);
 - each `file` route: the file exists, is a regular file, is readable and is
   not older than `max_age` nor more than `max_age` in the future;
 - each `unix_socket` route: the path exists, is a socket and is writable by
-  the current user (required by `connect()`).
+  the current user (required by `connect()`);
+- a `file` or `unix_socket` under `/tmp`, `/var/tmp`, `/home`, `/root` or
+  `/run/user` is a warning: the systemd unit hides these directories from
+  the service (`PrivateTmp=yes`, `ProtectHome=yes`), so the path that
+  `--check` sees by hand does not exist for the service.
 
 With `--probe`, `--check` also reads every route's source once, with the
 same code, timeout and limits as the proxy, and validates its content: an

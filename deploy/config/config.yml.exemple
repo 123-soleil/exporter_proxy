@@ -49,9 +49,10 @@ listeners:
       # Exact request path, starting with '/'. Required, unique in the
       # listener.
       - path: /metrics
-        # HTTP exporter over TCP: http:// only, no credentials. The
-        # exporter should listen on 127.0.0.1 only, otherwise it can be
-        # reached without going through the proxy.
+        # HTTP exporter over TCP: http://, or https:// with upstream_tls
+        # (see README); no credentials in the URL. The exporter should
+        # listen on 127.0.0.1 only, otherwise it can be reached without
+        # going through the proxy.
         upstream: http://127.0.0.1:CHANGE_ME/metrics
         # Optional per-route overrides of the defaults section:
         # timeout: 20s

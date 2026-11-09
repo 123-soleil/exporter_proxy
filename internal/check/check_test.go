@@ -446,4 +446,108 @@ func TestClientCRLFile(t *testing.T) {
 	bad := filepath.Join(dir, "bad.crl")
 	writeFile(t, bad, "nope")
 	expect(t, run(bad), want{Problem, "client_crl_file " + bad})
+
+	// A CRL signed by another CA covers none of the client CAs: every
+	// client certificate would be refused at runtime.
+	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTmpl := *tmpl
+	otherTmpl.Subject = pkix.Name{CommonName: "other-ca"}
+	otherDER, err := x509.CreateCertificate(rand.Reader, &otherTmpl, &otherTmpl, &otherKey.PublicKey, otherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := x509.ParseCertificate(otherDER)
+	otherCRL, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
+		Number: big.NewInt(1), ThisUpdate: now.Add(-time.Hour), NextUpdate: now.Add(30 * 24 * time.Hour)}, other, otherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(dir, "foreign.crl")
+	writeFile(t, foreign, string(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: otherCRL})))
+	expect(t, run(foreign), want{Problem, "has no CRL signed by any client CA (CN=ca)"})
+
+	// Two client CAs, a CRL from one of them only: a warning naming the other.
+	bundle := filepath.Join(dir, "bundle.pem")
+	writeFile(t, bundle, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))+
+		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: otherDER})))
+	expect(t, runWith(tlsWebConfig(t, dir, srvCert, srvKey, bundle), crl("one.crl", now.Add(30*24*time.Hour))),
+		want{Warning, "has no CRL signed by CN=other-ca"})
+}
+
+// TestMain disables the sandbox warnings: tests write their files under
+// t.TempDir(), in /tmp. TestSandboxedPaths restores them.
+func TestMain(m *testing.M) {
+	realSandboxed = sandboxed
+	sandboxed = nil
+	os.Exit(m.Run())
+}
+
+// realSandboxed holds the list disabled by TestMain.
+var realSandboxed = sandboxed
+
+func TestSandboxedPaths(t *testing.T) {
+	sandboxed = realSandboxed
+	t.Cleanup(func() { sandboxed = nil })
+	tests := []struct {
+		key, path string
+		want      string // directive named, "" for no warning
+	}{
+		{"file", "/tmp/x.prom", "PrivateTmp=yes"},
+		{"file", "/var/tmp/x.prom", "PrivateTmp=yes"},
+		{"file", "/home/app/x.prom", "ProtectHome=yes"},
+		{"unix_socket", "/run/user/1000/app.sock", "ProtectHome=yes"},
+		{"file", "/var/lib/batch/x.prom", ""},
+		{"file", "/tmpdata/x.prom", ""}, // prefix of a name, not a directory
+		{"unix_socket", "/run/app/metrics.sock", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			c := &checker{}
+			c.sandbox("route", tt.key, tt.path)
+			switch {
+			case tt.want == "" && len(c.findings) != 0:
+				t.Errorf("unexpected warning: %+v", c.findings)
+			case tt.want != "" && (len(c.findings) != 1 || c.findings[0].Severity != Warning ||
+				!strings.Contains(c.findings[0].Message, tt.want)):
+				t.Errorf("findings = %+v, want one warning naming %s", c.findings, tt.want)
+			}
+		})
+	}
+}
+
+func TestExposure(t *testing.T) {
+	dir := t.TempDir()
+	open := filepath.Join(dir, "open.yml")
+	writeFile(t, open, "{}\n")
+	basic := filepath.Join(dir, "basic.yml")
+	writeFile(t, basic, "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n")
+
+	tests := []struct {
+		name       string
+		web        string
+		listen     string
+		restricted bool
+		warn       bool
+	}{
+		{"empty web config on all interfaces", open, ":9100", false, true},
+		{"empty web config on a public address", open, "192.0.2.1:9100", false, true},
+		{"systemd socket", open, "systemd:node", false, true},
+		{"loopback IPv4", open, "127.0.0.1:9100", false, false},
+		{"loopback IPv6", open, "[::1]:9100", false, false},
+		{"localhost", open, "localhost:9100", false, false},
+		{"allowed_networks set", open, ":9100", true, false},
+		{"basic auth", basic, ":9100", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &checker{}
+			c.exposure("listener", tt.web, tt.listen, tt.restricted)
+			if got := len(c.findings) == 1 && c.findings[0].Severity == Warning; got != tt.warn {
+				t.Errorf("warning = %v (%+v), want %v", got, c.findings, tt.warn)
+			}
+		})
+	}
 }

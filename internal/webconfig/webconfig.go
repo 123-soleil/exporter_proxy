@@ -134,6 +134,48 @@ type Summary struct {
 // BasicAuthWithoutTLS reports whether credentials would travel in clear text.
 func (s Summary) BasicAuthWithoutTLS() bool { return s.HasUsers && !s.TLSEnabled }
 
+// Unprotected reports a web configuration with neither TLS nor basic
+// authentication: an empty file, for example, serves in plain HTTP to
+// anyone.
+func (s Summary) Unprotected() bool { return !s.HasUsers && !s.TLSEnabled }
+
+// CRLMissing returns the subjects of the certificates of the client CA
+// bundle caPEM that no CRL of lists is signed by. At runtime the revocation
+// of a client certificate is checked against a CRL of each issuer of its
+// chain, and a missing one refuses the certificate.
+func CRLMissing(caPEM []byte, lists []*x509.RevocationList) (missing []string, total int) {
+	for block, rest := pem.Decode(caPEM); block != nil; block, rest = pem.Decode(rest) {
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		ca, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		total++
+		covered := false
+		for _, l := range lists {
+			if bytes.Equal(l.RawIssuer, ca.RawSubject) && l.CheckSignatureFrom(ca) == nil {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			missing = append(missing, ca.Subject.String())
+		}
+	}
+	return missing, total
+}
+
+// ClientCAPEM returns the client CA bundle of c: the client_ca_file
+// content, or the inline client_ca.
+func ClientCAPEM(c *web.Config) ([]byte, error) {
+	if c.TLSConfig.ClientCAs != "" {
+		return os.ReadFile(c.TLSConfig.ClientCAs)
+	}
+	return []byte(c.TLSConfig.ClientCAsText), nil
+}
+
 // Read loads the file at path and summarizes it.
 func Read(path string) (Summary, error) {
 	c, err := Load(path)

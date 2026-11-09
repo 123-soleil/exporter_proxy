@@ -231,6 +231,11 @@ func TestValidateRejects(t *testing.T) {
 			wantErr: "upstream must have a host",
 		},
 		{
+			name:    "malformed upstream with credentials",
+			yaml:    withRoutes("      - path: /m\n        upstream: \"http://user:S3cret%zz@h/m\"\n"),
+			wantErr: "upstream is not a valid URL",
+		},
+		{
 			name:    "upstream with credentials",
 			yaml:    withRoutes("      - path: /m\n        upstream: http://user:CHANGE_ME@h/m\n"),
 			wantErr: "upstream must not contain credentials",
@@ -336,6 +341,9 @@ func TestValidateRejects(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %q\nwant substring %q", err, tt.wantErr)
+			}
+			if strings.Contains(err.Error(), "S3cret") {
+				t.Errorf("credentials of the upstream URL leaked into the error: %q", err)
 			}
 			if strings.ContainsAny(err.Error(), "\r\n") {
 				t.Errorf("error spans several lines: %q", err)

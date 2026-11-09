@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,12 +47,14 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 	c := &checker{now: now}
 
 	c.webConfig("metrics", cfg.Metrics.WebConfigFile)
+	c.exposure("metrics", cfg.Metrics.WebConfigFile, cfg.Metrics.Listen, cfg.Metrics.AllowedNetworks != nil)
 	if cfg.Metrics.ClientCRLFile != "" {
 		c.crl("metrics", cfg.Metrics.ClientCRLFile, cfg.Metrics.WebConfigFile)
 	}
 	for _, l := range cfg.Listeners {
 		where := fmt.Sprintf("listener %q", l.Name)
 		c.webConfig(where, l.WebConfigFile)
+		c.exposure(where, l.WebConfigFile, l.Listen, l.AllowedNetworks != nil)
 		if l.ClientCRLFile != "" {
 			c.crl(where, l.ClientCRLFile, l.WebConfigFile)
 		}
@@ -59,8 +62,10 @@ func Run(cfg *config.Config, now time.Time) []Finding {
 			rwhere := fmt.Sprintf("%s route %q", where, r.Path)
 			switch {
 			case r.File != "":
+				c.sandbox(rwhere, "file", r.File)
 				c.metricsFile(rwhere, r.File, r.MaxAge)
 			case r.UnixSocket != "":
+				c.sandbox(rwhere, "unix_socket", r.UnixSocket)
 				c.socket(rwhere, r.UnixSocket)
 			}
 			if t := r.UpstreamTLS; t != nil {
@@ -86,6 +91,40 @@ type checker struct {
 
 func (c *checker) add(sev Severity, where, format string, args ...any) {
 	c.findings = append(c.findings, Finding{Severity: sev, Where: where, Message: fmt.Sprintf(format, args...)})
+}
+
+// exposure warns about a listener that anyone able to reach it can read:
+// no TLS, no basic authentication, no allowed_networks, not loopback only.
+func (c *checker) exposure(where, webConfig, listen string, restricted bool) {
+	wc, err := webconfig.Read(webConfig)
+	// An empty listen only occurs in configurations built by tests: a
+	// loaded configuration always has one.
+	if err != nil || !wc.Unprotected() || restricted || listen == "" || config.LoopbackListen(listen) {
+		return
+	}
+	c.add(Warning, where, "web_config_file %s has neither TLS nor basic_auth_users and allowed_networks is not set: "+
+		"anyone reaching %s can read the metrics", webConfig, listen)
+}
+
+// sandboxed lists the directories the systemd unit hides from the service:
+// a path under them exists for --check run by hand but not for the service.
+var sandboxed = []struct{ dir, directive string }{
+	{"/tmp", "PrivateTmp=yes"},
+	{"/var/tmp", "PrivateTmp=yes"},
+	{"/home", "ProtectHome=yes"},
+	{"/root", "ProtectHome=yes"},
+	{"/run/user", "ProtectHome=yes"},
+}
+
+// sandbox warns about a path the shipped systemd unit hides.
+func (c *checker) sandbox(where, key, path string) {
+	for _, s := range sandboxed {
+		if path == s.dir || strings.HasPrefix(path, s.dir+"/") {
+			c.add(Warning, where, "%s %s is under %s, which the systemd unit hides from the service (%s): "+
+				"the route would answer 502 unavailable", key, path, s.dir, s.directive)
+			return
+		}
+	}
 }
 
 // webConfig checks a web configuration file once, even if shared.
@@ -150,6 +189,21 @@ func (c *checker) crl(where, path, webConfig string) {
 	if err != nil {
 		c.add(Problem, where, "client_crl_file %s: %v", path, err)
 		return
+	}
+	// Every issuer of a client certificate chain needs a CRL in the file,
+	// or the certificate is refused.
+	if wcfg, err := webconfig.Load(webConfig); err == nil {
+		if caPEM, err := webconfig.ClientCAPEM(wcfg); err == nil {
+			missing, total := webconfig.CRLMissing(caPEM, lists)
+			switch {
+			case total > 0 && len(missing) == total:
+				c.add(Problem, where, "client_crl_file %s has no CRL signed by any client CA (%s): every client certificate would be refused",
+					path, strings.Join(missing, "; "))
+			case len(missing) > 0:
+				c.add(Warning, where, "client_crl_file %s has no CRL signed by %s: client certificates issued by it would be refused",
+					path, strings.Join(missing, "; "))
+			}
+		}
 	}
 	for i, l := range lists {
 		switch {

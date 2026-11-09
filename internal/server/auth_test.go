@@ -759,3 +759,30 @@ func TestLongPasswordSuffixesShareCacheEntry(t *testing.T) {
 		t.Errorf("success cache has %d entries, want 1", n)
 	}
 }
+
+// A refused request closes its connection: a client must not be able to
+// hold connections open with cheap refused requests.
+func TestRefusalClosesConnection(t *testing.T) {
+	h, _, _, _, _ := newTestAuth(t, usersYAML(t, map[string]string{"prometheus": "good-pass"}), webRateLimit{interval: time.Hour, burst: 2})
+	tests := []struct {
+		name       string
+		user, pass string
+		want       int
+	}{
+		{"valid keeps the connection", "prometheus", "good-pass", http.StatusOK},
+		{"missing credentials", "", "", http.StatusUnauthorized},
+		{"rate limited", "prometheus", "good-pass", http.StatusTooManyRequests},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := do(h, tt.user, tt.pass)
+			if w.Code != tt.want {
+				t.Fatalf("code = %d, want %d", w.Code, tt.want)
+			}
+			closes := w.Header().Get("Connection") == "close"
+			if closes != (tt.want != http.StatusOK) {
+				t.Errorf("Connection: close = %v for %d", closes, w.Code)
+			}
+		})
+	}
+}

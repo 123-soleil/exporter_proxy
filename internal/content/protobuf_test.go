@@ -194,3 +194,45 @@ func TestValidateProtobufLabelRules(t *testing.T) {
 		}
 	}
 }
+
+// One series of many empty buckets is refused before decoding: decoding
+// would allocate tens of times the body size.
+func TestProtobufBucketFloodRefusedBeforeDecoding(t *testing.T) {
+	const buckets = 30000
+	h := &dto.Histogram{SampleCount: proto.Uint64(0), SampleSum: proto.Float64(0), Bucket: make([]*dto.Bucket, buckets)}
+	for i := range h.Bucket {
+		h.Bucket[i] = &dto.Bucket{}
+	}
+	mf := &dto.MetricFamily{Name: proto.String("flood"), Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{Histogram: h}}}
+	msg, err := proto.Marshal(mf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := protowire.AppendVarint(nil, uint64(len(msg)))
+	body = append(body, msg...)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	res, err := ValidateFormat(body, 24000, true)
+	runtime.ReadMemStats(&after)
+
+	if source.ReasonOf(err) != source.ReasonTooManySamples {
+		t.Fatalf("reason = %q (%v), want too_many_samples", source.ReasonOf(err), err)
+	}
+	if res.Samples <= 24000 {
+		t.Errorf("Samples = %d, want above the limit", res.Samples)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(4*len(body)) {
+		t.Errorf("allocated %d bytes for a %d byte body: decoded before refusing", alloc, len(body))
+	}
+
+	// Below the limit, the same shape is still accepted.
+	h.Bucket = h.Bucket[:100]
+	msg, _ = proto.Marshal(mf)
+	ok := append(protowire.AppendVarint(nil, uint64(len(msg))), msg...)
+	if _, err := ValidateFormat(ok, 24000, true); err != nil {
+		t.Errorf("100 buckets refused: %v", err)
+	}
+}

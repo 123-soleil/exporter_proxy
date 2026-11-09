@@ -522,6 +522,10 @@ func (h *authHandler) refuse(w http.ResponseWriter, r *http.Request, reason prox
 	if code == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Basic realm="exporter_proxy"`)
 	}
+	// Close the connection: otherwise a client could hold connections
+	// open indefinitely with one cheap refused request each, without ever
+	// authenticating. A legitimate scraper reconnects at its next scrape.
+	w.Header().Set("Connection", "close")
 	http.Error(w, http.StatusText(code), code)
 }
 
