@@ -295,10 +295,13 @@ routes:
 - Patterns match whole names; each must be a valid regular expression on
   its own.
 - The source is validated first, whole (`max_samples` counts what the
-  source sent), then filtered. Protobuf messages kept are copied as they
-  are; text is re-encoded family by family, sorted by name: the body is no
-  longer the source's byte for byte, but the same families, series and
-  values.
+  source sent), then filtered. Nothing is re-encoded: the protobuf
+  messages and text lines of the kept families are copied byte for byte,
+  in the source's order, so nothing is added either (a histogram without
+  `_sum` or `_count` lines is served without them). In text, a family's
+  lines are its `# HELP` and `# TYPE` comments and its sample lines,
+  assigned to families exactly like the Prometheus parser does; other
+  comments and blank lines are dropped.
 
 ### Route concurrency limit
 

@@ -3,6 +3,8 @@ package content
 import (
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 )
 
 const filterInput = `# HELP node_cpu_seconds_total CPU time.
@@ -59,4 +61,96 @@ func TestFilterProtobuf(t *testing.T) {
 	if string(out) != string(want) {
 		t.Error("kept protobuf messages differ from the source")
 	}
+}
+
+// Filtering copies lines: nothing is added. Re-encoding gave a histogram
+// without _sum and _count lines "h_sum 0" and "h_count 0".
+func TestFilterTextAddsNothing(t *testing.T) {
+	in := "# TYPE h histogram\n" +
+		"h_bucket{le=\"1\"} 3\n" +
+		"h_bucket{le=\"+Inf\"} 5\n" +
+		"# TYPE s summary\n" +
+		"s{quantile=\"0.5\"} 1\n" +
+		"other 1\n"
+	out, err := Filter([]byte(in), false, func(name string) bool { return name != "other" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# TYPE h histogram\nh_bucket{le=\"1\"} 3\nh_bucket{le=\"+Inf\"} 5\n# TYPE s summary\ns{quantile=\"0.5\"} 1\n"
+	if string(out) != want {
+		t.Errorf("filtered:\n%s\nwant (the original lines, nothing added):\n%s", out, want)
+	}
+}
+
+// filterCases are bodies whose families the line resolution must assign
+// exactly like the parser.
+var filterCases = []string{
+	filterInput,
+	// UTF-8 names, quoted, with escapes, in comments and samples.
+	"# HELP \"my.metric\" A dotted name.\n# TYPE \"my.metric\" gauge\n{\"my.metric\", zone=\"a\"} 1\n{\"my.metric\"} 2\n" +
+		"# TYPE \"esc\\\"aped\" counter\n{\"esc\\\"aped\"} 3\nplain 4\n",
+	// _count seen before the histogram is declared: its own family.
+	"x_count 1\n# TYPE x histogram\nx_bucket{le=\"+Inf\"} 1\nx_sum 0\n",
+	// A HELP for x_count after the histogram x resolves to x.
+	"# TYPE x histogram\nx_bucket{le=\"+Inf\"} 1\n# HELP x_count help\nx_count 1\nx_sum 2\n",
+	// Summary and histogram suffixes, gauge named like a suffix.
+	"# TYPE s summary\ns{quantile=\"0.9\"} 1\ns_sum 2\ns_count 3\n# TYPE g_count gauge\ng_count 7\n",
+	// Blank lines, other comments, leading blanks, timestamps.
+	"\n# just a comment\n  a 1 1700000000000\n\n# TYPE b counter\nb_total 2\nb 3\n",
+}
+
+// Parsing the filtered body gives the original families minus the dropped
+// ones, unchanged.
+func TestFilterTextKeepsFamiliesIntact(t *testing.T) {
+	for i, in := range filterCases {
+		if _, _, err := parseText([]byte(in), 1000); err != nil {
+			t.Fatalf("case %d invalid: %v", i, err)
+		}
+		checkFilterEquivalence(t, []byte(in))
+	}
+}
+
+func checkFilterEquivalence(t *testing.T, body []byte) {
+	t.Helper()
+	_, orig, err := parseText(body, 1<<30)
+	if err != nil {
+		return // only validated bodies are filtered
+	}
+	for _, keep := range []func(string) bool{
+		func(string) bool { return true },
+		func(string) bool { return false },
+		func(n string) bool { return len(n)%2 == 0 },
+		func(n string) bool { return strings.Contains(n, "_") },
+	} {
+		out := filterText(body, keep)
+		_, got, err := parseText(out, 1<<30)
+		if err != nil {
+			t.Fatalf("filtered body invalid: %v\ninput:\n%s\noutput:\n%s", err, body, out)
+		}
+		want := 0
+		for name, mf := range orig {
+			if !keep(name) {
+				if _, ok := got[name]; ok {
+					t.Errorf("dropped family %q served:\n%s", name, out)
+				}
+				continue
+			}
+			want++
+			if !proto.Equal(got[name], mf) {
+				t.Errorf("family %q changed:\n got %v\nwant %v\ninput:\n%s\noutput:\n%s", name, got[name], mf, body, out)
+			}
+		}
+		if len(got) != want {
+			t.Errorf("filtered body has %d families, want %d:\n%s", len(got), want, out)
+		}
+	}
+}
+
+func FuzzFilterText(f *testing.F) {
+	for _, c := range filterCases {
+		f.Add([]byte(c))
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		checkFilterEquivalence(t, body)
+	})
 }

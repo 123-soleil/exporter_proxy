@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("x_count 1\n# TYPE x histogram\nx_bucckket{le=\"\vInf\"} 1\nx_sum+0\n")

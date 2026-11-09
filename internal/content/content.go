@@ -61,12 +61,11 @@ func ValidateAndFilter(body []byte, maxSamples int, protobuf bool, keep func(nam
 		out, err := filterProtobuf(body, keep)
 		return res, out, err
 	}
-	res, families, err := parseText(body, maxSamples)
+	res, _, err := parseText(body, maxSamples)
 	if err != nil {
 		return res, nil, err
 	}
-	out, err := encodeText(families, keep)
-	return res, out, err
+	return res, filterText(body, keep), nil
 }
 
 // parseText checks the cost of a text body, parses and counts it.

@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `metrics_filter` copies the text lines of the kept families instead of
+  re-encoding them: re-encoding added `_sum 0` and `_count 0` lines to
+  histograms and summaries sent without them (a count of 0 next to a
+  `+Inf` bucket of 5), and `_bucket{le="+Inf"}` to histograms sent with
+  only `_sum` and `_count`. The output keeps the source's order.
 - Filtering a protobuf body (`metrics_filter`) reads the name of each
   family without decoding it again: about 8 times faster.
 - Documentation: `process_start_time_seconds` is missing under the shipped
