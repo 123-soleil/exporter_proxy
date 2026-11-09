@@ -493,7 +493,13 @@ func TestMetricsEndpoint(t *testing.T) {
 func writeWeb(t *testing.T, dir, name, content string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+	// Atomically, like the README asks: a request reading a file being
+	// rewritten in place would see it empty, which is refused (518).
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -893,7 +899,7 @@ func TestUsersRemovedFailClosedUntilReload(t *testing.T) {
 	addr := s.Addr("node").String()
 	url := "http://" + addr + "/metrics"
 
-	writeWeb(t, dir, "web.yml", "") // emptied while being rewritten
+	writeWeb(t, dir, "web.yml", "{}\n") // users removed while running
 	if code, body := get(t, url, "", ""); code != StatusWebConfigUnreadable {
 		t.Fatalf("without users: code %d body %q, want 518", code, body)
 	}
@@ -1307,7 +1313,7 @@ func TestClientCARemovedFailsClosed(t *testing.T) {
 // A reload catching a TLS file emptied would serve in clear text: refused.
 func TestReloadLosingTLSIsWarned(t *testing.T) {
 	m := newMTLSTest(t, "")
-	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), "")
+	writeWeb(t, filepath.Dir(m.web), filepath.Base(m.web), "{}\n")
 	expectWeakeningRefused(t, m.s.Reload(&config.Config{Listeners: []config.Listener{m.l}}), "TLS")
 }
 
@@ -2047,7 +2053,7 @@ func TestReloadRestartServesEveryRequest(t *testing.T) {
 // exporters to anyone.
 func TestStartWarnsOnUnprotectedListener(t *testing.T) {
 	dir := t.TempDir()
-	empty := writeWeb(t, dir, "empty.yml", "")
+	empty := writeWeb(t, dir, "empty.yml", "{}\n")
 	tests := []struct {
 		name   string
 		listen string

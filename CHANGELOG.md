@@ -24,12 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (+ 65536). Bodies of empty buckets, spans, series or labels, exemplar
   labels included, made decoding allocate 50 to 83 times their size.
 
+### Changed
+
+- An empty web configuration file (no content, only comments or a YAML
+  `null`) is refused at startup, reload and `--check`, and a request
+  reading it while running gets `518`: it was read as "no TLS, no
+  authentication", so a file emptied by a failed deployment, or caught
+  while rewritten in place, opened the listener silently. Write `{}` for a
+  listener meant to be open.
+
 ### Added
 
 - Startup, reload and `--check` warning for a listener that authenticates
   nobody (neither basic authentication nor a required and verified client
-  certificate) and has no `allowed_networks`, listening beyond loopback: an
-  empty web configuration file serves in plain HTTP, and TLS alone only
+  certificate) and has no `allowed_networks`, listening beyond loopback: a
+  `{}` web configuration serves in plain HTTP, and TLS alone only
   encrypts.
 - `--check` reports a `client_crl_file` with no CRL signed by the client
   CAs (a problem when no CA has one: every client certificate would be

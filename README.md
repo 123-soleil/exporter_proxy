@@ -507,8 +507,7 @@ net/http turns `Connection: close` into a graceful GOAWAY.
 A listener that authenticates nobody, neither by basic authentication nor
 by a required and verified client certificate (`client_auth_type:
 RequireAndVerifyClientCert`), serves the exporters to anyone who can reach
-it: an empty or truncated web configuration file, or TLS alone, which only
-encrypts. When it listens beyond the loopback interface and has no
+it: a web configuration file `{}`, or TLS alone, which only encrypts. When it listens beyond the loopback interface and has no
 `allowed_networks`, a `warn` line says so at startup and reload
 (`msg="listener without authentication (basic auth or required client
 certificates) nor allowed_networks: anyone reaching it can read the
@@ -998,6 +997,16 @@ listeners:
   for `FileDescriptorName=`.
 
 ### Web configuration examples
+
+A web configuration file may not be empty (no content, only comments or a
+YAML `null`): exporter-toolkit would read it as "no TLS, no
+authentication", so a file emptied or truncated by a failed deployment
+would open the listener silently. It is refused at startup, reload and
+`--check`, and a request reading it while running is refused (`518`). A
+listener meant to be served without TLS or authentication says it with a
+file containing `{}`. Replace web configuration files atomically
+(temporary file, then rename): rewritten in place, they are empty for a
+moment.
 
 Example mTLS web configuration (`web-mtls.yml`):
 

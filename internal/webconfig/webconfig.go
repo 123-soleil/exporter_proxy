@@ -25,6 +25,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// ErrEmpty reports a web configuration file with no content.
+var ErrEmpty = errors.New("web configuration file is empty: write {} for a listener without TLS or authentication")
+
 // Load reads and parses the web configuration file at path.
 func Load(path string) (*web.Config, error) { return load(path, true) }
 
@@ -46,6 +49,13 @@ func load(path string, checkCA bool) (*web.Config, error) {
 			MaxVersion: tls.VersionTLS13,
 		},
 		HTTPConfig: web.HTTPConfig{HTTP2: true},
+	}
+	// An empty file (or only comments, or null) would serve without TLS or
+	// authentication without saying so, for example after a truncated
+	// deployment: a listener meant to be open says it with {}.
+	var doc any
+	if err := yaml.Unmarshal(data, &doc); err == nil && doc == nil {
+		return nil, fmt.Errorf("parse %s: %w", path, ErrEmpty)
 	}
 	if err := yaml.UnmarshalStrict(data, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)

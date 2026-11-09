@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -360,7 +361,6 @@ func TestUnprotected(t *testing.T) {
 		yaml  string
 		unpro bool
 	}{
-		{"empty file", "", true},
 		{"empty object", "{}\n", true},
 		{"basic auth without TLS", "basic_auth_users:\n  u: $2y$10$QOauhQNbBCuQDKes6eFzPeMqBSjb7Mr5DUmpZ/VcEd00UAV/LDeSi\n", false},
 	}
@@ -458,5 +458,34 @@ func TestCRLMissing(t *testing.T) {
 				t.Errorf("CRLMissing = %v, %d; want %v, %d", missing, total, tt.wantMissing, tt.wantTotal)
 			}
 		})
+	}
+}
+
+// An empty web configuration file would serve without TLS or
+// authentication without saying so: refused, {} says it on purpose.
+func TestEmptyWebConfigRefused(t *testing.T) {
+	for name, content := range map[string]string{
+		"no byte":       "",
+		"blank lines":   "\n\n  \n",
+		"comments only": "# TLS settings go here\n# basic_auth_users:\n",
+		"null":          "~\n",
+		"document mark": "---\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "web.yml")
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); !errors.Is(err, ErrEmpty) {
+				t.Errorf("Load = %v, want ErrEmpty", err)
+			}
+		})
+	}
+	p := filepath.Join(t.TempDir(), "web.yml")
+	if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Errorf("{} refused: %v", err)
 	}
 }
