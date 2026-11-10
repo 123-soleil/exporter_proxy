@@ -1,8 +1,5 @@
 # exporter_proxy
 
-> **Status: 0.x.** Implemented and tested; the configuration and metrics
-> may still change before 1.0.
-
 A small reverse proxy that puts **TLS, mutual TLS (mTLS) and/or HTTP basic
 authentication** in front of Prometheus exporters that do not support them
 natively (or where configuring each exporter separately is impractical).
